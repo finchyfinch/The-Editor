@@ -10,6 +10,33 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Session restore.** The open folder, the open files with their caret
+  positions, the active tab, the output panel and the window geometry all come
+  back on the next launch. Controlled by `[ui] restore_session`.
+  - Files and folders that have since been deleted are dropped rather than
+    reopening as errors, and an active-tab index past the end is discarded.
+  - A remembered window position is checked twice: once for obvious garbage
+    when the file is read, and again against the monitors actually attached
+    once the window exists. A window remembered on a monitor that has since
+    been unplugged keeps its size and lets the window manager place it, rather
+    than opening where it cannot be seen.
+  - A corrupt session file is discarded silently — losing a session is a mild
+    annoyance, a dialog about it on every launch is worse.
+- **Filesystem watching.** The explorer now notices files created, renamed or
+  deleted outside The Editor. Events are debounced, and the editor's own
+  atomic-save temporaries and build directories are ignored so the tree does
+  not flicker on every save.
+  - An open document whose file changes on disk is **reloaded silently when it
+    has no unsaved edits**, and warned about when it does — saving over a file
+    that `git checkout` has just rewritten is how people lose work.
+- **File tree context menu**: New File, New Folder, Rename, Delete, Copy Path,
+  Copy Relative Path, Reveal in Explorer, and Refresh.
+  - Renaming happens in place, and an open tab follows its file — otherwise the
+    next save writes to the old name and resurrects it.
+  - Delete moves to the **recycle bin**, never an unrecoverable delete, and
+    closes any tab showing the deleted file or anything inside a deleted folder.
+  - New Folder creates and drops straight into an in-place rename.
+
 - **Create Virtual Environment** (Run → Create Virtual Environment…). Pick a
   base interpreter, a folder name, and three checkboxes; the commands run in
   the output panel where you can watch them.

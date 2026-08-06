@@ -34,6 +34,22 @@ pub enum Action {
     Open(PathBuf),
     /// Single click: open in the reusable preview tab.
     Preview(PathBuf),
+    /// Create a file in this directory.
+    NewFileIn(PathBuf),
+    /// Create a folder in this directory.
+    NewFolderIn(PathBuf),
+    /// Begin renaming; the app confirms and performs it.
+    Rename { from: PathBuf, to: PathBuf },
+    /// Move to the operating system's trash, never an unrecoverable delete.
+    Delete(PathBuf),
+    /// Show in Explorer/Finder/the file manager.
+    Reveal(PathBuf),
+    /// Copy the absolute path to the clipboard.
+    CopyPath(PathBuf),
+    /// Copy the path relative to the project root.
+    CopyRelativePath(PathBuf),
+    /// Re-read the tree.
+    Refresh,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +72,10 @@ pub struct FileTree {
     /// Set when a listing could not be read, so the pane can say so instead of
     /// silently showing an empty directory.
     errors: HashMap<PathBuf, String>,
+    /// The entry being renamed in place, and the name typed so far.
+    renaming: Option<(PathBuf, String)>,
+    /// Set for one frame after rename starts, to focus the field.
+    focus_rename: bool,
 }
 
 impl FileTree {
@@ -79,6 +99,23 @@ impl FileTree {
     pub fn refresh(&mut self) {
         self.listings.clear();
         self.errors.clear();
+    }
+
+    /// Start renaming `path` in place, with its current name selected.
+    ///
+    /// Used after creating a folder, so the placeholder name can be typed over
+    /// immediately rather than needing a second right-click.
+    pub fn begin_rename(&mut self, path: &Path) {
+        self.renaming = Some((
+            path.to_path_buf(),
+            path.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        ));
+        self.focus_rename = true;
+        // Make sure the new entry is visible to be renamed.
+        if let Some(parent) = path.parent() {
+            self.expanded.insert(parent.to_path_buf());
+        }
     }
 
     pub fn set_show_hidden(&mut self, show: bool) {
@@ -136,9 +173,26 @@ impl FileTree {
         depth: usize,
         action: &mut Action,
     ) {
+        if self.renaming.as_ref().is_some_and(|(p, _)| p == path) {
+            let renamed = self.rename_row(ui, depth, path);
+            if renamed != Action::None {
+                *action = renamed;
+            }
+            return;
+        }
+
         let expanded = self.expanded.contains(path);
         let arrow = if expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ ▸
         let response = self.row(ui, depth, &format!("{arrow} \u{1f4c1} {label}"), path);
+
+        {
+            let path = path.to_path_buf();
+            let mut menu_action = Action::None;
+            response.context_menu(|ui| self.context_menu(ui, &path, true, &mut menu_action));
+            if menu_action != Action::None {
+                *action = menu_action;
+            }
+        }
 
         if response.clicked() {
             if expanded {
@@ -170,12 +224,34 @@ impl FileTree {
                 if !self.matches_filter(&child.name) {
                     continue;
                 }
+                if self
+                    .renaming
+                    .as_ref()
+                    .is_some_and(|(p, _)| *p == child.path)
+                {
+                    let renamed = self.rename_row(ui, depth + 1, &child.path);
+                    if renamed != Action::None {
+                        *action = renamed;
+                    }
+                    continue;
+                }
                 let response = self.row(
                     ui,
                     depth + 1,
                     &format!("\u{1f4c4} {}", child.name),
                     &child.path,
                 );
+
+                {
+                    let path = child.path.clone();
+                    let mut menu_action = Action::None;
+                    response
+                        .context_menu(|ui| self.context_menu(ui, &path, false, &mut menu_action));
+                    if menu_action != Action::None {
+                        *action = menu_action;
+                    }
+                }
+
                 if response.double_clicked() {
                     *action = Action::Open(child.path.clone());
                     self.selected = Some(child.path.clone());
@@ -195,6 +271,114 @@ impl FileTree {
             ui.selectable_label(selected, text)
         })
         .inner
+    }
+
+    /// Draw the in-place rename field for a row. Returns an action once the
+    /// user commits or abandons it.
+    fn rename_row(&mut self, ui: &mut egui::Ui, depth: usize, path: &Path) -> Action {
+        let mut action = Action::None;
+        let mut finished = false;
+
+        ui.horizontal(|ui| {
+            ui.add_space(12.0 * depth as f32);
+            let Some((_, name)) = &mut self.renaming else {
+                return;
+            };
+            let field = ui.add(
+                egui::TextEdit::singleline(name)
+                    .desired_width(180.0)
+                    .hint_text("name"),
+            );
+            if std::mem::take(&mut self.focus_rename) {
+                field.request_focus();
+            }
+
+            let commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let cancel =
+                ui.input(|i| i.key_pressed(egui::Key::Escape)) || (field.lost_focus() && !commit);
+
+            if commit {
+                let trimmed = name.trim();
+                // An unchanged or empty name is a cancel, not a rename: asking
+                // the user to confirm a no-op would be noise.
+                if !trimmed.is_empty()
+                    && path.file_name().is_some_and(|n| n != trimmed)
+                    && let Some(parent) = path.parent()
+                {
+                    action = Action::Rename {
+                        from: path.to_path_buf(),
+                        to: parent.join(trimmed),
+                    };
+                }
+                finished = true;
+            } else if cancel {
+                finished = true;
+            }
+        });
+
+        if finished {
+            self.renaming = None;
+        }
+        action
+    }
+
+    /// The context menu shared by files and directories.
+    fn context_menu(&mut self, ui: &mut egui::Ui, path: &Path, is_dir: bool, action: &mut Action) {
+        // "New" targets the directory itself, or the containing directory for
+        // a file — which is what people mean by right-clicking a file and
+        // asking for a new one beside it.
+        let container = if is_dir {
+            path.to_path_buf()
+        } else {
+            path.parent().map_or_else(PathBuf::new, Path::to_path_buf)
+        };
+
+        if ui.button("New File\u{2026}").clicked() {
+            *action = Action::NewFileIn(container.clone());
+            ui.close();
+        }
+        if ui.button("New Folder\u{2026}").clicked() {
+            *action = Action::NewFolderIn(container);
+            ui.close();
+        }
+        ui.separator();
+
+        if ui.button("Rename").clicked() {
+            self.renaming = Some((
+                path.to_path_buf(),
+                path.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            ));
+            self.focus_rename = true;
+            ui.close();
+        }
+        if ui
+            .button("Delete")
+            .on_hover_text("Moves to the recycle bin, not a permanent delete")
+            .clicked()
+        {
+            *action = Action::Delete(path.to_path_buf());
+            ui.close();
+        }
+        ui.separator();
+
+        if ui.button("Copy Path").clicked() {
+            *action = Action::CopyPath(path.to_path_buf());
+            ui.close();
+        }
+        if ui.button("Copy Relative Path").clicked() {
+            *action = Action::CopyRelativePath(path.to_path_buf());
+            ui.close();
+        }
+        if ui.button(reveal_label()).clicked() {
+            *action = Action::Reveal(path.to_path_buf());
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Refresh").clicked() {
+            *action = Action::Refresh;
+            ui.close();
+        }
     }
 
     fn matches_filter(&self, name: &str) -> bool {
@@ -247,6 +431,29 @@ fn read_dir_sorted(dir: &Path, show_hidden: bool) -> Result<Vec<Entry>, String> 
 
 fn is_hidden(name: &str) -> bool {
     name.starts_with('.')
+}
+
+/// The platform's name for "show this in the file manager".
+fn reveal_label() -> &'static str {
+    if cfg!(windows) {
+        "Reveal in Explorer"
+    } else if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else {
+        "Open Containing Folder"
+    }
+}
+
+/// Move a path to the operating system's trash.
+///
+/// Never an unrecoverable delete: a mis-clicked Delete in a file tree should
+/// cost a trip to the recycle bin, not a lost afternoon.
+///
+/// # Errors
+/// If the platform refuses — a file on a volume with no trash, or one that is
+/// in use.
+pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    trash::delete(path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

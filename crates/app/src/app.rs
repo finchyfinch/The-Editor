@@ -7,12 +7,13 @@
 //! Each open document carries its own editing view state and its own parse tree
 //! for highlighting. Edits reach the parse tree by draining the document's
 //! change outbox once per frame rather than by every edit path remembering to
-//! notify it — the same route the language server will take in M6.
+//! notify it â€” the same route the language server will take in M6.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use editor_config::paths::AppPaths;
+use editor_config::session::{OpenFile, Session, WindowGeometry};
 use editor_config::settings::Settings;
 use editor_config::theme::{ResolvedTheme, ThemePreference};
 use editor_core::document::Document;
@@ -29,6 +30,7 @@ use crate::new_file;
 use crate::palette::Palette;
 use crate::runner::Runner;
 use crate::venv_dialog;
+use crate::watcher::Watcher;
 
 /// Metadata shown in the About dialog.
 pub(crate) struct BuildInfo {
@@ -129,6 +131,16 @@ pub(crate) struct EditorApp {
     /// What to do once a virtual environment finishes being created. Held
     /// across frames because creation is three processes, not a function call.
     pending_venv: Option<venv_dialog::Completion>,
+
+    /// Watches the open folder. `None` when no folder is open, or when the
+    /// platform refused to watch it.
+    watcher: Option<Watcher>,
+    /// The session to restore on the first frame, once the window exists and
+    /// its geometry can be checked against the monitors actually attached.
+    restore: Option<Session>,
+    /// Set once the session has been written on quit, so it is not written
+    /// again by a second close request.
+    session_saved: bool,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -143,6 +155,7 @@ impl std::fmt::Debug for EditorApp {
 impl EditorApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, log_dir: String) -> Self {
         let (settings, settings_error) = Settings::load(&paths.settings_file());
+        let session = Session::load(&paths.session_file());
 
         cc.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -170,6 +183,9 @@ impl EditorApp {
             show_output: false,
             venv_dialog: venv_dialog::Dialog::default(),
             pending_venv: None,
+            watcher: None,
+            restore: settings.restore_session().then(|| session.clone()),
+            session_saved: false,
             settings,
         };
 
@@ -221,7 +237,7 @@ impl EditorApp {
         self.active.and_then(|i| self.docs.get_mut(i))
     }
 
-    /// Editor options from settings, with the language left at its default —
+    /// Editor options from settings, with the language left at its default â€”
     /// callers that have a document fill that in.
     fn editor_options(&self) -> EditorOptions {
         EditorOptions {
@@ -409,7 +425,7 @@ impl EditorApp {
         };
         let at_risk = self.at_risk(pending);
 
-        // Nothing actually unsaved — proceed without bothering the user.
+        // Nothing actually unsaved â€” proceed without bothering the user.
         if at_risk.is_empty() {
             self.pending = None;
             self.commit_pending(pending, ctx);
@@ -462,7 +478,7 @@ impl EditorApp {
             });
         });
 
-        // Escape is Cancel — the safe option, never the destructive one.
+        // Escape is Cancel â€” the safe option, never the destructive one.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             decision = Some(Decision::Cancel);
         }
@@ -558,6 +574,300 @@ impl EditorApp {
             // Place the caret where the template asked.
             entry.view.set_caret(cursor);
         }
+    }
+
+    /// Reopen what was open last time.
+    ///
+    /// Runs on the first frame rather than in `new`, because the window has to
+    /// exist before its remembered geometry can be checked against the
+    /// monitors that are actually attached.
+    fn restore_session(&mut self, session: &Session, ctx: &egui::Context) {
+        if let Some(geometry) = session.window {
+            let monitor = ctx.input(|i| i.viewport().monitor_size);
+            let visible = monitor.is_none_or(|size| geometry.is_on_screen(size.x, size.y));
+
+            if visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    geometry.x, geometry.y,
+                )));
+            } else {
+                // The monitor it was on is gone. Keep the size, drop the
+                // position, and let the window manager place it.
+                tracing::info!("remembered window position is off-screen; ignoring it");
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                geometry.width,
+                geometry.height,
+            )));
+            if geometry.maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        }
+
+        if let Some(folder) = &session.folder {
+            self.open_folder(folder.clone());
+        }
+        for file in &session.open_files {
+            self.open_path(&file.path, false);
+            if let Some(entry) = self.active_mut() {
+                let caret = file.caret.min(entry.doc.len_chars());
+                entry.view.set_caret(caret);
+            }
+        }
+        if let Some(active) = session.active.filter(|i| *i < self.docs.len()) {
+            self.active = Some(active);
+            self.focus_active();
+        }
+        self.show_output = session.show_output;
+    }
+
+    /// Gather the current state for writing out.
+    fn current_session(&self, ctx: &egui::Context) -> Session {
+        let window = ctx.input(|i| {
+            let viewport = i.viewport();
+            // Position comes from the outer rect — that is where the window
+            // actually is — but the size comes from the *inner* rect, because
+            // that is what `InnerSize` sets when restoring. Saving the outer
+            // size and restoring it as the inner one makes the window grow by
+            // the height of its own title bar on every launch.
+            let outer = viewport.outer_rect?;
+            let inner = viewport.inner_rect?;
+            Some(WindowGeometry {
+                x: outer.min.x,
+                y: outer.min.y,
+                width: inner.width(),
+                height: inner.height(),
+                maximized: viewport.maximized.unwrap_or(false),
+            })
+        });
+
+        Session {
+            folder: self.tree.root().map(Path::to_path_buf),
+            open_files: self
+                .docs
+                .iter()
+                .filter_map(|entry| {
+                    Some(OpenFile {
+                        path: entry.doc.path()?.to_path_buf(),
+                        caret: entry.view.selection.head,
+                    })
+                })
+                .collect(),
+            active: self.active,
+            window: window.filter(|w| w.is_plausible()),
+            show_output: self.show_output,
+        }
+    }
+
+    fn save_session(&mut self, ctx: &egui::Context) {
+        if self.session_saved || !self.settings.restore_session() {
+            return;
+        }
+        let session = self.current_session(ctx);
+        if let Err(e) = session.save(&self.paths.session_file()) {
+            tracing::warn!("could not save the session: {e}");
+        }
+        self.session_saved = true;
+    }
+
+    /// Open a project folder and start watching it.
+    fn open_folder(&mut self, folder: PathBuf) {
+        tracing::info!(path = %folder.display(), "opening folder");
+
+        // Reopening the same folder — which session restore can do right after
+        // startup — should not tear down a working watch and build another.
+        if self.watcher.as_ref().is_some_and(|w| w.root() == folder) {
+            self.tree.set_root(folder);
+            return;
+        }
+
+        match Watcher::new(&folder) {
+            Ok(watcher) => self.watcher = Some(watcher),
+            Err(e) => {
+                // Not fatal: the tree still works, it just will not notice
+                // changes made elsewhere.
+                tracing::warn!("could not watch {}: {e}", folder.display());
+                self.watcher = None;
+                self.info("Changes made outside The Editor will not be noticed automatically");
+            }
+        }
+        self.tree.set_root(folder);
+    }
+
+    /// React to files changing outside The Editor.
+    fn poll_watcher(&mut self) {
+        let Some(watcher) = &self.watcher else {
+            return;
+        };
+        let changes = watcher.drain();
+        if changes.is_empty() {
+            return;
+        }
+        if changes.structural {
+            self.tree.refresh();
+        }
+
+        // An open document whose file changed underneath it: reload silently
+        // when there is nothing to lose, warn when there is. Saving over a
+        // file that `git checkout` has rewritten is how people lose work.
+        for path in &changes.touched {
+            let Some(index) = self.docs.iter().position(|d| d.doc.path() == Some(path)) else {
+                continue;
+            };
+            if self.docs[index].doc.is_dirty() {
+                let name = self.docs[index].doc.display_name();
+                self.error(format!(
+                    "{name} changed on disk and has unsaved edits \u{2014} saving will overwrite it"
+                ));
+                continue;
+            }
+            self.reload_document(index);
+        }
+    }
+
+    /// Re-read a document from disk, keeping the caret where it was.
+    fn reload_document(&mut self, index: usize) {
+        let Some(entry) = self.docs.get(index) else {
+            return;
+        };
+        let Some(path) = entry.doc.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let caret = entry.view.selection.head;
+
+        match Document::open(&path) {
+            Ok(doc) => {
+                let entry = &mut self.docs[index];
+                entry.highlighter = new_highlighter(entry.language, &doc);
+                entry.doc = doc;
+                entry.view.set_caret(caret.min(entry.doc.len_chars()));
+                tracing::info!(path = %path.display(), "reloaded after an external change");
+            }
+            Err(e) => self.error(format!("Could not reload {}: {e:#}", path.display())),
+        }
+    }
+
+    /// Carry out what the explorer's context menu asked for.
+    fn apply_tree_action(
+        &mut self,
+        action: editor_widgets::file_tree::Action,
+        ctx: &egui::Context,
+    ) {
+        use editor_widgets::file_tree::Action;
+
+        match action {
+            Action::None => {}
+            Action::Open(path) => self.open_path(&path, false),
+            Action::Preview(path) => self.open_path(&path, true),
+            Action::Refresh => self.tree.refresh(),
+
+            Action::NewFileIn(directory) => self.new_file.open(directory),
+            Action::NewFolderIn(directory) => {
+                // A folder needs no dialog of its own: create it with a
+                // placeholder name and drop straight into an in-place rename,
+                // which is how every file manager does it.
+                let path = unique_path(&directory, "New Folder", "");
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {
+                        self.tree.refresh();
+                        self.tree.begin_rename(&path);
+                    }
+                    Err(e) => self.error(format!("Could not create folder: {e}")),
+                }
+            }
+
+            Action::Rename { from, to } => self.rename_path(&from, &to),
+            Action::Delete(path) => self.delete_path(&path),
+
+            Action::Reveal(path) => {
+                if let Err(e) = reveal_in_file_manager(&path) {
+                    self.error(format!("Could not reveal {}: {e}", path.display()));
+                }
+            }
+            Action::CopyPath(path) => {
+                ctx.copy_text(path.display().to_string());
+                self.info("Path copied");
+            }
+            Action::CopyRelativePath(path) => {
+                let relative = self
+                    .tree
+                    .root()
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(&path);
+                ctx.copy_text(relative.display().to_string());
+                self.info("Relative path copied");
+            }
+        }
+    }
+
+    /// Rename a file or folder, keeping any open tab pointing at it.
+    fn rename_path(&mut self, from: &Path, to: &Path) {
+        if to.exists() {
+            self.error(format!("{} already exists", to.display()));
+            return;
+        }
+        if let Some(name) = to.file_name().and_then(|n| n.to_str())
+            && let Err(e) = editor_core::filename::validate(name)
+        {
+            self.error(e.to_string());
+            return;
+        }
+
+        if let Err(e) = std::fs::rename(from, to) {
+            self.error(format!("Could not rename: {e}"));
+            return;
+        }
+
+        // An open document must follow its file, or the next save writes back
+        // to the old name and resurrects it.
+        for entry in &mut self.docs {
+            if entry.doc.path() == Some(from) {
+                entry.doc.set_path(to.to_path_buf());
+                entry.language = to
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map_or(LanguageId::PlainText, LanguageId::from_extension);
+                entry.highlighter = new_highlighter(entry.language, &entry.doc);
+            }
+        }
+
+        self.tree.refresh();
+        tracing::info!(from = %from.display(), to = %to.display(), "renamed");
+    }
+
+    /// Move a path to the trash, closing any tab that showed it.
+    fn delete_path(&mut self, path: &Path) {
+        if let Err(e) = editor_widgets::file_tree::move_to_trash(path) {
+            self.error(format!("Could not delete {}: {e}", path.display()));
+            return;
+        }
+
+        // Close tabs for the deleted file, or for anything inside a deleted
+        // folder. Leaving them open invites saving the file back into
+        // existence.
+        let doomed: Vec<usize> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.doc
+                    .path()
+                    .is_some_and(|p| p == path || p.starts_with(path))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for index in doomed.into_iter().rev() {
+            self.force_close_tab(index);
+        }
+
+        self.tree.refresh();
+        self.info(format!(
+            "Moved {} to the recycle bin",
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned()
+            )
+        ));
     }
 
     /// Kick off virtual environment creation.
@@ -724,8 +1034,7 @@ impl EditorApp {
             }
             CommandId::OpenFolder => {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    tracing::info!(path = %dir.display(), "opening folder");
-                    self.tree.set_root(dir);
+                    self.open_folder(dir);
                 }
             }
             CommandId::Save => self.save_active(false),
@@ -753,6 +1062,7 @@ impl EditorApp {
             }
             CommandId::CloseFolder => {
                 self.tree = FileTree::default();
+                self.watcher = None;
             }
             CommandId::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
 
@@ -952,7 +1262,7 @@ impl EditorApp {
 
         if changed {
             ui_theme::apply(ctx, resolved, scale, font_size);
-            // The code pane follows the UI theme. PLAN.md §3.11 allows pinning
+            // The code pane follows the UI theme. PLAN.md Â§3.11 allows pinning
             // them apart; the setting for that arrives with the settings UI.
             self.syntax_theme = SyntaxTheme::for_ui(resolved);
             self.applied_theme = Some(resolved);
@@ -1100,8 +1410,8 @@ impl EditorApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // The theme indicator is a control, not a label — one
-                        // of the three ways PLAN.md §3.11 requires it to be
+                        // The theme indicator is a control, not a label â€” one
+                        // of the three ways PLAN.md Â§3.11 requires it to be
                         // reachable.
                         if ui
                             .button(format!("\u{25d0} {theme_label}"))
@@ -1154,8 +1464,8 @@ impl EditorApp {
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
                 opts.language = entry.language;
                 // Bring the parse tree up to date before painting from it.
-                // Draining the outbox here means every edit path — typing,
-                // paste, undo, redo — feeds the highlighter without each one
+                // Draining the outbox here means every edit path â€” typing,
+                // paste, undo, redo â€” feeds the highlighter without each one
                 // having to remember to.
                 let changes = entry.doc.take_changes();
                 if let Some(h) = entry.highlighter.as_mut()
@@ -1294,7 +1604,7 @@ impl EditorApp {
     }
 
     /// Generated from the registry, so it cannot describe a binding that does
-    /// not exist. PLAN.md §3.10.
+    /// not exist. PLAN.md Â§3.10.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_shortcuts;
         egui::Window::new("Keyboard Shortcuts")
@@ -1331,10 +1641,20 @@ impl eframe::App for EditorApp {
         let ctx = ui.ctx().clone();
         self.sync_appearance(&ctx);
 
+        // Restoring needs the window to exist, so it happens here rather than
+        // in `new`.
+        if let Some(session) = self.restore.take() {
+            self.restore_session(&session, &ctx);
+        }
+        self.poll_watcher();
+
         // Never let the window close with unsaved work. This must run before
         // anything else in the frame, and `quit_confirmed` stops the second
         // close request being intercepted again.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
+            // Written before the unsaved prompt, so the session survives even
+            // if the user then cancels the quit and closes some other way.
+            self.save_session(&ctx);
             if self.docs.iter().any(|d| d.doc.is_dirty()) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending = Some(Pending::Quit);
@@ -1344,7 +1664,7 @@ impl eframe::App for EditorApp {
         }
 
         // One command per frame, from whichever source fired. Keyboard first,
-        // so a shortcut is not swallowed by a menu that happens to be open —
+        // so a shortcut is not swallowed by a menu that happens to be open â€”
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
         let modal_open = self.palette.is_open()
@@ -1360,6 +1680,7 @@ impl eframe::App for EditorApp {
         invoked = self.toolbar(ui).or(invoked);
         invoked = self.status_bar(ui).or(invoked);
 
+        let mut tree_action = editor_widgets::file_tree::Action::None;
         if self.settings.show_file_tree() {
             egui::Panel::left("explorer")
                 .default_size(250.0)
@@ -1369,17 +1690,10 @@ impl eframe::App for EditorApp {
                         ui.heading("Explorer");
                     });
                     ui.separator();
-                    match self.tree.ui(ui) {
-                        editor_widgets::file_tree::Action::Open(path) => {
-                            self.open_path(&path, false);
-                        }
-                        editor_widgets::file_tree::Action::Preview(path) => {
-                            self.open_path(&path, true);
-                        }
-                        editor_widgets::file_tree::Action::None => {}
-                    }
+                    tree_action = self.tree.ui(ui);
                 });
         }
+        self.apply_tree_action(tree_action, &ctx);
 
         // Keep draining the process even while the dock is hidden, or output
         // piles up in the channel and arrives in a lump when it is reopened.
@@ -1401,7 +1715,7 @@ impl eframe::App for EditorApp {
             }
         }
         // Between the steps of a sequence there is momentarily no process, but
-        // work is still pending — treating that as "finished" makes the status
+        // work is still pending â€” treating that as "finished" makes the status
         // bar and the console header flicker.
         if self.runner.is_running() || self.runner.has_queued_work() {
             // A running process produces output between frames, so keep
@@ -1522,7 +1836,7 @@ impl EditorApp {
 ///
 /// Replacements go through the document's normal transaction path, so they land
 /// in the undo history and reach the highlighter like any other edit. Replace
-/// All is a single transaction, and therefore a single undo step — undoing a
+/// All is a single transaction, and therefore a single undo step â€” undoing a
 /// 500-match replace one match at a time would be unusable.
 fn apply_find_action(entry: &mut OpenDoc, action: find_bar::Action) {
     use editor_core::edit::{Edit, Transaction};
@@ -1581,7 +1895,7 @@ fn new_highlighter(language: LanguageId, doc: &Document) -> Option<Highlighter> 
     Highlighter::new(language, doc.text())
 }
 
-/// Read the system clipboard, for the Edit → Paste menu item.
+/// Read the system clipboard, for the Edit â†’ Paste menu item.
 ///
 /// Keyboard paste does not come through here: egui synthesises `Event::Paste`
 /// with the text already attached, and the editor widget handles it. This
@@ -1592,8 +1906,8 @@ fn read_clipboard() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Which theme command the status-bar button should fire: cycle Dark → Light →
-/// System → Dark.
+/// Which theme command the status-bar button should fire: cycle Dark â†’ Light â†’
+/// System â†’ Dark.
 fn next_theme_command(current_label: &str) -> CommandId {
     match current_label {
         "Dark" => CommandId::ThemeLight,
@@ -1628,6 +1942,59 @@ fn toolbar_glyph(id: CommandId) -> &'static str {
         CommandId::CommandPalette => "\u{2318}",
         CommandId::OpenSettingsFile => "\u{2699}",
         _ => "?",
+    }
+}
+
+/// A name inside `directory` that is not already taken.
+fn unique_path(directory: &Path, stem: &str, extension: &str) -> PathBuf {
+    let build = |suffix: String| {
+        let name = if extension.is_empty() {
+            format!("{stem}{suffix}")
+        } else {
+            format!("{stem}{suffix}.{extension}")
+        };
+        directory.join(name)
+    };
+
+    let first = build(String::new());
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000 {
+        let candidate = build(format!(" {n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// Select a path in the platform's file manager, rather than merely opening
+/// the folder that contains it.
+fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // `/select,` highlights the item; without it Explorer opens the file.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R".as_ref(), path.as_os_str()])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select" on Linux, so open the containing directory.
+        let directory = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(directory)
+            .spawn()
+            .map(|_| ())
     }
 }
 

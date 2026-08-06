@@ -29,6 +29,8 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 arboard = "3.6.1"
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
 
 [lints]
 workspace = true

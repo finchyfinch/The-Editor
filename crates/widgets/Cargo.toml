@@ -15,6 +15,7 @@ editor-syntax = { version = "1.0.0", path = "../syntax" }
 eframe.workspace = true
 editor-search = { version = "1.0.0", path = "../search" }
 editor-proc = { version = "1.0.0", path = "../proc" }
+trash = "5.2.6"
 
 [lints]
 workspace = true

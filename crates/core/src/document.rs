@@ -411,6 +411,15 @@ impl Document {
         self.path.as_deref()
     }
 
+    /// Point this document at a different file, without writing anything.
+    ///
+    /// For a rename performed outside the editor's save path: the open tab has
+    /// to follow its file, or the next save writes back to the old name and
+    /// resurrects it.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
     /// Filename for the tab label, or "Untitled" for a new document.
     #[must_use]
     pub fn display_name(&self) -> String {

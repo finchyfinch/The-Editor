@@ -888,12 +888,10 @@ caret motion with a sticky goal column, smart backspace to the tab stop,
 auto-indent carried from the previous line, cut/copy/paste, select all, and
 undo/redo with typing coalesced into single steps.
 
-**M1 still to do:** filesystem watcher (`notify`) so external changes refresh the
-tree; session persistence (reopen tabs, scroll positions, window geometry);
-file-tree context menu (new/rename/delete-to-trash/reveal); tab drag-reorder and
-the overflow dropdown; Ctrl+Tab most-recently-used cycling; go-to-file
-(Ctrl+P); native macOS menu bar via `muda`; and a build/run pass on Linux and
-macOS.
+**M1 still to do:** tab drag-reorder and the overflow dropdown; Ctrl+Tab
+most-recently-used cycling; go-to-file (Ctrl+P); native macOS menu bar via
+`muda`; and a build/run pass on Linux and macOS. The filesystem watcher,
+session persistence and the file-tree context menu are done.
 
 **Also landed:** the New File dialog with all its templates (pulled forward from
 M8), and the Save / Don't Save / Cancel guard on closing a dirty tab, Close
