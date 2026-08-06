@@ -9,6 +9,7 @@
 mod app;
 mod commands;
 mod logging;
+mod new_file;
 mod palette;
 mod panic_hook;
 

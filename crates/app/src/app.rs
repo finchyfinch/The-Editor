@@ -19,6 +19,7 @@ use editor_widgets::{file_tree::FileTree, tab_bar, theme as ui_theme};
 use eframe::egui;
 
 use crate::commands::{self, CommandId};
+use crate::new_file;
 use crate::palette::Palette;
 
 /// Metadata shown in the About dialog.
@@ -48,6 +49,23 @@ struct Toast {
     born: Instant,
 }
 
+/// The user's answer to the unsaved-changes prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// An action that would discard unsaved work, held until the user answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    CloseTab(usize),
+    CloseOthers(usize),
+    CloseAll,
+    Quit,
+}
+
 /// One open document, its view state, and its tab state.
 #[derive(Debug)]
 struct OpenDoc {
@@ -69,9 +87,15 @@ pub(crate) struct EditorApp {
     active: Option<usize>,
 
     palette: Palette,
+    new_file: new_file::Dialog,
     show_about: bool,
     show_shortcuts: bool,
     toasts: Vec<Toast>,
+    /// A destructive action waiting on the user's answer about unsaved work.
+    pending: Option<Pending>,
+    /// Set once the user has answered the quit prompt, so the second close
+    /// request is not intercepted again.
+    quit_confirmed: bool,
 
     /// What the theme preference last resolved to. Re-applied when it changes,
     /// which is how "follow system" reacts to the OS switching at runtime.
@@ -105,9 +129,12 @@ impl EditorApp {
             docs: Vec::new(),
             active: None,
             palette: Palette::default(),
+            new_file: new_file::Dialog::default(),
             show_about: false,
             show_shortcuts: false,
             toasts: Vec::new(),
+            pending: None,
+            quit_confirmed: false,
             applied_theme: None,
             applied_scale: settings.ui_scale(),
             applied_ui_font: settings.ui_font_size(),
@@ -222,12 +249,20 @@ impl EditorApp {
         self.focus_active();
     }
 
+    /// Close a tab, asking first if it has unsaved changes.
     fn close_tab(&mut self, index: usize) {
+        if self.docs.get(index).is_some_and(|d| d.doc.is_dirty()) {
+            self.pending = Some(Pending::CloseTab(index));
+            return;
+        }
+        self.force_close_tab(index);
+    }
+
+    /// Close a tab unconditionally. Only call once unsaved work is resolved.
+    fn force_close_tab(&mut self, index: usize) {
         if index >= self.docs.len() {
             return;
         }
-        // M2: prompt Save / Don't Save / Cancel when the document is dirty.
-        // Nothing can be dirty yet, since editing does not exist.
         self.docs.remove(index);
 
         self.active = match self.active {
@@ -236,6 +271,168 @@ impl EditorApp {
             Some(active) => Some(active.min(self.docs.len() - 1)),
             None => None,
         };
+    }
+
+    /// Indices of every document with unsaved changes.
+    fn dirty_indices(&self) -> Vec<usize> {
+        self.docs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.doc.is_dirty())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Which documents a pending action would discard.
+    fn at_risk(&self, pending: Pending) -> Vec<usize> {
+        match pending {
+            Pending::CloseTab(i) => self
+                .docs
+                .get(i)
+                .filter(|d| d.doc.is_dirty())
+                .map(|_| vec![i])
+                .unwrap_or_default(),
+            Pending::CloseOthers(keep) => self
+                .dirty_indices()
+                .into_iter()
+                .filter(|i| *i != keep)
+                .collect(),
+            Pending::CloseAll | Pending::Quit => self.dirty_indices(),
+        }
+    }
+
+    /// Save the given documents. Returns false if any could not be saved, in
+    /// which case the destructive action must not proceed.
+    fn save_indices(&mut self, indices: &[usize]) -> bool {
+        let mut failures = Vec::new();
+        for &i in indices {
+            let Some(entry) = self.docs.get_mut(i) else {
+                continue;
+            };
+            if entry.doc.path().is_none() {
+                // An untitled buffer needs a destination. Rather than opening a
+                // file chooser from inside a modal, refuse and let the user do
+                // Save As deliberately.
+                failures.push(format!("{} has never been saved", entry.doc.display_name()));
+                continue;
+            }
+            if let Err(e) = entry.doc.save() {
+                failures.push(format!("{}: {e:#}", entry.doc.display_name()));
+            }
+        }
+        if failures.is_empty() {
+            true
+        } else {
+            self.error(format!("Not closed \u{2014} {}", failures.join("; ")));
+            false
+        }
+    }
+
+    /// Carry out a pending action now that unsaved work has been dealt with.
+    fn commit_pending(&mut self, pending: Pending, ctx: &egui::Context) {
+        match pending {
+            Pending::CloseTab(i) => self.force_close_tab(i),
+            Pending::CloseOthers(keep) => {
+                if keep < self.docs.len() {
+                    let kept = self.docs.remove(keep);
+                    self.docs.clear();
+                    self.docs.push(kept);
+                    self.active = Some(0);
+                }
+            }
+            Pending::CloseAll => {
+                self.docs.clear();
+                self.active = None;
+            }
+            Pending::Quit => {
+                self.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// The Save / Don't Save / Cancel prompt.
+    ///
+    /// Deliberately not a plain "are you sure": the third option has to be
+    /// *save*, or the only way out of the dialog is to lose the work.
+    fn unsaved_prompt(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending else {
+            return;
+        };
+        let at_risk = self.at_risk(pending);
+
+        // Nothing actually unsaved — proceed without bothering the user.
+        if at_risk.is_empty() {
+            self.pending = None;
+            self.commit_pending(pending, ctx);
+            return;
+        }
+
+        let names: Vec<String> = at_risk
+            .iter()
+            .filter_map(|i| self.docs.get(*i))
+            .map(|d| d.doc.display_name())
+            .collect();
+
+        let mut decision = None;
+
+        egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            if names.len() == 1 {
+                ui.heading(format!("Save changes to {}?", names[0]));
+            } else {
+                ui.heading(format!("Save changes to {} files?", names.len()));
+            }
+            ui.add_space(6.0);
+            ui.label("Your changes will be lost if you don't save them.");
+
+            if names.len() > 1 {
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        for name in &names {
+                            ui.weak(format!("\u{2022} {name}"));
+                        }
+                    });
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let save = if names.len() == 1 { "Save" } else { "Save All" };
+                    if ui.button(save).clicked() {
+                        decision = Some(Decision::Save);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        decision = Some(Decision::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(Decision::Cancel);
+                    }
+                });
+            });
+        });
+
+        // Escape is Cancel — the safe option, never the destructive one.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(Decision::Cancel);
+        }
+
+        match decision {
+            Some(Decision::Save) => {
+                self.pending = None;
+                if self.save_indices(&at_risk) {
+                    self.commit_pending(pending, ctx);
+                }
+            }
+            Some(Decision::Discard) => {
+                self.pending = None;
+                self.commit_pending(pending, ctx);
+            }
+            Some(Decision::Cancel) => self.pending = None,
+            None => {}
+        }
     }
 
     fn save_active(&mut self, ask_for_path: bool) {
@@ -271,14 +468,66 @@ impl EditorApp {
         }
     }
 
+    /// Write a file created by the New File dialog and open it.
+    fn create_file(&mut self, request: new_file::NewFile) {
+        let new_file::NewFile {
+            path,
+            language,
+            contents,
+            cursor,
+        } = request;
+
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.error(format!("Could not create {}: {e}", parent.display()));
+            return;
+        }
+
+        // Normalise to the platform's line endings on the way out; Document
+        // will detect and preserve them from here on.
+        let eol = editor_core::document::LineEnding::platform_default();
+        let text = if eol == editor_core::document::LineEnding::Crlf {
+            contents.replace('\n', "\r\n")
+        } else {
+            contents
+        };
+
+        if let Err(e) = std::fs::write(&path, text.as_bytes()) {
+            self.error(format!("Could not write {}: {e}", path.display()));
+            return;
+        }
+
+        tracing::info!(path = %path.display(), "created file");
+        self.tree.refresh();
+        self.open_path(&path, false);
+
+        if let Some(entry) = self.active_mut() {
+            // The dialog's explicit choice wins over extension sniffing, so a
+            // Python file named `build.cfg` is still treated as Python.
+            entry.language = language;
+            // Place the caret where the template asked.
+            entry.view.set_caret(cursor);
+        }
+    }
+
     // ---- commands --------------------------------------------------------
 
     fn run_command(&mut self, id: CommandId, ctx: &egui::Context) {
         match id {
             CommandId::NewFile => {
-                // The New File dialog — name, language, boilerplate template —
-                // is the next thing after M2. This creates a blank buffer that
-                // Save As can name.
+                let directory = self
+                    .active_doc()
+                    .and_then(|d| d.doc.path())
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+                    .or_else(|| self.tree.root().map(Path::to_path_buf))
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                self.new_file.open(directory);
+            }
+            CommandId::NewScratch => {
                 self.docs.push(OpenDoc {
                     doc: Document::untitled(),
                     view: EditorView::default(),
@@ -767,11 +1016,25 @@ impl eframe::App for EditorApp {
         let ctx = ui.ctx().clone();
         self.sync_appearance(&ctx);
 
+        // Never let the window close with unsaved work. This must run before
+        // anything else in the frame, and `quit_confirmed` stops the second
+        // close request being intercepted again.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
+            if self.docs.iter().any(|d| d.doc.is_dirty()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.pending = Some(Pending::Quit);
+            } else {
+                self.quit_confirmed = true;
+            }
+        }
+
         // One command per frame, from whichever source fired. Keyboard first,
         // so a shortcut is not swallowed by a menu that happens to be open —
-        // except while the palette has focus, where keystrokes belong to its
-        // query field and its own shortcut must not re-open it.
-        let mut invoked = if self.palette.is_open() {
+        // except while a modal has focus, where keystrokes belong to its
+        // fields and its own shortcut must not re-open it.
+        let modal_open =
+            self.palette.is_open() || self.new_file.is_open() || self.pending.is_some();
+        let mut invoked = if modal_open {
             None
         } else {
             commands::triggered(&ctx)
@@ -824,16 +1087,10 @@ impl eframe::App for EditorApp {
                 }
                 tab_bar::Action::Close(i) => self.close_tab(i),
                 tab_bar::Action::CloseOthers(keep) => {
-                    if keep < self.docs.len() {
-                        let kept = self.docs.remove(keep);
-                        self.docs.clear();
-                        self.docs.push(kept);
-                        self.active = Some(0);
-                    }
+                    self.pending = Some(Pending::CloseOthers(keep));
                 }
                 tab_bar::Action::CloseAll => {
-                    self.docs.clear();
-                    self.active = None;
+                    self.pending = Some(Pending::CloseAll);
                 }
                 tab_bar::Action::None => {}
             }
@@ -841,8 +1098,13 @@ impl eframe::App for EditorApp {
 
         invoked = self.palette.ui(&ctx).or(invoked);
 
+        if let Some(request) = self.new_file.ui(&ctx, editor_config::APP_AUTHOR) {
+            self.create_file(request);
+        }
+
         self.about_window(&ctx);
         self.shortcuts_window(&ctx);
+        self.unsaved_prompt(&ctx);
         self.toasts_ui(&ctx);
 
         if let Some(id) = invoked {
@@ -949,6 +1211,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
         "File",
         &[
             MenuEntry::Item(CommandId::NewFile),
+            MenuEntry::Item(CommandId::NewScratch),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::OpenFile),
             MenuEntry::Item(CommandId::OpenFolder),

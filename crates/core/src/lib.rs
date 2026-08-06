@@ -18,6 +18,7 @@
 
 pub mod document;
 pub mod edit;
+pub mod filename;
 pub mod history;
 pub mod selection;
 

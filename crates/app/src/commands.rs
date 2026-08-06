@@ -18,6 +18,7 @@ use eframe::egui::{Key, KeyboardShortcut, Modifiers};
 pub(crate) enum CommandId {
     // File
     NewFile,
+    NewScratch,
     OpenFile,
     OpenFolder,
     Save,
@@ -56,6 +57,7 @@ impl CommandId {
     /// exhaustiveness test.
     pub(crate) const ALL: &'static [Self] = &[
         Self::NewFile,
+        Self::NewScratch,
         Self::OpenFile,
         Self::OpenFolder,
         Self::Save,
@@ -139,7 +141,13 @@ pub(crate) fn registry() -> &'static [Command] {
 }
 
 static REGISTRY: [Command; CommandId::ALL.len()] = [
-    cmd(CommandId::NewFile, "File", "New File", ctrl(Key::N)),
+    cmd(CommandId::NewFile, "File", "New File...", ctrl(Key::N)),
+    cmd(
+        CommandId::NewScratch,
+        "File",
+        "New Untitled Buffer",
+        ctrl_shift(Key::N),
+    ),
     cmd(CommandId::OpenFile, "File", "Open File", ctrl(Key::O)),
     cmd(
         CommandId::OpenFolder,

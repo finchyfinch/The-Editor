@@ -75,6 +75,14 @@ impl EditorView {
         self.selection.len()
     }
 
+    /// Put the caret at `offset`, collapsing any selection, and scroll it into
+    /// view. Used to honour a template's `$CURSOR` marker.
+    pub fn set_caret(&mut self, offset: usize) {
+        self.selection = Selection::at(offset);
+        self.goal_column = None;
+        self.scroll_to_caret = true;
+    }
+
     /// Take the keyboard on the next frame.
     ///
     /// Called when a document is opened or a tab is selected, so that typing

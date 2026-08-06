@@ -216,7 +216,7 @@ mod tests {
     fn an_empty_query_lists_every_command_in_registry_order() {
         let all = results_for("");
         assert_eq!(all.len(), commands::registry().len());
-        assert_eq!(all.first().map(String::as_str), Some("File: New File"));
+        assert_eq!(all.first().map(String::as_str), Some("File: New File..."));
     }
 
     #[test]

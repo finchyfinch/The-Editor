@@ -10,6 +10,27 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **New File dialog** (Ctrl+N). Name, language, location, and an optional
+  boilerplate template with a live preview of exactly what will be written.
+  - Name and language stay in step both ways: choosing Rust sets `.rs`, and
+    typing `.rs` switches the language to Rust. A dotfile such as `.gitignore`
+    is taken as a complete name rather than having an extension appended.
+  - 27 templates across Python, Rust, HTML, CSS, JavaScript, JSON, INI, TOML,
+    Markdown and plain text, with `${NAME}`, `${FILENAME}`, `${CLASS_NAME}`,
+    `${AUTHOR}` and `${DATE}` substitution, and a `$CURSOR` marker that places
+    the caret where you would start typing.
+  - Names are validated before anything is written, including the rules that
+    only Windows enforces — reserved device names (`CON`, `NUL.txt`, `COM1.py`),
+    trailing dots and spaces, and illegal characters — on every platform, so a
+    project created on Linux does not become un-checkoutable on Windows.
+  - An existing file requires a second, explicit click to overwrite.
+  - Ctrl+Shift+N still creates a plain untitled buffer with no dialog.
+- **Unsaved changes are now guarded.** Closing a tab, Close Others, Close All
+  and quitting the application all prompt Save / Don't Save / Cancel when there
+  is unsaved work, listing the affected files. Escape is Cancel, never the
+  destructive option. A save that fails cancels the close rather than
+  proceeding and losing the work.
+
 - **M2 (in progress) — Editor core.** The editor pane is now editable.
   - Virtualised painting: only the visible rows are laid out, so cost tracks the
     viewport rather than the file size.

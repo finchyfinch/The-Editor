@@ -875,12 +875,14 @@ the overflow dropdown; Ctrl+Tab most-recently-used cycling; go-to-file
 (Ctrl+P); native macOS menu bar via `muda`; and a build/run pass on Linux and
 macOS.
 
-**M2 still to do:** the New File dialog (pulled forward from M8); prompting
-Save / Don't Save / Cancel when closing a dirty tab; multi-cursor and column
-selection; word-wise motion and deletion (Ctrl+arrow, Ctrl+Backspace); line
-manipulation (duplicate, move up/down, delete); external-change detection;
-crash-recovery autosave; and the performance benchmarks that assert the §2.4
-budgets.
+**Also landed:** the New File dialog with all its templates (pulled forward from
+M8), and the Save / Don't Save / Cancel guard on closing a dirty tab, Close
+Others, Close All and quitting.
+
+**M2 still to do:** multi-cursor and column selection; word-wise motion and
+deletion (Ctrl+arrow, Ctrl+Backspace); line manipulation (duplicate, move
+up/down, delete); external-change detection; crash-recovery autosave; and the
+performance benchmarks that assert the §2.4 budgets.
 
 Still outstanding, none of it blocking:
 - Set up the bare backup remote (`git remote add origin <path-to-nas>/the-editor.git`).

@@ -5,6 +5,8 @@
 //! visible viewport only; parse trees are updated incrementally via
 //! `Tree::edit` on every transaction. See PLAN.md §3.5.
 
+pub mod templates;
+
 // M3 populates these.
 //
 // pub mod language;    // LanguageId, detection by extension/shebang/override
@@ -54,6 +56,38 @@ impl LanguageId {
         }
     }
 
+    /// Every language, in the order the New File dialog lists them: the two
+    /// this IDE is built for first, then the rest.
+    pub const ALL: [Self; 10] = [
+        Self::Python,
+        Self::Rust,
+        Self::Json,
+        Self::JavaScript,
+        Self::Html,
+        Self::Css,
+        Self::Ini,
+        Self::Toml,
+        Self::Markdown,
+        Self::PlainText,
+    ];
+
+    /// Extension a new file of this language gets, without the dot.
+    #[must_use]
+    pub fn default_extension(self) -> &'static str {
+        match self {
+            Self::Python => "py",
+            Self::Rust => "rs",
+            Self::Json => "json",
+            Self::JavaScript => "js",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Ini => "ini",
+            Self::Toml => "toml",
+            Self::Markdown => "md",
+            Self::PlainText => "txt",
+        }
+    }
+
     /// Human-readable name, for the status bar and the New File dialog.
     #[must_use]
     pub fn display_name(self) -> &'static str {
@@ -88,5 +122,22 @@ mod tests {
     fn unknown_extensions_open_as_plain_text_rather_than_failing() {
         assert_eq!(LanguageId::from_extension("xyzzy"), LanguageId::PlainText);
         assert_eq!(LanguageId::from_extension(""), LanguageId::PlainText);
+    }
+
+    #[test]
+    fn every_default_extension_maps_back_to_its_own_language() {
+        for language in LanguageId::ALL {
+            assert_eq!(
+                LanguageId::from_extension(language.default_extension()),
+                language,
+                "{language:?} does not round-trip through its default extension"
+            );
+        }
+    }
+
+    #[test]
+    fn python_and_rust_lead_the_language_list() {
+        assert_eq!(LanguageId::ALL.first(), Some(&LanguageId::Python));
+        assert_eq!(LanguageId::ALL.get(1), Some(&LanguageId::Rust));
     }
 }
