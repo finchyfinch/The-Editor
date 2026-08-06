@@ -85,6 +85,18 @@ pub struct EditorView {
     /// Search results to highlight, supplied by the find bar.
     search_matches: Vec<std::ops::Range<usize>>,
     current_match: Option<std::ops::Range<usize>>,
+    /// Diagnostic underlines, supplied by the application each frame.
+    diagnostics: Vec<Underline>,
+}
+
+/// A range to underline, and how seriously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Underline {
+    /// Character offsets into the document.
+    pub range: std::ops::Range<usize>,
+    pub severity: editor_lsp::diagnostics::Severity,
+    /// Shown on hover.
+    pub message: String,
 }
 
 impl EditorView {
@@ -198,6 +210,14 @@ impl EditorView {
         opts: EditorOptions,
     ) -> bool {
         self.render(ui, doc, highlighter, syntax, opts)
+    }
+
+    /// Diagnostics to underline, from the language servers.
+    ///
+    /// Supplied per frame rather than held, because they belong to the document
+    /// and several views may show the same one.
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<Underline>) {
+        self.diagnostics = diagnostics;
     }
 
     /// Ranges to highlight as search results, and which of them is current.
@@ -1069,8 +1089,51 @@ impl EditorView {
                 }
             }
 
+            // Diagnostic underlines, over the text so they are not hidden by
+            // the selection.
+            if !self.diagnostics.is_empty() {
+                let line_end = line_start + text.chars().count();
+                for diagnostic in &self.diagnostics {
+                    if diagnostic.range.end < line_start || diagnostic.range.start > line_end {
+                        continue;
+                    }
+                    let from = diagnostic.range.start.clamp(line_start, line_end) - line_start;
+                    let to = diagnostic.range.end.clamp(line_start, line_end) - line_start;
+                    // A zero-width diagnostic — an error at the end of a line —
+                    // still needs something visible, so give it a minimum width.
+                    let x0 = text_left + galley.pos_from_cursor(ccursor(from)).left();
+                    let x1 = (text_left + galley.pos_from_cursor(ccursor(to)).left()).max(x0 + 6.0);
+                    paint_squiggle(
+                        &painter,
+                        x0,
+                        x1,
+                        y + row_height - 2.0,
+                        severity_colour(&visuals, diagnostic.severity),
+                    );
+                }
+            }
+
             if opts.show_line_numbers {
                 let is_caret_line = line == caret_line;
+                // A gutter glyph for the worst diagnostic on this line, so
+                // severity is not conveyed by the squiggle's colour alone.
+                if let Some(worst) = self
+                    .diagnostics
+                    .iter()
+                    .filter(|d| {
+                        let line_end = line_start + text.chars().count();
+                        d.range.start <= line_end && d.range.end >= line_start
+                    })
+                    .min_by_key(|d| d.severity)
+                {
+                    painter.text(
+                        egui::pos2(rect.left() + 2.0, y),
+                        egui::Align2::LEFT_TOP,
+                        worst.severity.glyph(),
+                        font.clone(),
+                        severity_colour(&visuals, worst.severity),
+                    );
+                }
                 painter.text(
                     egui::pos2(text_left - 12.0, y),
                     egui::Align2::RIGHT_TOP,
@@ -1205,6 +1268,52 @@ fn format_for(
         color: colour,
         italics: style.italic,
         ..Default::default()
+    }
+}
+
+/// Draw a wavy underline.
+///
+/// A squiggle rather than a straight line because it is the one underline
+/// convention nobody confuses with a hyperlink or a spelling of emphasis, and
+/// because it survives being drawn under a selection.
+fn paint_squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, colour: egui::Color32) {
+    const WAVELENGTH: f32 = 4.0;
+    const AMPLITUDE: f32 = 1.5;
+
+    let mut points = Vec::new();
+    let mut x = x0;
+    let mut up = true;
+    while x < x1 {
+        points.push(egui::pos2(
+            x,
+            if up { y - AMPLITUDE } else { y + AMPLITUDE },
+        ));
+        x += WAVELENGTH / 2.0;
+        up = !up;
+    }
+    points.push(egui::pos2(
+        x1,
+        if up { y - AMPLITUDE } else { y + AMPLITUDE },
+    ));
+
+    if points.len() >= 2 {
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.0, colour)));
+    }
+}
+
+/// Theme-aware colour for a diagnostic severity.
+///
+/// Public so the Problems panel colours its rows the same way as the squiggles
+/// — two palettes for the same thing would be worse than one imperfect one.
+pub fn severity_colour(
+    visuals: &egui::Visuals,
+    severity: editor_lsp::diagnostics::Severity,
+) -> egui::Color32 {
+    use editor_lsp::diagnostics::Severity;
+    match severity {
+        Severity::Error => visuals.error_fg_color,
+        Severity::Warning => visuals.warn_fg_color,
+        Severity::Information | Severity::Hint => visuals.weak_text_color(),
     }
 }
 

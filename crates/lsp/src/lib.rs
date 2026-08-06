@@ -1,25 +1,27 @@
 //! Language Server Protocol client and server lifecycle management.
 //!
-//! One tokio task per server, JSON-RPC over stdio. Supports several servers
-//! per language (Python uses `ruff` for lint/format alongside `basedpyright`
-//! for types) with merged, source-tagged diagnostics.
+//! One thread pair per server, JSON-RPC over stdio. Several servers may serve
+//! one language — Python uses `ruff` for linting alongside a type checker —
+//! with merged, source-tagged diagnostics.
 //!
-//! Two things this module must get right, because both are silent failures:
+//! **Threads rather than tokio**, departing from PLAN.md §1 D5. Everything else
+//! that talks to a child process is already built this way, and a handful of
+//! language servers does not need a scheduler; one concurrency model in the
+//! codebase is worth more than the efficiency of a second.
 //!
-//! - **Degradation.** With no server installed the editor still works. See the
-//!   ladder in PLAN.md §3.6 — buffer words, keywords and tree-sitter symbols.
-//! - **Process cleanup.** On Windows, killing the child is not enough;
-//!   `rust-analyzer` spawns its own children and they outlive us. Servers must
-//!   be assigned to a Job Object so the whole tree dies with the editor.
+//! Two things this crate must get right, because both are silent failures:
+//!
+//! - **Degradation.** With no server installed the editor still works, and
+//!   noticing a server is absent costs one filesystem check rather than one per
+//!   keystroke. See PLAN.md §3.6.
+//! - **Cleanup.** A server left running holds a workspace index and a few
+//!   hundred megabytes, so every exit path stops them — including `Drop`.
 
 // This crate spawns and reaps external processes. Panics leak them.
 #![deny(clippy::unwrap_used)]
 
-// M6 populates these.
-//
-// pub mod client;      // LspClient: request/response/notification plumbing
-// pub mod transport;   // JSON-RPC framing over stdio
-// pub mod registry;    // which server for which language, discovery on PATH
-// pub mod lifecycle;   // spawn, initialize, shutdown, crash restart w/ backoff
-// pub mod diagnostics; // merge and route publishDiagnostics
-// pub mod fallback;    // the no-server completion ladder
+pub mod diagnostics;
+pub mod registry;
+pub mod server;
+pub mod session;
+pub mod transport;

@@ -10,6 +10,41 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **M6 (in progress) — Language servers.** Diagnostics from `rust-analyzer`,
+  `ruff`, `pyright`/`basedpyright`, `pylsp` and `taplo`, whichever are
+  installed.
+  - Squiggles under the offending text, a gutter glyph per line, a **Problems**
+    panel grouped by file (Ctrl+Shift+M), and error/warning counts in the
+    status bar. Severity is shown by glyph as well as colour.
+  - **Several servers per language.** Python is served by `ruff` for linting
+    alongside a type checker, and each publishes its own complete set for a
+    file — so diagnostics are stored per source and merged, or each server
+    would erase the other's findings.
+  - A crashed server restarts with backoff and gives up after three attempts;
+    a server that ran healthily for a minute before dying has its counter
+    reset, so a fault an hour in is not treated as the fourth failure of a
+    broken server. Its diagnostics are cleared when it dies, since it is no
+    longer running to correct them, and every open document is re-sent when it
+    comes back.
+  - Servers in a project's virtual environment are preferred over globally
+    installed ones, so a project pinning `ruff` is linted by that version.
+  - **With no server installed the editor is unaffected**: opening a file of a
+    language with no server allocates nothing, and an absent server costs one
+    filesystem check rather than one per keystroke. The Problems panel says
+    which servers would help and what they provide, rather than showing an
+    empty list that looks like "no problems".
+  - Everything stops on exit, including via `Drop` — a language server left
+    running holds a workspace index and a few hundred megabytes.
+
+### Fixed
+
+- **A binary on `PATH` was assumed to work.** `~/.cargo/bin/rust-analyzer`
+  exists whenever `rustup` is installed even when the component is not; running
+  it exits 1 with "Unknown binary in official toolchain". Speaking LSP to it
+  produced an immediate end of stream indistinguishable from a server crashing
+  on startup. Discovery now runs each candidate's version flag before offering
+  it — the same class of trap as the Microsoft Store Python stub.
+
 - **Session restore.** The open folder, the open files with their caret
   positions, the active tab, the output panel and the window geometry all come
   back on the next launch. Controlled by `[ui] restore_session`.

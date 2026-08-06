@@ -47,6 +47,7 @@ pub(crate) enum CommandId {
     RunRestart,
     RunTests,
     ShowOutput,
+    ShowProblems,
     SelectInterpreter,
     CreateVenv,
     // View
@@ -99,6 +100,7 @@ impl CommandId {
         Self::RunRestart,
         Self::RunTests,
         Self::ShowOutput,
+        Self::ShowProblems,
         Self::SelectInterpreter,
         Self::CreateVenv,
         Self::ToggleExplorer,
@@ -250,6 +252,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "View",
         "Toggle Output Panel",
         ctrl(Key::J),
+    ),
+    cmd(
+        CommandId::ShowProblems,
+        "View",
+        "Problems",
+        ctrl_shift(Key::M),
     ),
     cmd(
         CommandId::SelectInterpreter,

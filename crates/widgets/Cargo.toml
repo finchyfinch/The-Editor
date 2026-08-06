@@ -16,6 +16,7 @@ eframe.workspace = true
 editor-search = { version = "1.0.0", path = "../search" }
 editor-proc = { version = "1.0.0", path = "../proc" }
 trash = "5.2.6"
+editor-lsp = { version = "1.0.0", path = "../lsp" }
 
 [lints]
 workspace = true

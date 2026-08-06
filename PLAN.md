@@ -24,7 +24,7 @@ which switching is still cheap, so they can be revisited deliberately rather tha
 | D2 | **Text storage: `ropey`** rope, one buffer per document | O(log n) edits and line indexing, UTF-8 native, handles multi-MB files without the O(n) copies a `String` would cost. Battle-tested (Helix uses it). | `crop`, or a piece table. Contained inside `ide-core::Buffer`. |
 | D3 | **Highlighting: `tree-sitter`** with per-language grammars, incremental reparse | Real parse trees → correct highlighting, plus free bracket matching, code folding ranges, "select enclosing node", and indentation heuristics. One mechanism serves five features. | Regex/`syntect` (`.sublime-syntax`). Keep a `Highlighter` trait so a regex fallback can serve any language without a grammar (INI can go either way). |
 | D4 | **Intelligence: LSP client**, not hand-written analysis | Completion, diagnostics, hover, go-to-definition, rename and formatting all come from `rust-analyzer` / `ruff` / `pyright` for free and stay correct as those languages evolve. Writing a Python type inferencer is a multi-year project on its own. | None sensible. Must ship a graceful degradation path: buffer-word + keyword completion when no server is installed, so the IDE is never *broken* by a missing server. |
-| D5 | **Concurrency: `tokio` runtime on a background thread**, UI thread never blocks | Every slow thing (LSP I/O, file scanning, project search, child processes, FS watching) is async; the UI thread only drains channels. Guarantees the 60 fps repaint budget. | Thread-per-task with `std::sync::mpsc`. Tokio wins because the LSP client and PTY handling both want async I/O anyway. |
+| D5 | ~~**Concurrency: `tokio` runtime**~~ → **threads and channels**, UI thread never blocks | *Revised during M7.* Every slow thing runs off the UI thread, which only drains channels — that part held. But the PTY, the filesystem watcher and the LSP client each turned out to need one or two threads and a channel, not a scheduler. Adding tokio for the LSP client alone would have meant two concurrency models in one codebase, which is worth more than the efficiency it would have bought. Revisit if project-wide search or a plugin host ever needs real task management. | Tokio, as originally planned. |
 | D6 | **Run/console: PTY-backed** (`portable-pty` + `alacritty_terminal` for VT parsing) | Programs behave the same as in a real terminal: `input()` works, colours work, Ctrl-C works, progress bars work. Piped stdout would break interactive Python immediately. | Plain `Command` + pipes. Cheap now, painful later — do the PTY from the start. |
 | D7 | **Config: TOML**, layered *defaults → user → project* | Human-editable, diffable, comment-friendly; `serde` gives the settings UI a typed source of truth. | JSON (no comments) / YAML (indentation footguns). |
 | D8 | **No telemetry, no auto-update, no network calls** in 1.0 | Simpler, privacy-clean, no server infrastructure to run, and no signing/hosting requirement beyond the release artefacts themselves. | Add an opt-in update *check* post-1.0 if ever wanted. |
@@ -861,6 +861,13 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
       case and whole-word options, match highlighting, wrapping navigation, and
       Replace All as one undo step. Still to do: project-wide search and replace
       on the ripgrep engine, and go-to-file / go-to-symbol.
+- [ ] **M6 — Language servers.** The client works: transport, handshake,
+      document sync, diagnostics with a Problems panel, several servers per
+      language, crash recovery, and a degradation path that costs nothing when
+      no server is installed. Still to do: the completion popup, hover,
+      go-to-definition, find-references, rename, code actions, and
+      format-on-save — all of which build on the request machinery now in
+      place.
 - [ ] **M7 — Run & console.** Running Python and Rust works, under a PTY, with
       clickable error links, stdin, stop and restart. The venv creation dialog
       (§3.8a) is done, along with interpreter discovery beyond `PATH`. Still to

@@ -1,4 +1,4 @@
-//! The application shell: layout, command routing, and the document set.
+﻿//! The application shell: layout, command routing, and the document set.
 //!
 //! Everything the user can trigger goes through [`EditorApp::run_command`], so
 //! the menus, the toolbar, the keyboard and the palette cannot diverge in
@@ -7,7 +7,7 @@
 //! Each open document carries its own editing view state and its own parse tree
 //! for highlighting. Edits reach the parse tree by draining the document's
 //! change outbox once per frame rather than by every edit path remembering to
-//! notify it â€” the same route the language server will take in M6.
+//! notify it ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the same route the language server will take in M6.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,7 +20,7 @@ use editor_core::document::Document;
 use editor_syntax::LanguageId;
 use editor_syntax::highlight::Highlighter;
 use editor_syntax::theme::SyntaxTheme;
-use editor_widgets::editor_view::{EditorOptions, EditorView};
+use editor_widgets::editor_view::{EditorOptions, EditorView, Underline, severity_colour};
 use editor_widgets::find_bar::{self, FindBar};
 use editor_widgets::{file_tree::FileTree, tab_bar, theme as ui_theme};
 use eframe::egui;
@@ -141,6 +141,21 @@ pub(crate) struct EditorApp {
     /// Set once the session has been written on quit, so it is not written
     /// again by a second close request.
     session_saved: bool,
+
+    lsp: editor_lsp::session::Lsp,
+    /// Which bottom-dock tab is showing.
+    dock: DockTab,
+    /// Document versions the servers were last told about, so an unchanged
+    /// document is not re-sent every frame.
+    synced: std::collections::HashMap<PathBuf, u64>,
+}
+
+/// The bottom dock's tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DockTab {
+    #[default]
+    Output,
+    Problems,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -186,6 +201,9 @@ impl EditorApp {
             watcher: None,
             restore: settings.restore_session().then(|| session.clone()),
             session_saved: false,
+            lsp: editor_lsp::session::Lsp::default(),
+            dock: DockTab::default(),
+            synced: std::collections::HashMap::new(),
             settings,
         };
 
@@ -237,7 +255,7 @@ impl EditorApp {
         self.active.and_then(|i| self.docs.get_mut(i))
     }
 
-    /// Editor options from settings, with the language left at its default â€”
+    /// Editor options from settings, with the language left at its default ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â
     /// callers that have a document fill that in.
     fn editor_options(&self) -> EditorOptions {
         EditorOptions {
@@ -425,7 +443,7 @@ impl EditorApp {
         };
         let at_risk = self.at_risk(pending);
 
-        // Nothing actually unsaved â€” proceed without bothering the user.
+        // Nothing actually unsaved ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â proceed without bothering the user.
         if at_risk.is_empty() {
             self.pending = None;
             self.commit_pending(pending, ctx);
@@ -478,7 +496,7 @@ impl EditorApp {
             });
         });
 
-        // Escape is Cancel â€” the safe option, never the destructive one.
+        // Escape is Cancel ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the safe option, never the destructive one.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             decision = Some(Decision::Cancel);
         }
@@ -625,8 +643,8 @@ impl EditorApp {
     fn current_session(&self, ctx: &egui::Context) -> Session {
         let window = ctx.input(|i| {
             let viewport = i.viewport();
-            // Position comes from the outer rect — that is where the window
-            // actually is — but the size comes from the *inner* rect, because
+            // Position comes from the outer rect Ã¢â‚¬â€ that is where the window
+            // actually is Ã¢â‚¬â€ but the size comes from the *inner* rect, because
             // that is what `InnerSize` sets when restoring. Saving the outer
             // size and restoring it as the inner one makes the window grow by
             // the height of its own title bar on every launch.
@@ -674,8 +692,8 @@ impl EditorApp {
     fn open_folder(&mut self, folder: PathBuf) {
         tracing::info!(path = %folder.display(), "opening folder");
 
-        // Reopening the same folder — which session restore can do right after
-        // startup — should not tear down a working watch and build another.
+        // Reopening the same folder Ã¢â‚¬â€ which session restore can do right after
+        // startup Ã¢â‚¬â€ should not tear down a working watch and build another.
         if self.watcher.as_ref().is_some_and(|w| w.root() == folder) {
             self.tree.set_root(folder);
             return;
@@ -692,6 +710,199 @@ impl EditorApp {
             }
         }
         self.tree.set_root(folder);
+    }
+
+    /// The Problems panel: every diagnostic, grouped by file.
+    ///
+    /// Returns the location to jump to when a row is clicked.
+    fn problems_ui(&mut self, ui: &mut egui::Ui) -> Option<(PathBuf, usize, usize)> {
+        let files = self.lsp.diagnostics().all();
+
+        if files.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(16.0);
+                if self.lsp.running().is_empty() {
+                    // Distinguish "nothing wrong" from "nothing is checking",
+                    // which look identical and mean opposite things.
+                    ui.weak("No language server is running");
+                    let missing = self.lsp.missing();
+                    if !missing.is_empty() {
+                        ui.add_space(4.0);
+                        for spec in missing {
+                            ui.small(format!(
+                                "{} is not installed \u{2014} it would provide {}",
+                                spec.name, spec.provides
+                            ));
+                        }
+                    }
+                } else {
+                    ui.weak("No problems");
+                }
+            });
+            return None;
+        }
+
+        let mut clicked = None;
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (path, diagnostics) in files {
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.strong(name);
+                        ui.weak(format!("({})", diagnostics.len()));
+                    });
+
+                    for diagnostic in diagnostics {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.colored_label(
+                                severity_colour(ui.visuals(), diagnostic.severity),
+                                diagnostic.severity.glyph(),
+                            );
+                            ui.weak(format!("{}:{}", diagnostic.line + 1, diagnostic.column + 1));
+                            let row = ui.add(
+                                egui::Label::new(diagnostic.summary())
+                                    .sense(egui::Sense::click())
+                                    .truncate(),
+                            );
+                            if row
+                                .on_hover_text(&diagnostic.message)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                clicked = Some((
+                                    path.clone(),
+                                    diagnostic.line as usize,
+                                    diagnostic.column as usize,
+                                ));
+                            }
+                        });
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+        clicked
+    }
+
+    /// Open a file and put the caret at a zero-based line and column.
+    fn open_at(&mut self, path: &Path, line: usize, column: usize) {
+        self.open_path(path, false);
+        if let Some(entry) = self.active_mut() {
+            let offset = entry.doc.offset_at(line, column);
+            entry.view.set_caret(offset);
+            entry.view.focus();
+        }
+    }
+
+    /// Keep the language servers' view of the open documents current, and
+    /// drain whatever they have said.
+    ///
+    /// Driven from the documents' own version counters rather than from the
+    /// edit path, so no future way of changing text can forget to tell them Ã¢â‚¬â€
+    /// the same reason the highlighter is driven from the change outbox.
+    fn sync_language_servers(&mut self) {
+        let extra_path = self.tool_search_path();
+        self.lsp
+            .set_root(self.tree.root().map(Path::to_path_buf), extra_path);
+
+        // Tell the servers about anything new or changed.
+        for entry in &self.docs {
+            let Some(path) = entry.doc.path() else {
+                continue;
+            };
+            let version = entry.doc.version();
+            match self.synced.get(path) {
+                None => {
+                    self.lsp.open(path, &entry.doc.text().to_string());
+                    self.synced.insert(path.to_path_buf(), version);
+                }
+                Some(known) if *known != version => {
+                    self.lsp.change(path, &entry.doc.text().to_string());
+                    self.synced.insert(path.to_path_buf(), version);
+                }
+                Some(_) => {}
+            }
+        }
+
+        // ...and about anything closed.
+        let open: std::collections::HashSet<PathBuf> = self
+            .docs
+            .iter()
+            .filter_map(|d| d.doc.path().map(Path::to_path_buf))
+            .collect();
+        let closed: Vec<PathBuf> = self
+            .synced
+            .keys()
+            .filter(|p| !open.contains(*p))
+            .cloned()
+            .collect();
+        for path in closed {
+            self.lsp.close(&path);
+            self.synced.remove(&path);
+        }
+
+        for notice in self.lsp.poll() {
+            match notice {
+                editor_lsp::session::Notice::ServerReady(id) => {
+                    tracing::info!(server = id, "ready");
+                }
+                editor_lsp::session::Notice::ServerDied {
+                    name, restarting, ..
+                } => {
+                    if restarting {
+                        self.info(format!("{name} stopped unexpectedly; restarting"));
+                    } else {
+                        self.error(format!("{name} keeps failing; giving up on it"));
+                    }
+                }
+                editor_lsp::session::Notice::DiagnosticsChanged(_) => {}
+            }
+        }
+    }
+
+    /// Directories searched before `PATH` when looking for language servers.
+    ///
+    /// A project virtual environment's tools come first, so a project with
+    /// `ruff` pinned in its venv is linted by that version rather than by
+    /// whatever happens to be installed globally.
+    fn tool_search_path(&self) -> Vec<PathBuf> {
+        let Some(root) = self.tree.root() else {
+            return Vec::new();
+        };
+        editor_proc::interpreter::find_venv(root)
+            .and_then(|venv| venv.path.parent().map(Path::to_path_buf))
+            .into_iter()
+            .collect()
+    }
+
+    /// Diagnostics for a document, converted to character offsets.
+    ///
+    /// The protocol works in zero-based line and UTF-16 column; the editor works
+    /// in character offsets. Converting here rather than at the point of use
+    /// means one place to get it wrong.
+    fn underlines_for(entry: &OpenDoc, store: &editor_lsp::diagnostics::Store) -> Vec<Underline> {
+        let Some(path) = entry.doc.path() else {
+            return Vec::new();
+        };
+        store
+            .for_file(path)
+            .into_iter()
+            .map(|d| {
+                let start = entry.doc.offset_at(d.line as usize, d.column as usize);
+                let end = entry
+                    .doc
+                    .offset_at(d.end_line as usize, d.end_column as usize);
+                Underline {
+                    range: start..end.max(start),
+                    severity: d.severity,
+                    message: d.summary(),
+                }
+            })
+            .collect()
     }
 
     /// React to files changing outside The Editor.
@@ -1171,6 +1382,13 @@ impl EditorApp {
                 }
             }
             CommandId::ShowOutput => self.show_output = !self.show_output,
+            CommandId::ShowProblems => {
+                // Always shows rather than toggles: this is reached from the
+                // status-bar problem count, where hiding the panel would be a
+                // surprising answer to "show me the problems".
+                self.show_output = true;
+                self.dock = DockTab::Problems;
+            }
             CommandId::CreateVenv => match self.tree.root() {
                 Some(root) => self.venv_dialog.open(root.to_path_buf()),
                 None => self.error("Open a folder before creating a virtual environment"),
@@ -1262,7 +1480,7 @@ impl EditorApp {
 
         if changed {
             ui_theme::apply(ctx, resolved, scale, font_size);
-            // The code pane follows the UI theme. PLAN.md Â§3.11 allows pinning
+            // The code pane follows the UI theme. PLAN.md Ãƒâ€šÃ‚Â§3.11 allows pinning
             // them apart; the setting for that arrives with the settings UI.
             self.syntax_theme = SyntaxTheme::for_ui(resolved);
             self.applied_theme = Some(resolved);
@@ -1352,6 +1570,7 @@ impl EditorApp {
         let tab_width = self.settings.tab_width();
         let insert_spaces = self.settings.insert_spaces();
         let running = self.runner.is_running() || self.runner.has_queued_work();
+        let diagnostic_counts = self.lsp.diagnostics().total_counts();
         let has_run = self.runner.output().line_count() > 1;
         let run_label = self.runner.label().to_owned();
 
@@ -1390,6 +1609,25 @@ impl EditorApp {
                         }
                     }
 
+                    // Problem counts, and a way to the panel listing them.
+                    if !diagnostic_counts.is_empty() {
+                        ui.separator();
+                        let text = format!(
+                            "{} {}  {} {}",
+                            editor_lsp::diagnostics::Severity::Error.glyph(),
+                            diagnostic_counts.errors,
+                            editor_lsp::diagnostics::Severity::Warning.glyph(),
+                            diagnostic_counts.warnings
+                        );
+                        if ui
+                            .button(text)
+                            .on_hover_text("Show the Problems panel")
+                            .clicked()
+                        {
+                            invoked = Some(CommandId::ShowProblems);
+                        }
+                    }
+
                     // What is running, and a way back to its output. Without
                     // this, a hidden output panel means a running process with
                     // nothing on screen to say so.
@@ -1410,8 +1648,8 @@ impl EditorApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // The theme indicator is a control, not a label â€” one
-                        // of the three ways PLAN.md Â§3.11 requires it to be
+                        // The theme indicator is a control, not a label ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â one
+                        // of the three ways PLAN.md Ãƒâ€šÃ‚Â§3.11 requires it to be
                         // reachable.
                         if ui
                             .button(format!("\u{25d0} {theme_label}"))
@@ -1460,12 +1698,13 @@ impl EditorApp {
 
             let mut opts = self.editor_options();
             let syntax = &self.syntax_theme;
+            let diagnostics = self.lsp.diagnostics();
 
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
                 opts.language = entry.language;
                 // Bring the parse tree up to date before painting from it.
-                // Draining the outbox here means every edit path â€” typing,
-                // paste, undo, redo â€” feeds the highlighter without each one
+                // Draining the outbox here means every edit path ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â typing,
+                // paste, undo, redo ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â feeds the highlighter without each one
                 // having to remember to.
                 let changes = entry.doc.take_changes();
                 if let Some(h) = entry.highlighter.as_mut()
@@ -1490,6 +1729,9 @@ impl EditorApp {
                 entry
                     .view
                     .set_search_matches(entry.find.matches(), entry.find.current_match());
+                entry
+                    .view
+                    .set_diagnostics(Self::underlines_for(entry, diagnostics));
 
                 // Editing a preview tab promotes it: the file is being worked
                 // on, so it must not be replaced by the next explorer click.
@@ -1604,7 +1846,7 @@ impl EditorApp {
     }
 
     /// Generated from the registry, so it cannot describe a binding that does
-    /// not exist. PLAN.md Â§3.10.
+    /// not exist. PLAN.md Ãƒâ€šÃ‚Â§3.10.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_shortcuts;
         egui::Window::new("Keyboard Shortcuts")
@@ -1647,6 +1889,7 @@ impl eframe::App for EditorApp {
             self.restore_session(&session, &ctx);
         }
         self.poll_watcher();
+        self.sync_language_servers();
 
         // Never let the window close with unsaved work. This must run before
         // anything else in the frame, and `quit_confirmed` stops the second
@@ -1664,7 +1907,7 @@ impl eframe::App for EditorApp {
         }
 
         // One command per frame, from whichever source fired. Keyboard first,
-        // so a shortcut is not swallowed by a menu that happens to be open â€”
+        // so a shortcut is not swallowed by a menu that happens to be open ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
         let modal_open = self.palette.is_open()
@@ -1715,7 +1958,7 @@ impl eframe::App for EditorApp {
             }
         }
         // Between the steps of a sequence there is momentarily no process, but
-        // work is still pending â€” treating that as "finished" makes the status
+        // work is still pending ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â treating that as "finished" makes the status
         // bar and the console header flicker.
         if self.runner.is_running() || self.runner.has_queued_work() {
             // A running process produces output between frames, so keep
@@ -1725,24 +1968,50 @@ impl eframe::App for EditorApp {
 
         if self.show_output {
             let mut console_action = None;
+            let mut problem_clicked = None;
             egui::Panel::bottom("dock")
                 .resizable(true)
                 .default_size(220.0)
                 .size_range(60.0..=800.0)
                 .show(ui, |ui| {
+                    let counts = self.lsp.diagnostics().total_counts();
                     ui.horizontal(|ui| {
-                        ui.strong("OUTPUT");
+                        if ui
+                            .selectable_label(self.dock == DockTab::Output, "OUTPUT")
+                            .clicked()
+                        {
+                            self.dock = DockTab::Output;
+                        }
+                        let problems = if counts.is_empty() {
+                            "PROBLEMS".to_owned()
+                        } else {
+                            format!("PROBLEMS ({})", counts.total())
+                        };
+                        if ui
+                            .selectable_label(self.dock == DockTab::Problems, problems)
+                            .clicked()
+                        {
+                            self.dock = DockTab::Problems;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
                                 self.show_output = false;
                             }
                         });
                     });
-                    console_action = Some(self.runner.draw(ui));
+                    ui.separator();
+
+                    match self.dock {
+                        DockTab::Output => console_action = Some(self.runner.draw(ui)),
+                        DockTab::Problems => problem_clicked = self.problems_ui(ui),
+                    }
                 });
 
             if let Some(action) = console_action {
                 self.apply_console_action(action);
+            }
+            if let Some((path, line, column)) = problem_clicked {
+                self.open_at(&path, line, column);
             }
         }
 
@@ -1836,7 +2105,7 @@ impl EditorApp {
 ///
 /// Replacements go through the document's normal transaction path, so they land
 /// in the undo history and reach the highlighter like any other edit. Replace
-/// All is a single transaction, and therefore a single undo step â€” undoing a
+/// All is a single transaction, and therefore a single undo step ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â undoing a
 /// 500-match replace one match at a time would be unusable.
 fn apply_find_action(entry: &mut OpenDoc, action: find_bar::Action) {
     use editor_core::edit::{Edit, Transaction};
@@ -1895,7 +2164,7 @@ fn new_highlighter(language: LanguageId, doc: &Document) -> Option<Highlighter> 
     Highlighter::new(language, doc.text())
 }
 
-/// Read the system clipboard, for the Edit â†’ Paste menu item.
+/// Read the system clipboard, for the Edit ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Paste menu item.
 ///
 /// Keyboard paste does not come through here: egui synthesises `Event::Paste`
 /// with the text already attached, and the editor widget handles it. This
@@ -1906,8 +2175,8 @@ fn read_clipboard() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Which theme command the status-bar button should fire: cycle Dark â†’ Light â†’
-/// System â†’ Dark.
+/// Which theme command the status-bar button should fire: cycle Dark ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Light ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢
+/// System ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Dark.
 fn next_theme_command(current_label: &str) -> CommandId {
     match current_label {
         "Dark" => CommandId::ThemeLight,
