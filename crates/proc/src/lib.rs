@@ -17,7 +17,4 @@ pub mod interpreter;
 pub mod links;
 pub mod pty;
 pub mod run_config;
-
-// Still to come.
-//
-// pub mod venv;        // `python -m venv` creation, pip bootstrap
+pub mod venv;

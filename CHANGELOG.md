@@ -10,6 +10,29 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Create Virtual Environment** (Run → Create Virtual Environment…). Pick a
+  base interpreter, a folder name, and three checkboxes; the commands run in
+  the output panel where you can watch them.
+  - The base-interpreter list looks beyond `PATH` — the Windows `py` launcher,
+    the usual install directories, pyenv versions — and **verifies each
+    candidate by running it**, which filters out Microsoft Store stubs and
+    entries left behind by uninstalls. Newest version first.
+  - Optionally upgrades pip and installs from `requirements.txt` when one
+    exists. Those steps use the **new environment's** Python, not the base
+    interpreter — running `pip install` with the base is the exact mistake a
+    virtual environment exists to prevent.
+  - On success it can adopt the environment as the project's interpreter and
+    add it to `.gitignore` (without duplicating an entry already there, and
+    without gluing itself onto a file with no trailing newline).
+  - Existing non-empty targets, invalid folder names and paths-as-names are
+    refused before anything runs.
+  - Success is confirmed against the filesystem, not the exit code alone:
+    `python -m venv` can report success and still leave nothing usable behind.
+- The runner can run a **sequence** of commands, stopping at the first failure
+  — installing requirements into an environment that failed to be created only
+  produces a second, more confusing error. Completion is reported once, at the
+  end of the sequence.
+
 - **M7 (in progress) — Running code.** F5 to run, Shift+F5 to stop, Ctrl+F5 to
   restart, Ctrl+J for the output panel.
   - **Python** runs as `<interpreter> <file>` from the project root — no

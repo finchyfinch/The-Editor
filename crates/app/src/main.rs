@@ -13,6 +13,7 @@ mod new_file;
 mod palette;
 mod panic_hook;
 mod runner;
+mod venv_dialog;
 
 use anyhow::{Context, Result};
 use editor_config::paths::AppPaths;

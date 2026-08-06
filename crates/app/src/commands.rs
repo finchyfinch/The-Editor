@@ -48,6 +48,7 @@ pub(crate) enum CommandId {
     RunTests,
     ShowOutput,
     SelectInterpreter,
+    CreateVenv,
     // View
     ToggleExplorer,
     ThemeDark,
@@ -99,6 +100,7 @@ impl CommandId {
         Self::RunTests,
         Self::ShowOutput,
         Self::SelectInterpreter,
+        Self::CreateVenv,
         Self::ToggleExplorer,
         Self::ThemeDark,
         Self::ThemeLight,
@@ -253,6 +255,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         CommandId::SelectInterpreter,
         "Run",
         "Select Python Interpreter",
+        None,
+    ),
+    cmd(
+        CommandId::CreateVenv,
+        "Run",
+        "Create Virtual Environment...",
         None,
     ),
     cmd(

@@ -28,6 +28,7 @@ use crate::commands::{self, CommandId};
 use crate::new_file;
 use crate::palette::Palette;
 use crate::runner::Runner;
+use crate::venv_dialog;
 
 /// Metadata shown in the About dialog.
 pub(crate) struct BuildInfo {
@@ -124,6 +125,10 @@ pub(crate) struct EditorApp {
     runner: Runner,
     /// Whether the bottom dock is showing the run output.
     show_output: bool,
+    venv_dialog: venv_dialog::Dialog,
+    /// What to do once a virtual environment finishes being created. Held
+    /// across frames because creation is three processes, not a function call.
+    pending_venv: Option<venv_dialog::Completion>,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -163,6 +168,8 @@ impl EditorApp {
             syntax_theme: SyntaxTheme::for_ui(ResolvedTheme::Dark),
             runner: Runner::default(),
             show_output: false,
+            venv_dialog: venv_dialog::Dialog::default(),
+            pending_venv: None,
             settings,
         };
 
@@ -553,6 +560,69 @@ impl EditorApp {
         }
     }
 
+    /// Kick off virtual environment creation.
+    fn create_venv(&mut self, request: &venv_dialog::Request) {
+        let commands = match editor_proc::venv::create_commands(&request.options) {
+            Ok(commands) => commands,
+            Err(e) => {
+                self.error(e.to_string());
+                return;
+            }
+        };
+
+        self.show_output = true;
+        match self.runner.start_sequence(commands) {
+            Ok(()) => {
+                self.pending_venv = Some(venv_dialog::Completion::from_request(request));
+            }
+            Err(e) => self.error(format!("Could not create environment: {e:#}")),
+        }
+    }
+
+    /// Adopt a newly created virtual environment, once its commands have run.
+    fn finish_venv(&mut self, completion: &venv_dialog::Completion, code: Option<i32>) {
+        if code != Some(0) {
+            self.error("Virtual environment was not created \u{2014} see the output");
+            return;
+        }
+        // Trust the filesystem over the exit code: `python -m venv` can report
+        // success and still leave nothing usable behind if, say, the target was
+        // on a full disk.
+        if !venv_dialog::interpreter_exists(&completion.interpreter) {
+            self.error(format!(
+                "Finished, but {} is not there",
+                completion.interpreter.display()
+            ));
+            return;
+        }
+
+        if completion.set_as_project_interpreter {
+            self.settings
+                .set_python_interpreter(&completion.interpreter.display().to_string());
+            self.persist_settings();
+        }
+
+        if completion.add_to_gitignore {
+            match editor_proc::venv::add_to_gitignore(
+                &completion.project_root,
+                &completion.gitignore_entry(),
+            ) {
+                Ok(true) => tracing::info!("added {} to .gitignore", completion.gitignore_entry()),
+                Ok(false) => {}
+                Err(e) => self.error(format!("Could not update .gitignore: {e}")),
+            }
+        }
+
+        self.tree.refresh();
+        match editor_proc::interpreter::version_of(&completion.interpreter) {
+            Ok(version) => self.info(format!(
+                "Created {} with Python {version}",
+                completion.folder_name
+            )),
+            Err(_) => self.info(format!("Created {}", completion.folder_name)),
+        }
+    }
+
     /// Work out what running the active document means, and do it.
     ///
     /// The whole point of the Run button is that it does the obvious thing
@@ -791,6 +861,10 @@ impl EditorApp {
                 }
             }
             CommandId::ShowOutput => self.show_output = !self.show_output,
+            CommandId::CreateVenv => match self.tree.root() {
+                Some(root) => self.venv_dialog.open(root.to_path_buf()),
+                None => self.error("Open a folder before creating a virtual environment"),
+            },
             CommandId::SelectInterpreter => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Select a Python interpreter")
@@ -967,7 +1041,7 @@ impl EditorApp {
         let theme_label = self.settings.theme().label();
         let tab_width = self.settings.tab_width();
         let insert_spaces = self.settings.insert_spaces();
-        let running = self.runner.is_running();
+        let running = self.runner.is_running() || self.runner.has_queued_work();
         let has_run = self.runner.output().line_count() > 1;
         let run_label = self.runner.label().to_owned();
 
@@ -1273,8 +1347,10 @@ impl eframe::App for EditorApp {
         // so a shortcut is not swallowed by a menu that happens to be open —
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
-        let modal_open =
-            self.palette.is_open() || self.new_file.is_open() || self.pending.is_some();
+        let modal_open = self.palette.is_open()
+            || self.new_file.is_open()
+            || self.venv_dialog.is_open()
+            || self.pending.is_some();
         let mut invoked = if modal_open {
             None
         } else {
@@ -1311,13 +1387,23 @@ impl eframe::App for EditorApp {
             ctx.request_repaint();
         }
         if let Some(code) = self.runner.take_finished() {
-            match code {
-                Some(0) => self.info("Finished"),
-                Some(code) => self.error(format!("Exited with code {code}")),
-                None => self.info("Terminated"),
+            // A virtual environment being created takes precedence over the
+            // generic banner: the user asked for an environment, not for a
+            // process to exit.
+            if let Some(completion) = self.pending_venv.take() {
+                self.finish_venv(&completion, code);
+            } else {
+                match code {
+                    Some(0) => self.info("Finished"),
+                    Some(code) => self.error(format!("Exited with code {code}")),
+                    None => self.info("Terminated"),
+                }
             }
         }
-        if self.runner.is_running() {
+        // Between the steps of a sequence there is momentarily no process, but
+        // work is still pending — treating that as "finished" makes the status
+        // bar and the console header flicker.
+        if self.runner.is_running() || self.runner.has_queued_work() {
             // A running process produces output between frames, so keep
             // repainting rather than waiting for input.
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -1367,6 +1453,9 @@ impl eframe::App for EditorApp {
 
         if let Some(request) = self.new_file.ui(&ctx, editor_config::APP_AUTHOR) {
             self.create_file(request);
+        }
+        if let Some(request) = self.venv_dialog.ui(&ctx) {
+            self.create_venv(&request);
         }
 
         self.about_window(&ctx);
@@ -1642,6 +1731,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::RunTests),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::SelectInterpreter),
+            MenuEntry::Item(CommandId::CreateVenv),
         ],
     ),
     ("Tools", &[MenuEntry::Item(CommandId::CommandPalette)]),

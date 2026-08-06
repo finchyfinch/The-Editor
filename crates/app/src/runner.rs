@@ -23,6 +23,11 @@ pub(crate) struct Runner {
     label: String,
     /// Set when a run finishes, so the app can surface the exit code once.
     finished: Option<Option<i32>>,
+    /// Commands still to run, for multi-step operations like creating a
+    /// virtual environment. A non-zero exit abandons the rest, because
+    /// installing requirements into an environment that failed to be created
+    /// only produces a second, more confusing error.
+    queue: std::collections::VecDeque<RunConfig>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -44,6 +49,7 @@ impl Default for Runner {
             cwd: PathBuf::from("."),
             label: "No process".to_owned(),
             finished: None,
+            queue: std::collections::VecDeque::new(),
         }
     }
 }
@@ -78,12 +84,36 @@ impl Runner {
         &self.label
     }
 
+    /// Run several commands in order, stopping at the first failure.
+    ///
+    /// # Errors
+    /// If the first command cannot be started. Later failures surface in the
+    /// console rather than as a `Result`, since by then the caller has moved on.
+    pub(crate) fn start_sequence(&mut self, mut commands: Vec<RunConfig>) -> anyhow::Result<()> {
+        let first = commands
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("nothing to run"))?;
+        commands.remove(0);
+        self.start(first, true)?;
+        self.queue = commands.into();
+        Ok(())
+    }
+
+    /// True while a multi-step operation still has commands to run.
+    #[must_use]
+    pub(crate) fn has_queued_work(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     /// Start a command, replacing anything already running.
     ///
     /// # Errors
     /// If the process cannot be started.
     pub(crate) fn start(&mut self, config: RunConfig, clear_first: bool) -> anyhow::Result<()> {
         self.stop();
+        // A new run started by hand abandons any sequence in progress.
+        self.queue.clear();
 
         if clear_first {
             self.output.clear();
@@ -154,6 +184,7 @@ impl Runner {
             return false;
         }
 
+        let mut next = None;
         for event in events {
             match event {
                 Event::Output(bytes) => self.output.feed(&bytes),
@@ -165,11 +196,36 @@ impl Runner {
                         }
                         None => self.output.push_line("[Terminated]"),
                     }
-                    self.finished = Some(code);
+                    if code == Some(0) {
+                        next = self.queue.pop_front();
+                    } else if !self.queue.is_empty() {
+                        let abandoned = self.queue.len();
+                        self.queue.clear();
+                        self.output
+                            .push_line(&format!("[Stopped: {abandoned} step(s) not run]"));
+                    }
+                    // Only report completion once the whole sequence is done,
+                    // so a three-step venv creation is one outcome, not three.
+                    if next.is_none() {
+                        self.finished = Some(code);
+                    }
                 }
                 Event::Failed(message) => {
                     self.output.push_line(&format!("[Error: {message}]"));
                 }
+            }
+        }
+
+        // Chain to the next step without clearing what came before, so the
+        // whole sequence reads as one transcript.
+        if let Some(config) = next {
+            let queued = std::mem::take(&mut self.queue);
+            if let Err(e) = self.start(config, false) {
+                self.output
+                    .push_line(&format!("[Could not continue: {e:#}]"));
+                self.finished = Some(Some(-1));
+            } else {
+                self.queue = queued;
             }
         }
         true
@@ -397,6 +453,156 @@ mod tests {
         assert_eq!(link.line, 2, "the raise is on line 2");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sequence_runs_every_step_in_order() {
+        let mut runner = Runner::default();
+        runner
+            .start_sequence(vec![
+                trivial("step_one"),
+                trivial("step_two"),
+                trivial("step_three"),
+            ])
+            .expect("starts");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            runner.poll();
+            if !runner.is_running() && !runner.has_queued_work() {
+                runner.poll();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let text = transcript(&runner);
+        for marker in ["step_one", "step_two", "step_three"] {
+            assert!(text.contains(marker), "{marker} missing from: {text}");
+        }
+        let positions: Vec<usize> = ["step_one", "step_two", "step_three"]
+            .iter()
+            .filter_map(|m| text.find(m))
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "steps ran out of order: {text}"
+        );
+        assert_eq!(
+            runner.take_finished(),
+            Some(Some(0)),
+            "completion is reported once, at the end of the sequence"
+        );
+    }
+
+    #[test]
+    fn a_failing_step_abandons_the_rest_of_the_sequence() {
+        // Installing requirements into an environment that failed to be
+        // created only produces a second, more confusing error.
+        let failing = RunConfig {
+            args: if cfg!(windows) {
+                vec!["/C".to_owned(), "exit 4".to_owned()]
+            } else {
+                vec!["-c".to_owned(), "exit 4".to_owned()]
+            },
+            ..trivial("")
+        };
+
+        let mut runner = Runner::default();
+        runner
+            .start_sequence(vec![failing, trivial("should_not_run")])
+            .expect("starts");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            runner.poll();
+            if !runner.is_running() && !runner.has_queued_work() {
+                runner.poll();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let text = transcript(&runner);
+        assert!(text.contains("code 4"), "got: {text}");
+        assert!(
+            !text.contains("should_not_run"),
+            "the remaining step must not run: {text}"
+        );
+        assert!(text.contains("not run"), "the user should be told: {text}");
+        assert!(!runner.has_queued_work());
+    }
+
+    /// End-to-end: really create a virtual environment through the runner and
+    /// check the interpreter it produces works. The dialog's job is to build
+    /// these commands; this proves the commands are right.
+    ///
+    /// Skipped when no Python is installed.
+    #[test]
+    fn a_real_virtual_environment_is_created_and_its_python_runs() {
+        let Some(base) = editor_proc::venv::discover().into_iter().next() else {
+            eprintln!("skipping: no Python installation found");
+            return;
+        };
+
+        let root = std::env::temp_dir().join("the-editor-venv-e2e");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).expect("create project");
+        let target = root.join(".venv");
+
+        let commands = editor_proc::venv::create_commands(&editor_proc::venv::CreateOptions {
+            base: base.path.clone(),
+            target: target.clone(),
+            // Skip pip work: it needs the network and is not what is under test.
+            upgrade_pip: false,
+            requirements: None,
+            system_site_packages: false,
+        })
+        .expect("builds commands");
+
+        let mut runner = Runner::default();
+        runner.start_sequence(commands).expect("starts");
+
+        // Creating an environment copies a Python installation, so allow more
+        // time than a trivial command needs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            runner.poll();
+            if !runner.is_running() && !runner.has_queued_work() {
+                runner.poll();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let text = transcript(&runner);
+        assert_eq!(
+            runner.take_finished(),
+            Some(Some(0)),
+            "venv creation did not succeed: {text}"
+        );
+
+        let python = editor_proc::interpreter::venv_python(&target);
+        assert!(
+            python.is_file(),
+            "no interpreter at {}: {text}",
+            python.display()
+        );
+        let version = editor_proc::interpreter::version_of(&python)
+            .unwrap_or_else(|e| panic!("the new interpreter does not run: {e}"));
+        assert!(version.starts_with('3'), "got version {version:?}");
+
+        // ...and the project would now find it automatically.
+        let found = editor_proc::interpreter::find_venv(&root).expect("venv is discoverable");
+        assert_eq!(found.path, python);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_empty_sequence_is_an_error_rather_than_a_silent_no_op() {
+        let mut runner = Runner::default();
+        assert!(runner.start_sequence(Vec::new()).is_err());
     }
 
     #[test]
