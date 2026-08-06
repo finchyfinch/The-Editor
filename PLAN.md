@@ -846,6 +846,12 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
 - [ ] **M1 — Shell & layout.** Mostly done; the remaining items are listed below.
 - [ ] **M2 — Editor core.** Core editing works: typing, selections, undo/redo
       with coalescing, clipboard, caret motion, virtualised painting.
+- [ ] **M3 — Syntax highlighting.** Working for all nine languages, computed
+      per viewport, reparsing incrementally, with dark and light syntax themes
+      whose contrast is enforced by tests. Still to do: HTML injections so
+      embedded `<script>` and `<style>` are highlighted as JS and CSS, shebang
+      and manual language override, the user-editable TOML theme format, and
+      the fold/bracket queries that M4 builds on.
 
 **Sequencing change.** M2's editing widget was brought forward ahead of the rest
 of M1. An IDE you cannot type into is impossible to evaluate, and the M1

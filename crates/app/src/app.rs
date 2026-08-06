@@ -1,10 +1,13 @@
 //! The application shell: layout, command routing, and the document set.
 //!
-//! M1 builds the frame — panels, tabs, explorer, theme, palette, open/save.
-//! The editor pane is still a read-only viewer; M2 replaces it with the real
-//! editing widget. Everything the user can trigger goes through
-//! [`EditorApp::run_command`], so the menus, the toolbar, the keyboard and the
-//! palette cannot diverge in behaviour.
+//! Everything the user can trigger goes through [`EditorApp::run_command`], so
+//! the menus, the toolbar, the keyboard and the palette cannot diverge in
+//! behaviour.
+//!
+//! Each open document carries its own editing view state and its own parse tree
+//! for highlighting. Edits reach the parse tree by draining the document's
+//! change outbox once per frame rather than by every edit path remembering to
+//! notify it — the same route the language server will take in M6.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -14,6 +17,8 @@ use editor_config::settings::Settings;
 use editor_config::theme::{ResolvedTheme, ThemePreference};
 use editor_core::document::Document;
 use editor_syntax::LanguageId;
+use editor_syntax::highlight::Highlighter;
+use editor_syntax::theme::SyntaxTheme;
 use editor_widgets::editor_view::{EditorOptions, EditorView};
 use editor_widgets::{file_tree::FileTree, tab_bar, theme as ui_theme};
 use eframe::egui;
@@ -72,6 +77,9 @@ struct OpenDoc {
     doc: Document,
     view: EditorView,
     language: LanguageId,
+    /// Parse state for highlighting. `None` for plain text, for languages with
+    /// no grammar, and for files too large to highlight.
+    highlighter: Option<Highlighter>,
     /// Preview tabs are replaced by the next single-clicked file instead of
     /// accumulating. Promoted to permanent on double-click or first edit.
     preview: bool,
@@ -102,6 +110,8 @@ pub(crate) struct EditorApp {
     applied_theme: Option<ResolvedTheme>,
     applied_scale: f32,
     applied_ui_font: f32,
+    /// Rebuilt whenever the UI theme changes, so the code pane follows it.
+    syntax_theme: SyntaxTheme,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -138,6 +148,7 @@ impl EditorApp {
             applied_theme: None,
             applied_scale: settings.ui_scale(),
             applied_ui_font: settings.ui_font_size(),
+            syntax_theme: SyntaxTheme::for_ui(ResolvedTheme::Dark),
             settings,
         };
 
@@ -232,6 +243,7 @@ impl EditorApp {
             .map_or(LanguageId::PlainText, LanguageId::from_extension);
 
         let entry = OpenDoc {
+            highlighter: new_highlighter(language, &doc),
             doc,
             view: EditorView::default(),
             language,
@@ -506,6 +518,7 @@ impl EditorApp {
             // The dialog's explicit choice wins over extension sniffing, so a
             // Python file named `build.cfg` is still treated as Python.
             entry.language = language;
+            entry.highlighter = new_highlighter(language, &entry.doc);
             // Place the caret where the template asked.
             entry.view.set_caret(cursor);
         }
@@ -532,6 +545,7 @@ impl EditorApp {
                     doc: Document::untitled(),
                     view: EditorView::default(),
                     language: LanguageId::PlainText,
+                    highlighter: None,
                     preview: false,
                 });
                 self.active = Some(self.docs.len() - 1);
@@ -690,6 +704,9 @@ impl EditorApp {
 
         if changed {
             ui_theme::apply(ctx, resolved, scale, font_size);
+            // The code pane follows the UI theme. PLAN.md §3.11 allows pinning
+            // them apart; the setting for that arrives with the settings UI.
+            self.syntax_theme = SyntaxTheme::for_ui(resolved);
             self.applied_theme = Some(resolved);
             self.applied_scale = scale;
             self.applied_ui_font = font_size;
@@ -867,11 +884,26 @@ impl EditorApp {
                 insert_spaces: self.settings.insert_spaces(),
                 show_line_numbers: true,
             };
+            let syntax = &self.syntax_theme;
 
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
+                // Bring the parse tree up to date before painting from it.
+                // Draining the outbox here means every edit path — typing,
+                // paste, undo, redo — feeds the highlighter without each one
+                // having to remember to.
+                let changes = entry.doc.take_changes();
+                if let Some(h) = entry.highlighter.as_mut()
+                    && !changes.is_empty()
+                {
+                    h.update(&changes, entry.doc.text());
+                }
+
                 // Editing a preview tab promotes it: the file is being worked
                 // on, so it must not be replaced by the next explorer click.
-                if entry.view.ui(ui, &mut entry.doc, opts) {
+                if entry
+                    .view
+                    .ui(ui, &mut entry.doc, entry.highlighter.as_mut(), syntax, opts)
+                {
                     entry.preview = false;
                 }
             }
@@ -1126,6 +1158,20 @@ struct StatusSummary {
     line: usize,
     column: usize,
     selected: usize,
+}
+
+/// Build a highlighter for a document, or `None` if it should not be
+/// highlighted.
+///
+/// Files past the large-file threshold are deliberately left plain: parsing a
+/// multi-megabyte file on every keystroke is exactly the cost the viewport
+/// virtualisation exists to avoid, and the status bar already says the file
+/// opened read-only.
+fn new_highlighter(language: LanguageId, doc: &Document) -> Option<Highlighter> {
+    if doc.is_large() {
+        return None;
+    }
+    Highlighter::new(language, doc.text())
 }
 
 /// Read the system clipboard, for the Edit → Paste menu item.

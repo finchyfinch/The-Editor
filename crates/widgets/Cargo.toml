@@ -11,7 +11,7 @@ description = "egui widgets: editor view, file tree, tab bar, palette, console"
 [dependencies]
 editor-core.workspace = true
 editor-config.workspace = true
-editor-syntax.workspace = true
+editor-syntax = { version = "1.0.0", path = "../syntax" }
 eframe.workspace = true
 
 [lints]

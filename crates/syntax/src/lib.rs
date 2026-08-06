@@ -5,16 +5,14 @@
 //! visible viewport only; parse trees are updated incrementally via
 //! `Tree::edit` on every transaction. See PLAN.md §3.5.
 
+pub mod highlight;
 pub mod templates;
+pub mod theme;
 
-// M3 populates these.
+// Still to come.
 //
-// pub mod language;    // LanguageId, detection by extension/shebang/override
-// pub mod registry;    // grammar loading, injections (HTML -> JS/CSS)
-// pub mod highlight;   // viewport highlighting, capture -> style mapping
-// pub mod theme;       // TOML theme format
-// pub mod folds;
-// pub mod brackets;
+// pub mod folds;       // M4: fold ranges from the parse tree
+// pub mod brackets;    // M4: bracket matching
 
 /// Languages The Editor recognises in 1.0.
 ///

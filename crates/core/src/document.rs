@@ -1,4 +1,4 @@
-//! Documents: a rope, where it came from, and how to write it back unchanged.
+﻿//! Documents: a rope, where it came from, and how to write it back unchanged.
 //!
 //! The rope always holds text with `\n` line endings, whatever was on disk.
 //! That keeps every offset calculation in the editor honest — a CRLF file
@@ -115,6 +115,14 @@ pub struct Document {
     large: bool,
 
     history: History,
+    /// Changes applied since the last [`Self::take_changes`].
+    ///
+    /// An outbox rather than a callback: the incremental highlighter (M3) and
+    /// the language server (M6) both need to see every edit exactly once, and
+    /// edits originate from several places — typing, paste, undo, redo, a
+    /// project-wide replace. Queueing them here means no new edit path can
+    /// forget to notify anyone.
+    pending: Vec<Change>,
     /// Bumped by every mutation, including undo and redo. Compared against
     /// [`Self::saved_version`] to decide whether the tab shows an unsaved
     /// marker.
@@ -139,6 +147,7 @@ impl Document {
             read_only: None,
             large: false,
             history: History::default(),
+            pending: Vec::new(),
             version: 0,
             saved_version: 0,
         }
@@ -198,6 +207,7 @@ impl Document {
             read_only,
             large,
             history: History::default(),
+            pending: Vec::new(),
             version: 0,
             saved_version: 0,
         })
@@ -266,25 +276,42 @@ impl Document {
         self.history
             .push(tx.clone(), applied.inverse, before, after);
         self.version = self.version.wrapping_add(1);
-        // M3 feeds `applied.changes` to the incremental parser and M6 to the
-        // language server; both hang off this single return value.
+        self.pending.extend(applied.changes.iter().cloned());
         applied.changes
+    }
+
+    /// Take every change applied since this was last called.
+    ///
+    /// Drives the incremental highlighter now and the language server in M6.
+    /// Draining rather than peeking is deliberate: a consumer that forgets to
+    /// call this shows up as stale highlighting, not as silently duplicated
+    /// edits sent to a language server.
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// True if there are changes no consumer has seen yet.
+    #[must_use]
+    pub fn has_pending_changes(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// Undo one step. Returns the selection to restore, or `None` if there is
     /// nothing to undo.
     pub fn undo(&mut self) -> Option<Selection> {
         let step = self.history.undo()?;
-        edit::apply(&mut self.text, &step.transaction);
+        let applied = edit::apply(&mut self.text, &step.transaction);
         self.version = self.version.wrapping_add(1);
+        self.pending.extend(applied.changes);
         Some(step.selection.clamped(self.text.len_chars()))
     }
 
     /// Redo one step. Returns the selection to restore.
     pub fn redo(&mut self) -> Option<Selection> {
         let step = self.history.redo()?;
-        edit::apply(&mut self.text, &step.transaction);
+        let applied = edit::apply(&mut self.text, &step.transaction);
         self.version = self.version.wrapping_add(1);
+        self.pending.extend(applied.changes);
         Some(step.selection.clamped(self.text.len_chars()))
     }
 

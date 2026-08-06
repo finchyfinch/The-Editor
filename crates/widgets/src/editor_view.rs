@@ -10,12 +10,18 @@
 //! for proportional fallback glyphs, CJK, and combining marks — the character-
 //! width shortcut the spike used breaks on the first accented identifier.
 //!
-//! Not here yet: syntax highlighting (M3), language-aware indentation and
-//! bracket handling (M4), find/replace (M5), multi-cursor and folding.
+//! Highlighting is asked for one viewport at a time: the paint pass requests
+//! spans for exactly the rows it is about to draw, so a 50,000-line file costs
+//! the same per frame as a 50-line one.
+//!
+//! Not here yet: language-aware indentation and bracket handling (M4),
+//! find/replace (M5), multi-cursor and folding.
 
 use editor_core::document::Document;
 use editor_core::edit::Transaction;
 use editor_core::selection::Selection;
+use editor_syntax::highlight::Highlighter;
+use editor_syntax::theme::SyntaxTheme;
 use eframe::egui;
 
 /// Rows painted above and below the viewport, so a fast scroll never exposes a
@@ -152,7 +158,28 @@ impl EditorView {
     }
 
     /// Draw the editor and process input. Returns true if the document changed.
-    pub fn ui(&mut self, ui: &mut egui::Ui, doc: &mut Document, opts: EditorOptions) -> bool {
+    ///
+    /// `highlighter` is the document's own parse state; `None` means the
+    /// language has no grammar and the text is painted in one colour.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &mut Document,
+        highlighter: Option<&mut Highlighter>,
+        syntax: &SyntaxTheme,
+        opts: EditorOptions,
+    ) -> bool {
+        self.render(ui, doc, highlighter, syntax, opts)
+    }
+
+    fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &mut Document,
+        mut highlighter: Option<&mut Highlighter>,
+        syntax: &SyntaxTheme,
+        opts: EditorOptions,
+    ) -> bool {
         let font = egui::FontId::monospace(opts.font_size);
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
         let space_width = ui.fonts_mut(|f| f.glyph_width(&font, ' '));
@@ -199,6 +226,8 @@ impl EditorView {
                 self.paint(
                     ui,
                     doc,
+                    highlighter.take(),
+                    syntax,
                     opts,
                     &font,
                     rect,
@@ -580,6 +609,8 @@ impl EditorView {
         &mut self,
         ui: &mut egui::Ui,
         doc: &Document,
+        highlighter: Option<&mut Highlighter>,
+        syntax: &SyntaxTheme,
         opts: EditorOptions,
         font: &egui::FontId,
         rect: egui::Rect,
@@ -595,6 +626,14 @@ impl EditorView {
         let last = ((((visible.bottom() - rect.top()) / row_height).ceil() as usize)
             + OVERSCAN_ROWS)
             .min(line_count);
+
+        // Highlight exactly the rows about to be painted, and nothing else.
+        // This is where "cost tracks the viewport, not the file" is enforced.
+        let spans = highlighter.map_or_else(Vec::new, |h| {
+            let from = doc.text().line_to_byte(first.min(line_count));
+            let to = doc.text().line_to_byte(last.min(line_count));
+            h.spans(doc.text(), from..to, syntax)
+        });
 
         let painter = ui.painter_at(ui.clip_rect());
         let visuals = ui.visuals().clone();
@@ -621,7 +660,19 @@ impl EditorView {
             let line_start = doc.line_start(line);
             let text = doc.line_text(line);
 
-            let galley = painter.layout_no_wrap(text.clone(), font.clone(), visuals.text_color());
+            let galley = if spans.is_empty() {
+                painter.layout_no_wrap(text.clone(), font.clone(), visuals.text_color())
+            } else {
+                let job = highlighted_line(
+                    &text,
+                    doc.text().line_to_byte(line),
+                    &spans,
+                    syntax,
+                    font,
+                    visuals.text_color(),
+                );
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
 
             // Selection highlight for the part of this line that is selected.
             if !self.selection.is_empty() {
@@ -704,6 +755,86 @@ impl EditorView {
             return true;
         };
         since < 500 || (since / BLINK_MS).is_multiple_of(2)
+    }
+}
+
+/// Build a layout job for one line, splitting it into the runs the highlighter
+/// produced.
+///
+/// `spans` covers the whole visible window and is sorted; only the part
+/// overlapping this line is used. Bytes with no span get the theme's default
+/// colour, so the output always covers the line exactly once with no gaps.
+fn highlighted_line(
+    text: &str,
+    line_start_byte: usize,
+    spans: &[editor_syntax::highlight::Span],
+    syntax: &SyntaxTheme,
+    font: &egui::FontId,
+    fallback: egui::Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let line_end_byte = line_start_byte + text.len();
+    let default = syntax.default_style();
+
+    let mut cursor = 0usize; // byte offset within `text`
+    let push = |job: &mut egui::text::LayoutJob, range: std::ops::Range<usize>, style| {
+        let Some(slice) = text.get(range) else { return };
+        if slice.is_empty() {
+            return;
+        }
+        job.append(slice, 0.0, format_for(style, font, fallback));
+    };
+
+    for span in spans {
+        if span.range.end <= line_start_byte {
+            continue;
+        }
+        if span.range.start >= line_end_byte {
+            break;
+        }
+        let from = span
+            .range
+            .start
+            .saturating_sub(line_start_byte)
+            .min(text.len());
+        let to = (span.range.end - line_start_byte).min(text.len());
+        if from >= to {
+            continue;
+        }
+        if from > cursor {
+            push(&mut job, cursor..from, default);
+        }
+        push(&mut job, from..to, span.style);
+        cursor = to;
+    }
+    if cursor < text.len() {
+        push(&mut job, cursor..text.len(), default);
+    }
+
+    job
+}
+
+fn format_for(
+    style: editor_syntax::theme::Style,
+    font: &egui::FontId,
+    fallback: egui::Color32,
+) -> egui::TextFormat {
+    let editor_syntax::theme::Rgb(r, g, b) = style.colour;
+    let colour = if style == editor_syntax::theme::Style::default() {
+        fallback
+    } else {
+        egui::Color32::from_rgb(r, g, b)
+    };
+    // `style.bold` is deliberately not applied. egui has no synthetic bold:
+    // rendering it needs a bold face registered in the font family, which
+    // arrives when JetBrains Mono is embedded in M9. Themes can express bold
+    // now so theme files do not need rewriting later; it is simply not drawn
+    // yet, and no built-in colour relies on it to be distinguishable.
+    egui::TextFormat {
+        font_id: font.clone(),
+        color: colour,
+        italics: style.italic,
+        ..Default::default()
     }
 }
 

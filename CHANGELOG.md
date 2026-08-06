@@ -10,6 +10,27 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **M3 — Syntax highlighting.** Tree-sitter grammars compiled in for Python,
+  Rust, JSON, JavaScript, HTML, CSS, TOML and Markdown; INI gets a small
+  hand-written line highlighter, since the format is strictly line-oriented and
+  a parser would buy nothing.
+  - Highlighting is computed for the visible rows only, so a 50,000-line file
+    costs the same per frame as a 50-line one.
+  - Edits reparse incrementally. Multi-edit transactions (which arrive with
+    multi-cursor and project-wide replace) fall back to a full reparse rather
+    than risk a subtly wrong incremental update; a test asserts an incremental
+    reparse matches a clean one.
+  - Syntax themes for dark and light, following the UI theme. Every colour is
+    checked against the code-pane background for WCAG AA contrast by a unit
+    test, and the keyword/string/comment/function set is asserted to be
+    mutually distinguishable.
+  - Half-typed, syntactically invalid code still highlights what it can rather
+    than going blank — which is the normal state of a file being edited.
+  - Files past the large-file threshold stay unhighlighted, as does plain text.
+- Documents now carry a change outbox, drained once per frame to drive the
+  incremental parser. The language server will take the same route in M6, so
+  no future edit path has to remember to notify either of them.
+
 - **New File dialog** (Ctrl+N). Name, language, location, and an optional
   boilerplate template with a live preview of exactly what will be written.
   - Name and language stay in step both ways: choosing Rust sets `.rs`, and
