@@ -1,0 +1,32 @@
+﻿[package]
+name = "the-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "The Editor â€” a cross-platform IDE for Python and Rust"
+
+[[bin]]
+name = "the-editor"
+path = "src/main.rs"
+
+[dependencies]
+editor-core.workspace = true
+editor-config.workspace = true
+editor-syntax.workspace = true
+editor-lsp.workspace = true
+editor-proc.workspace = true
+editor-search.workspace = true
+editor-widgets.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+eframe.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+
+[lints]
+workspace = true

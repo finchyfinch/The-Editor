@@ -1,0 +1,10 @@
+# Normalise to LF in the repository. Working copies on Windows still get CRLF
+# if core.autocrlf says so, but the committed bytes are stable across the three
+# platforms this is built on.
+* text=auto eol=lf
+
+# Test fixtures whose line endings are the thing under test must never be
+# touched. The Editor detects and preserves CRLF vs LF (PLAN.md section 8), and
+# these files exist to prove it.
+tests/fixtures/**/*.crlf -text
+tests/fixtures/**/*.lf   -text

@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/syntax",
+    "crates/lsp",
+    "crates/proc",
+    "crates/search",
+    "crates/config",
+    "crates/widgets",
+    "crates/spike",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.97"
+authors = ["Gareth Finch"]
+license = "MIT"
+description = "The Editor — a cross-platform IDE for Python and Rust"
+repository = ""
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+editor-core = { path = "crates/core" }
+editor-syntax = { path = "crates/syntax" }
+editor-lsp = { path = "crates/lsp" }
+editor-proc = { path = "crates/proc" }
+editor-search = { path = "crates/search" }
+editor-config = { path = "crates/config" }
+editor-widgets = { path = "crates/widgets" }
+
+# Shared external crates are hoisted here as they are adopted, so every crate
+# in the workspace resolves to a single version of each.
+anyhow = "1.0.104"
+directories = "6.0.0"
+eframe = "0.36.0"
+ropey = "1.6.1"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Not denied globally — the crates that touch user data (core, lsp, proc) opt in
+# to `deny` at the top of their lib.rs. See PLAN.md §8 "Errors".
+unwrap_used = "warn"
+expect_used = "allow"     # allowed with a justifying comment; unwrap is not
+todo = "allow"            # scaffolding is expected until M1 lands
+
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "unwind"          # must stay `unwind`: the panic hook performs an emergency save
+
+# Debug builds of an editor still need to feel like an editor. Optimise the
+# dependencies (rope, tree-sitter, rendering) even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

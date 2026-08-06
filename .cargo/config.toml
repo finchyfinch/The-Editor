@@ -1,0 +1,11 @@
+[alias]
+# The three checks the pre-push hook runs. Run them individually while working.
+xfmt = ["fmt", "--all"]
+xlint = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+xtest = ["test", "--workspace"]
+
+# The Editor itself.
+editor = ["run", "--package", "the-editor"]
+
+# The M2 rendering spike. See crates/spike/src/main.rs.
+spike = ["run", "--release", "--package", "editor-spike"]

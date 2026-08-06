@@ -1,0 +1,20 @@
+﻿[package]
+name = "editor-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Throwaway spike: virtualised rope rendering in egui. Not part of the product."
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+ropey.workspace = true
+
+[lints]
+workspace = true

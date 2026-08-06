@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# The Editor's own per-project settings, when dogfooding on this repo
+.ide/
+
+# Release artefacts
+/dist

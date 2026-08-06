@@ -1,0 +1,45 @@
+# cargo-deny configuration.
+#
+# Backs decision D9 in PLAN.md: nothing in this project costs money and nothing
+# carries a licence that would restrict distributing The Editor.
+#
+#   cargo install cargo-deny
+#   cargo deny check
+
+[graph]
+all-features = false
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licences only. Anything copyleft (GPL/AGPL/SSPL) or commercial
+# must be rejected outright rather than reviewed case by case.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",           # file-level copyleft; fine for a dependency
+    "OFL-1.1",           # the bundled fonts
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

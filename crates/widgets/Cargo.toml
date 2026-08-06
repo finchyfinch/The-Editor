@@ -1,0 +1,17 @@
+[package]
+name = "editor-widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "egui widgets: editor view, file tree, tab bar, palette, console"
+
+[dependencies]
+editor-core.workspace = true
+editor-config.workspace = true
+editor-syntax.workspace = true
+
+[lints]
+workspace = true

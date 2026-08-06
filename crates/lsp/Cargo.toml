@@ -1,0 +1,15 @@
+[package]
+name = "editor-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Language Server Protocol client, server lifecycle and diagnostic routing"
+
+[dependencies]
+editor-core.workspace = true
+
+[lints]
+workspace = true
