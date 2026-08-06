@@ -16,7 +16,7 @@ path = "src/main.rs"
 editor-config.workspace = true
 editor-core.workspace = true
 editor-lsp.workspace = true
-editor-proc.workspace = true
+editor-proc = { version = "1.0.0", path = "../proc" }
 editor-search.workspace = true
 editor-syntax.workspace = true
 editor-widgets.workspace = true

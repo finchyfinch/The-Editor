@@ -861,6 +861,11 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
       case and whole-word options, match highlighting, wrapping navigation, and
       Replace All as one undo step. Still to do: project-wide search and replace
       on the ripgrep engine, and go-to-file / go-to-symbol.
+- [ ] **M7 — Run & console.** Running Python and Rust works, under a PTY, with
+      clickable error links, stdin, stop and restart. Still to do: the venv
+      creation dialog (§3.8a), interpreter discovery beyond `PATH` (registry,
+      `py -0p`, pyenv, conda), run configurations in `.ide/run.toml`, and the
+      Problems panel.
 
 **Sequencing change.** M2's editing widget was brought forward ahead of the rest
 of M1. An IDE you cannot type into is impossible to evaluate, and the M1

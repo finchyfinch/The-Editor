@@ -48,6 +48,10 @@ insert_spaces = true
 word_wrap = false
 # Typing an opening bracket or quote also inserts its closer.
 auto_close_brackets = true
+
+[python]
+# Leave empty to auto-detect: a .venv in the project, else python on PATH.
+interpreter = \"\"
 ";
 
 /// Defaults, in one place so the accessors and the documentation above cannot
@@ -302,6 +306,18 @@ impl Settings {
     pub fn word_wrap(&self) -> bool {
         self.bool_at("editor", "word_wrap")
             .unwrap_or(defaults::WORD_WRAP)
+    }
+
+    /// Path to the Python interpreter, or empty to auto-detect.
+    #[must_use]
+    pub fn python_interpreter(&self) -> String {
+        self.str_at("python", "interpreter")
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    pub fn set_python_interpreter(&mut self, path: &str) {
+        self.set("python", "interpreter", value(path));
     }
 
     /// Whether typing an opening bracket or quote inserts its closer.

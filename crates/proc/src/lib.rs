@@ -12,11 +12,12 @@
 // This crate spawns and reaps external processes. Panics leak them.
 #![deny(clippy::unwrap_used)]
 
-// M7 populates these.
+pub mod ansi;
+pub mod interpreter;
+pub mod links;
+pub mod pty;
+pub mod run_config;
+
+// Still to come.
 //
-// pub mod pty;         // PtySession: spawn, read, write, resize, kill tree
-// pub mod run_config;  // RunConfig resolution: cargo / python / node / browser
-// pub mod interpreter; // Python discovery: PATH, registry, py -0p, pyenv, venv
 // pub mod venv;        // `python -m venv` creation, pip bootstrap
-// pub mod ansi;        // VT parsing into styled output lines
-// pub mod links;       // file:line:col detection in output (rustc, tracebacks)

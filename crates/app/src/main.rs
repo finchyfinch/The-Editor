@@ -12,6 +12,7 @@ mod logging;
 mod new_file;
 mod palette;
 mod panic_hook;
+mod runner;
 
 use anyhow::{Context, Result};
 use editor_config::paths::AppPaths;

@@ -27,6 +27,7 @@ use eframe::egui;
 use crate::commands::{self, CommandId};
 use crate::new_file;
 use crate::palette::Palette;
+use crate::runner::Runner;
 
 /// Metadata shown in the About dialog.
 pub(crate) struct BuildInfo {
@@ -119,6 +120,10 @@ pub(crate) struct EditorApp {
     applied_ui_font: f32,
     /// Rebuilt whenever the UI theme changes, so the code pane follows it.
     syntax_theme: SyntaxTheme,
+
+    runner: Runner,
+    /// Whether the bottom dock is showing the run output.
+    show_output: bool,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -156,6 +161,8 @@ impl EditorApp {
             applied_scale: settings.ui_scale(),
             applied_ui_font: settings.ui_font_size(),
             syntax_theme: SyntaxTheme::for_ui(ResolvedTheme::Dark),
+            runner: Runner::default(),
+            show_output: false,
             settings,
         };
 
@@ -546,6 +553,71 @@ impl EditorApp {
         }
     }
 
+    /// Work out what running the active document means, and do it.
+    ///
+    /// The whole point of the Run button is that it does the obvious thing
+    /// without configuration: a Python file runs under the project's
+    /// interpreter, a Rust file runs `cargo run` from its manifest directory.
+    fn run_active(&mut self, tests: bool) {
+        let Some(entry) = self.active_doc() else {
+            self.info("Open a file to run");
+            return;
+        };
+        if entry.doc.is_dirty() {
+            // Running stale code is a genuinely confusing way to lose an hour.
+            if let Some(active) = self.active
+                && !self.save_indices(&[active])
+            {
+                return;
+            }
+        }
+
+        let Some(entry) = self.active_doc() else {
+            return;
+        };
+        let Some(path) = entry.doc.path().map(Path::to_path_buf) else {
+            self.error(editor_proc::run_config::RunError::Unsaved.to_string());
+            return;
+        };
+        let language = entry.language;
+        let root = self.tree.root().map(Path::to_path_buf);
+
+        let config = match language {
+            LanguageId::Python => {
+                let interpreter = editor_proc::interpreter::resolve(
+                    &self.settings.python_interpreter(),
+                    root.as_deref(),
+                );
+                editor_proc::run_config::python(&path, interpreter.as_ref(), root.as_deref(), &[])
+            }
+            LanguageId::Rust => {
+                match editor_proc::run_config::find_cargo_manifest(&path, root.as_deref()) {
+                    Some(manifest_dir) => editor_proc::run_config::cargo(
+                        &manifest_dir,
+                        if tests { "test" } else { "run" },
+                        false,
+                    ),
+                    None => Err(editor_proc::run_config::RunError::UnsupportedLanguage(
+                        "Rust outside a Cargo project".to_owned(),
+                    )),
+                }
+            }
+            other => Err(editor_proc::run_config::RunError::UnsupportedLanguage(
+                other.display_name().to_owned(),
+            )),
+        };
+
+        match config {
+            Ok(config) => {
+                self.show_output = true;
+                if let Err(e) = self.runner.start(config, true) {
+                    self.error(format!("Could not start: {e:#}"));
+                }
+            }
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
     // ---- commands --------------------------------------------------------
 
     fn run_command(&mut self, id: CommandId, ctx: &egui::Context) {
@@ -701,6 +773,38 @@ impl EditorApp {
                         ..opts
                     };
                     entry.view.shift_lines(&mut entry.doc, opts, levels);
+                }
+            }
+
+            CommandId::Run => self.run_active(false),
+            CommandId::RunTests => self.run_active(true),
+            CommandId::RunStop => {
+                if self.runner.is_running() {
+                    self.runner.stop();
+                } else {
+                    self.info("Nothing is running");
+                }
+            }
+            CommandId::RunRestart => {
+                if let Err(e) = self.runner.restart() {
+                    self.error(format!("{e}"));
+                }
+            }
+            CommandId::ShowOutput => self.show_output = !self.show_output,
+            CommandId::SelectInterpreter => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select a Python interpreter")
+                    .pick_file()
+                {
+                    match editor_proc::interpreter::version_of(&path) {
+                        Ok(version) => {
+                            self.settings
+                                .set_python_interpreter(&path.display().to_string());
+                            self.persist_settings();
+                            self.info(format!("Using Python {version}"));
+                        }
+                        Err(e) => self.error(format!("Not a working interpreter: {e}")),
+                    }
                 }
             }
 
@@ -863,6 +967,9 @@ impl EditorApp {
         let theme_label = self.settings.theme().label();
         let tab_width = self.settings.tab_width();
         let insert_spaces = self.settings.insert_spaces();
+        let running = self.runner.is_running();
+        let has_run = self.runner.output().line_count() > 1;
+        let run_label = self.runner.label().to_owned();
 
         let row = ui.text_style_height(&egui::TextStyle::Body);
 
@@ -896,6 +1003,25 @@ impl EditorApp {
                         }
                         None => {
                             ui.weak("Ready");
+                        }
+                    }
+
+                    // What is running, and a way back to its output. Without
+                    // this, a hidden output panel means a running process with
+                    // nothing on screen to say so.
+                    if running || has_run {
+                        ui.separator();
+                        let text = if running {
+                            format!("\u{25b6} {run_label}")
+                        } else {
+                            format!("\u{25a0} {run_label}")
+                        };
+                        if ui
+                            .button(text)
+                            .on_hover_text("Show the output panel")
+                            .clicked()
+                        {
+                            invoked = Some(CommandId::ShowOutput);
                         }
                     }
 
@@ -1179,20 +1305,46 @@ impl eframe::App for EditorApp {
                 });
         }
 
-        egui::Panel::bottom("dock")
-            .resizable(true)
-            .default_size(150.0)
-            .size_range(60.0..=600.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.weak("OUTPUT");
-                    ui.weak("PROBLEMS");
-                    ui.weak("SEARCH");
-                    ui.weak("TERMINAL");
+        // Keep draining the process even while the dock is hidden, or output
+        // piles up in the channel and arrives in a lump when it is reopened.
+        if self.runner.poll() {
+            ctx.request_repaint();
+        }
+        if let Some(code) = self.runner.take_finished() {
+            match code {
+                Some(0) => self.info("Finished"),
+                Some(code) => self.error(format!("Exited with code {code}")),
+                None => self.info("Terminated"),
+            }
+        }
+        if self.runner.is_running() {
+            // A running process produces output between frames, so keep
+            // repainting rather than waiting for input.
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
+        if self.show_output {
+            let mut console_action = None;
+            egui::Panel::bottom("dock")
+                .resizable(true)
+                .default_size(220.0)
+                .size_range(60.0..=800.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("OUTPUT");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
+                                self.show_output = false;
+                            }
+                        });
+                    });
+                    console_action = Some(self.runner.draw(ui));
                 });
-                ui.separator();
-                ui.weak("Output panel \u{2014} M7");
-            });
+
+            if let Some(action) = console_action {
+                self.apply_console_action(action);
+            }
+        }
 
         if let Some(action) = self.editor_pane(ui) {
             match action {
@@ -1241,6 +1393,40 @@ struct StatusSummary {
     line: usize,
     column: usize,
     selected: usize,
+}
+
+impl EditorApp {
+    /// Carry out what the console asked for.
+    fn apply_console_action(&mut self, action: editor_widgets::console::Action) {
+        use editor_widgets::console::Action;
+        match action {
+            Action::None => {}
+            Action::OpenLocation { path, line, column } => {
+                if !path.is_file() {
+                    self.error(format!("{} does not exist", path.display()));
+                    return;
+                }
+                self.open_path(&path, false);
+                if let Some(entry) = self.active_mut() {
+                    // Output line and column numbers are one-based.
+                    let offset = entry.doc.offset_at(
+                        line.saturating_sub(1),
+                        column.unwrap_or(1).saturating_sub(1),
+                    );
+                    entry.view.set_caret(offset);
+                    entry.view.focus();
+                }
+            }
+            Action::SendInput(text) => self.runner.send_input(&text),
+            Action::Stop => self.runner.stop(),
+            Action::Restart => {
+                if let Err(e) = self.runner.restart() {
+                    self.error(format!("{e}"));
+                }
+            }
+            Action::Clear => self.runner.clear(),
+        }
+    }
 }
 
 /// Carry out what the find bar asked for.
@@ -1347,6 +1533,8 @@ fn toolbar_glyph(id: CommandId) -> &'static str {
         CommandId::Undo => "\u{21b6}",
         CommandId::Redo => "\u{21b7}",
         CommandId::Find => "\u{1f50d}",
+        CommandId::Run => "\u{25b6}",
+        CommandId::RunStop => "\u{25a0}",
         CommandId::ToggleExplorer => "\u{2630}",
         CommandId::CommandPalette => "\u{2318}",
         CommandId::OpenSettingsFile => "\u{2699}",
@@ -1432,6 +1620,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
         "View",
         &[
             MenuEntry::Item(CommandId::ToggleExplorer),
+            MenuEntry::Item(CommandId::ShowOutput),
             MenuEntry::Item(CommandId::ToggleHiddenFiles),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::ThemeDark),
@@ -1441,6 +1630,18 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::ZoomIn),
             MenuEntry::Item(CommandId::ZoomOut),
             MenuEntry::Item(CommandId::ZoomReset),
+        ],
+    ),
+    (
+        "Run",
+        &[
+            MenuEntry::Item(CommandId::Run),
+            MenuEntry::Item(CommandId::RunStop),
+            MenuEntry::Item(CommandId::RunRestart),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::RunTests),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::SelectInterpreter),
         ],
     ),
     ("Tools", &[MenuEntry::Item(CommandId::CommandPalette)]),
@@ -1461,6 +1662,7 @@ const TOOLBAR: &[&[CommandId]] = &[
     &[CommandId::Save, CommandId::SaveAll],
     &[CommandId::Undo, CommandId::Redo],
     &[CommandId::Find],
+    &[CommandId::Run, CommandId::RunStop],
     &[CommandId::ToggleExplorer],
     &[CommandId::CommandPalette, CommandId::OpenSettingsFile],
 ];

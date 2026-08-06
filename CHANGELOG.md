@@ -10,6 +10,43 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **M7 (in progress) — Running code.** F5 to run, Shift+F5 to stop, Ctrl+F5 to
+  restart, Ctrl+J for the output panel.
+  - **Python** runs as `<interpreter> <file>` from the project root — no
+    wrapper, no generated launcher. The interpreter is the one configured in
+    settings, else a `.venv`/`venv`/`env` in the project, else `python` on
+    `PATH`. `PYTHONUNBUFFERED` is set so `print` output appears as it happens
+    rather than in a lump at exit.
+  - **Rust** runs `cargo run` from the nearest `Cargo.toml`, so a workspace
+    member runs from its own manifest. Run Tests runs `cargo test`.
+  - The exact command and working directory are echoed before anything starts,
+    so there is never any doubt about what ran or with which interpreter.
+  - Output goes through a **pseudo-terminal**, so `input()` prompts work,
+    colour survives, and progress bars that redraw with `\r` behave. There is
+    an input box for answering prompts.
+  - **File references in the output are clickable** — rustc's `--> src/x.rs:1:2`,
+    Python's `File "x.py", line 3`, and the generic `path:line:col` — and
+    resolve against the directory the program ran in. Diagnostic prefixes,
+    timestamps and URLs are deliberately not matched.
+  - Stopping kills the whole process tree, so `cargo run`'s compiled binary
+    does not survive stopping cargo.
+  - Scrollback is capped at 50,000 lines; the console follows new output unless
+    you scroll up to read something.
+  - The status bar shows what is running and takes you back to its output.
+
+### Fixed
+
+- **Python discovery picked the Microsoft Store stub on Windows.** `python3.exe`
+  on `PATH` is normally an App Execution Alias that prints "Python was not
+  found; run without arguments to install from the Microsoft Store" and exits
+  9009 — even with a working Python installed as `python`. Trying `python3`
+  first meant Run produced no output at all. Candidate order is now
+  platform-specific and `WindowsApps` stubs are rejected outright.
+- **Windows ConPTY waits for a Device Status Report before letting the child
+  proceed.** A console that never answered looked exactly like a program that
+  produced no output and never exited — every process test timed out at 20
+  seconds. The reader thread now replies, as a terminal is supposed to.
+
 - **M5 (in progress) — Find and replace within a file.** Ctrl+F to find,
   Ctrl+H to replace, F3 and Shift+F3 to step through results.
   - Match case, whole word, and regular expression toggles. Literal searches

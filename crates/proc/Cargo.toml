@@ -9,6 +9,10 @@ publish = false
 description = "Child process and PTY management, run configurations, ANSI and output links"
 
 [dependencies]
+anyhow.workspace = true
+portable-pty = "0.9.0"
+shell-words = "1.1.1"
+vte = "0.15.0"
 
 [lints]
 workspace = true
