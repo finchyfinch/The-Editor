@@ -11,10 +11,10 @@
 
 pub mod editor_view;
 pub mod file_tree;
+pub mod find_bar;
 pub mod tab_bar;
 pub mod theme;
 
 // Still to come.
 //
-// pub mod find_bar;    // M5
 // pub mod console;     // M7: run output dock

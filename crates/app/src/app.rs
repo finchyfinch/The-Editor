@@ -20,6 +20,7 @@ use editor_syntax::LanguageId;
 use editor_syntax::highlight::Highlighter;
 use editor_syntax::theme::SyntaxTheme;
 use editor_widgets::editor_view::{EditorOptions, EditorView};
+use editor_widgets::find_bar::{self, FindBar};
 use editor_widgets::{file_tree::FileTree, tab_bar, theme as ui_theme};
 use eframe::egui;
 
@@ -80,6 +81,12 @@ struct OpenDoc {
     /// Parse state for highlighting. `None` for plain text, for languages with
     /// no grammar, and for files too large to highlight.
     highlighter: Option<Highlighter>,
+    /// Find/replace state, per document so switching tabs keeps each one's
+    /// query.
+    find: FindBar,
+    /// A Find Next/Previous requested from the keyboard, applied on the frame
+    /// the bar next draws.
+    pending_find_step: Option<isize>,
     /// Preview tabs are replaced by the next single-clicked file instead of
     /// accumulating. Promoted to permanent on double-click or first edit.
     preview: bool,
@@ -260,6 +267,8 @@ impl EditorApp {
             doc,
             view: EditorView::default(),
             language,
+            find: FindBar::default(),
+            pending_find_step: None,
             preview,
         };
 
@@ -559,6 +568,8 @@ impl EditorApp {
                     view: EditorView::default(),
                     language: LanguageId::PlainText,
                     highlighter: None,
+                    find: FindBar::default(),
+                    pending_find_step: None,
                     preview: false,
                 });
                 self.active = Some(self.docs.len() - 1);
@@ -657,6 +668,28 @@ impl EditorApp {
                         let language = entry.language.display_name();
                         self.info(format!("{language} has no line comment syntax"));
                     }
+                }
+            }
+            CommandId::Find | CommandId::Replace => {
+                let seed = self
+                    .active_doc()
+                    .and_then(|entry| entry.view.copy(&entry.doc));
+                if let Some(entry) = self.active_mut() {
+                    if id == CommandId::Replace {
+                        entry.find.open_replace(seed);
+                    } else {
+                        entry.find.open_find(seed);
+                    }
+                }
+            }
+            CommandId::FindNext | CommandId::FindPrevious => {
+                // F3 with the bar closed is still "find the next one", using
+                // whatever was last searched for.
+                if let Some(entry) = self.active_mut() {
+                    if !entry.find.is_open() {
+                        entry.find.open_find(None);
+                    }
+                    entry.pending_find_step = Some(if id == CommandId::FindNext { 1 } else { -1 });
                 }
             }
             CommandId::Indent | CommandId::Outdent => {
@@ -931,6 +964,23 @@ impl EditorApp {
                     h.update(&changes, entry.doc.text());
                 }
 
+                if entry.find.is_open() {
+                    let caret = entry.view.selection.head;
+                    let mut action = entry.find.ui(ui, &entry.doc, caret);
+                    // A keyboard Find Next arrives as a pending step rather
+                    // than a click, so it takes the same path.
+                    if let Some(direction) = entry.pending_find_step.take()
+                        && let Some(range) = entry.find.step_from(caret, direction)
+                    {
+                        action = find_bar::Action::Reveal(range);
+                    }
+                    apply_find_action(entry, action);
+                    ui.separator();
+                }
+                entry
+                    .view
+                    .set_search_matches(entry.find.matches(), entry.find.current_match());
+
                 // Editing a preview tab promotes it: the file is being worked
                 // on, so it must not be replaced by the next explorer click.
                 if entry
@@ -1193,6 +1243,55 @@ struct StatusSummary {
     selected: usize,
 }
 
+/// Carry out what the find bar asked for.
+///
+/// Replacements go through the document's normal transaction path, so they land
+/// in the undo history and reach the highlighter like any other edit. Replace
+/// All is a single transaction, and therefore a single undo step — undoing a
+/// 500-match replace one match at a time would be unusable.
+fn apply_find_action(entry: &mut OpenDoc, action: find_bar::Action) {
+    use editor_core::edit::{Edit, Transaction};
+    use editor_core::selection::Selection;
+
+    match action {
+        find_bar::Action::None => {}
+        find_bar::Action::Reveal(range) => {
+            entry.view.select_range(range.start, range.end);
+        }
+        find_bar::Action::Replace { range, with } => {
+            if !entry.doc.is_editable() {
+                return;
+            }
+            let before = entry.view.selection;
+            let after = Selection::at(range.start + with.chars().count());
+            entry.doc.break_undo_run();
+            entry
+                .doc
+                .apply(&Transaction::replace(range, with), before, after);
+            entry.view.set_caret(after.head);
+            entry.doc.break_undo_run();
+        }
+        find_bar::Action::ReplaceAll(edits) => {
+            if !entry.doc.is_editable() || edits.is_empty() {
+                return;
+            }
+            let count = edits.len();
+            let before = entry.view.selection;
+            let transaction = Transaction::new(
+                edits
+                    .into_iter()
+                    .map(|(range, with)| Edit::replace(range, with))
+                    .collect(),
+            );
+            entry.doc.break_undo_run();
+            entry.doc.apply(&transaction, before, before);
+            entry.doc.break_undo_run();
+            tracing::info!(count, "replaced all occurrences");
+        }
+        find_bar::Action::FocusEditor => entry.view.focus(),
+    }
+}
+
 /// Build a highlighter for a document, or `None` if it should not be
 /// highlighted.
 ///
@@ -1247,6 +1346,7 @@ fn toolbar_glyph(id: CommandId) -> &'static str {
         CommandId::SaveAll => "\u{1f5c3}",
         CommandId::Undo => "\u{21b6}",
         CommandId::Redo => "\u{21b7}",
+        CommandId::Find => "\u{1f50d}",
         CommandId::ToggleExplorer => "\u{2630}",
         CommandId::CommandPalette => "\u{2318}",
         CommandId::OpenSettingsFile => "\u{2699}",
@@ -1321,6 +1421,11 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::ToggleComment),
             MenuEntry::Item(CommandId::Indent),
             MenuEntry::Item(CommandId::Outdent),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::Find),
+            MenuEntry::Item(CommandId::Replace),
+            MenuEntry::Item(CommandId::FindNext),
+            MenuEntry::Item(CommandId::FindPrevious),
         ],
     ),
     (
@@ -1355,6 +1460,7 @@ const TOOLBAR: &[&[CommandId]] = &[
     &[CommandId::NewFile, CommandId::OpenFile],
     &[CommandId::Save, CommandId::SaveAll],
     &[CommandId::Undo, CommandId::Redo],
+    &[CommandId::Find],
     &[CommandId::ToggleExplorer],
     &[CommandId::CommandPalette, CommandId::OpenSettingsFile],
 ];

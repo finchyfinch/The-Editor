@@ -857,6 +857,10 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
       toggling and block indent/dedent. Still to do: `.editorconfig` support,
       trim-trailing-whitespace and final-newline on save, re-indent on paste,
       bracket-match highlighting, and code folding.
+- [ ] **M5 — Search.** In-file find and replace is done: literal and regex,
+      case and whole-word options, match highlighting, wrapping navigation, and
+      Replace All as one undo step. Still to do: project-wide search and replace
+      on the ripgrep engine, and go-to-file / go-to-symbol.
 
 **Sequencing change.** M2's editing widget was brought forward ahead of the rest
 of M1. An IDE you cannot type into is impossible to evaluate, and the M1

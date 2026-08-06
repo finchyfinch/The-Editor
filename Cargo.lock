@@ -867,6 +867,8 @@ name = "editor-search"
 version = "1.0.0"
 dependencies = [
  "editor-core",
+ "regex",
+ "ropey",
 ]
 
 [[package]]
@@ -902,6 +904,7 @@ version = "1.0.0"
 dependencies = [
  "editor-config",
  "editor-core",
+ "editor-search",
  "editor-syntax",
  "eframe",
 ]

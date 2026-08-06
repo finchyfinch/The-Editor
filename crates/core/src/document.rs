@@ -296,6 +296,16 @@ impl Document {
         !self.pending.is_empty()
     }
 
+    /// A counter bumped by every mutation.
+    ///
+    /// Lets a consumer cache something derived from the text — search results,
+    /// a symbol list — and notice cheaply when it has gone stale, without
+    /// comparing the contents.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Undo one step. Returns the selection to restore, or `None` if there is
     /// nothing to undo.
     pub fn undo(&mut self) -> Option<Selection> {

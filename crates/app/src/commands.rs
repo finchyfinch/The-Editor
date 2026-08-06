@@ -37,6 +37,10 @@ pub(crate) enum CommandId {
     ToggleComment,
     Indent,
     Outdent,
+    Find,
+    Replace,
+    FindNext,
+    FindPrevious,
     // View
     ToggleExplorer,
     ThemeDark,
@@ -78,6 +82,10 @@ impl CommandId {
         Self::ToggleComment,
         Self::Indent,
         Self::Outdent,
+        Self::Find,
+        Self::Replace,
+        Self::FindNext,
+        Self::FindPrevious,
         Self::ToggleExplorer,
         Self::ThemeDark,
         Self::ThemeLight,
@@ -128,6 +136,14 @@ impl Command {
 
 const fn ctrl(key: Key) -> Option<KeyboardShortcut> {
     Some(KeyboardShortcut::new(Modifiers::COMMAND, key))
+}
+
+const fn plain(key: Key) -> KeyboardShortcut {
+    KeyboardShortcut::new(Modifiers::NONE, key)
+}
+
+const fn shift(key: Key) -> KeyboardShortcut {
+    KeyboardShortcut::new(Modifiers::SHIFT, key)
 }
 
 const fn ctrl_shift(key: Key) -> Option<KeyboardShortcut> {
@@ -195,6 +211,20 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Edit",
         "Outdent Lines",
         ctrl(Key::OpenBracket),
+    ),
+    cmd(CommandId::Find, "Edit", "Find", ctrl(Key::F)),
+    cmd(CommandId::Replace, "Edit", "Replace", ctrl(Key::H)),
+    cmd(
+        CommandId::FindNext,
+        "Edit",
+        "Find Next",
+        Some(plain(Key::F3)),
+    ),
+    cmd(
+        CommandId::FindPrevious,
+        "Edit",
+        "Find Previous",
+        Some(shift(Key::F3)),
     ),
     cmd(
         CommandId::ToggleExplorer,

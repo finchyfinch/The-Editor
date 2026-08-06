@@ -10,6 +10,25 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **M5 (in progress) — Find and replace within a file.** Ctrl+F to find,
+  Ctrl+H to replace, F3 and Shift+F3 to step through results.
+  - Match case, whole word, and regular expression toggles. Literal searches
+    escape the pattern, so searching for `a.c` does not match `abc`, and a
+    literal replacement of `$5` inserts `$5` rather than expanding a capture
+    group. In regex mode `$1` and `${name}` do expand.
+  - Every match is highlighted, with the current one outlined so it stays
+    visible even under a selection. `n of m` counts the results; an invalid
+    regular expression reports its error in the bar instead of clearing to
+    "no results".
+  - Stepping wraps in both directions, and the first step goes to the next
+    match *after the caret* rather than jumping back to the top of the file.
+  - Replace All is a single transaction and therefore a single undo step.
+  - Results are cached against the query and the document version, so typing
+    does not re-search a large file on every repaint.
+  - Empty matches are skipped: `a*` matches at every position, which would be
+    useless to step through and destructive to Replace All.
+  - The query is per-document, so switching tabs keeps each one's search.
+
 - **M4 (in progress) — Language-aware editing.**
   - **Python indentation**, the case that has to be right, because getting a
     newline wrong there changes what the program means:

@@ -82,6 +82,9 @@ pub struct EditorView {
     /// Set when the app wants this view to take the keyboard.
     grab_focus: bool,
     last_interaction: Option<std::time::Instant>,
+    /// Search results to highlight, supplied by the find bar.
+    search_matches: Vec<std::ops::Range<usize>>,
+    current_match: Option<std::ops::Range<usize>>,
 }
 
 impl EditorView {
@@ -101,6 +104,15 @@ impl EditorView {
     /// view. Used to honour a template's `$CURSOR` marker.
     pub fn set_caret(&mut self, offset: usize) {
         self.selection = Selection::at(offset);
+        self.goal_column = None;
+        self.scroll_to_caret = true;
+    }
+
+    /// Select `start..end` and scroll it into view, without taking focus —
+    /// stepping through search results must not pull the keyboard out of the
+    /// find field mid-search.
+    pub fn select_range(&mut self, start: usize, end: usize) {
+        self.selection = Selection::new(start, end);
         self.goal_column = None;
         self.scroll_to_caret = true;
     }
@@ -186,6 +198,19 @@ impl EditorView {
         opts: EditorOptions,
     ) -> bool {
         self.render(ui, doc, highlighter, syntax, opts)
+    }
+
+    /// Ranges to highlight as search results, and which of them is current.
+    ///
+    /// Set once per frame before drawing; cleared when the find bar closes.
+    pub fn set_search_matches(
+        &mut self,
+        matches: &[std::ops::Range<usize>],
+        current: Option<std::ops::Range<usize>>,
+    ) {
+        self.search_matches.clear();
+        self.search_matches.extend_from_slice(matches);
+        self.current_match = current;
     }
 
     fn render(
@@ -973,6 +998,51 @@ impl EditorView {
                 );
                 ui.fonts_mut(|f| f.layout_job(job))
             };
+
+            // Search results, painted under the selection so a selected match
+            // still reads as selected.
+            if !self.search_matches.is_empty() {
+                let line_end = line_start + text.chars().count();
+                for found in &self.search_matches {
+                    if found.end < line_start || found.start > line_end {
+                        continue;
+                    }
+                    let from = found.start.clamp(line_start, line_end) - line_start;
+                    let to = found.end.clamp(line_start, line_end) - line_start;
+                    if from >= to {
+                        continue;
+                    }
+                    let x0 = text_left + galley.pos_from_cursor(ccursor(from)).left();
+                    let x1 = text_left + galley.pos_from_cursor(ccursor(to)).left();
+                    let is_current = self.current_match.as_ref() == Some(found);
+                    let colour = if is_current {
+                        visuals.selection.bg_fill
+                    } else {
+                        visuals.widgets.hovered.bg_fill
+                    };
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0, y),
+                            egui::pos2(x1.max(x0 + 2.0), y + row_height),
+                        ),
+                        2,
+                        colour,
+                    );
+                    if is_current {
+                        // An outline as well as a fill, so the current match is
+                        // findable even where the fill sits under a selection.
+                        painter.rect_stroke(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x0, y),
+                                egui::pos2(x1.max(x0 + 2.0), y + row_height),
+                            ),
+                            2,
+                            egui::Stroke::new(1.0, visuals.strong_text_color()),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+            }
 
             // Selection highlight for the part of this line that is selected.
             if !self.selection.is_empty() {

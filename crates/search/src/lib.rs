@@ -5,9 +5,9 @@
 //! remains cancellable. A project-wide replace is applied as a single undoable
 //! operation. See PLAN.md §3.7.
 
-// M5 populates these.
+pub mod query;
+
+// Still to come.
 //
-// pub mod query;       // SearchQuery: literal/regex, case, whole word, scope
-// pub mod in_file;     // incremental match over a Rope
-// pub mod project;     // streaming walker + searcher
+// pub mod project;     // streaming walker + searcher over a whole tree
 // pub mod replace;     // preview, per-match exclusion, atomic multi-file apply
