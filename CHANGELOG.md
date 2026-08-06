@@ -10,6 +10,35 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **M2 (in progress) — Editor core.** The editor pane is now editable.
+  - Virtualised painting: only the visible rows are laid out, so cost tracks the
+    viewport rather than the file size.
+  - Typing, Enter with the previous line's indentation carried over, Tab to the
+    next tab stop, Delete, and smart Backspace that clears one indent level
+    inside leading whitespace and one character everywhere else.
+  - Selection by click, drag, shift-click and double-click; double-click selects
+    whole `snake_case` identifiers.
+  - Caret motion by arrows, Page Up/Down, Home/End (Home toggles between the
+    first non-whitespace character and column zero) and Ctrl+Home/End, with a
+    sticky goal column so crossing a short line and coming back returns to the
+    original column.
+  - Cut, copy, paste and select all, from both the keyboard and the Edit menu.
+  - Undo and redo, with a run of typing or backspaces coalesced into one step,
+    and the caret restored to where the edit happened rather than wherever it
+    drifted to since.
+  - Caret and click positions use galley cursor mapping rather than assuming a
+    fixed character width, so accented and CJK text behaves correctly.
+  - Status bar shows Ln/Col and the selection size; opening a document or
+    selecting its tab focuses the editor so it can be typed into immediately.
+
+### Fixed
+
+- Multi-edit transactions recorded their inverse in pre-edit coordinates, so
+  undoing a transaction containing two edits of differing lengths corrupted the
+  document. Single-edit undo was unaffected, which is why it was invisible until
+  a test covered the multi-edit case. The inverse is now shifted by the
+  cumulative length change of every preceding edit.
+
 - **M1 (in progress) — Shell & layout.**
   - **Themes.** Dark (default), Light, and Follow System, switchable from the
     View menu, the command palette, or the status-bar indicator. Applied live,

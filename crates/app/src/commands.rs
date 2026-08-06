@@ -2,11 +2,11 @@
 //!
 //! Every user-facing action is registered here exactly once, with its title,
 //! category and keyboard shortcut. The menus, the toolbar, the command palette
-//! and the Help → Keyboard Shortcuts page are all generated from this list.
+//! and the Help â†’ Keyboard Shortcuts page are all generated from this list.
 //!
 //! The point is not tidiness. It is that a menu item and its keyboard shortcut
 //! cannot drift apart into doing different things, and that a new command
-//! cannot be added to a menu but forgotten in the palette. See PLAN.md §5.
+//! cannot be added to a menu but forgotten in the palette. See PLAN.md Â§5.
 
 use eframe::egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -26,6 +26,13 @@ pub(crate) enum CommandId {
     CloseTab,
     CloseFolder,
     Exit,
+    // Edit
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
     // View
     ToggleExplorer,
     ThemeDark,
@@ -57,6 +64,12 @@ impl CommandId {
         Self::CloseTab,
         Self::CloseFolder,
         Self::Exit,
+        Self::Undo,
+        Self::Redo,
+        Self::Cut,
+        Self::Copy,
+        Self::Paste,
+        Self::SelectAll,
         Self::ToggleExplorer,
         Self::ThemeDark,
         Self::ThemeLight,
@@ -80,11 +93,21 @@ pub(crate) struct Command {
     /// Shown in the palette, prefixed by the category.
     pub(crate) title: &'static str,
     pub(crate) category: &'static str,
+    /// The accelerator, shown in menus and the shortcut reference.
     pub(crate) shortcut: Option<KeyboardShortcut>,
+    /// Whether [`triggered`] should claim this shortcut globally.
+    ///
+    /// Clipboard shortcuts are `false`: egui synthesises `Event::Copy`,
+    /// `Event::Cut` and `Event::Paste` from the platform (including the OS
+    /// menu and middle-click paste on X11), and the focused widget handles
+    /// them. Claiming Ctrl+C here would consume the keystroke before the
+    /// editor ever saw the event, and break copying out of a text field.
+    /// The binding is still listed so the menu shows the right accelerator.
+    pub(crate) global: bool,
 }
 
 impl Command {
-    /// `"File: Open Folder"` — what the palette matches against and displays.
+    /// `"File: Open Folder"` â€” what the palette matches against and displays.
     pub(crate) fn palette_label(&self) -> String {
         format!("{}: {}", self.category, self.title)
     }
@@ -109,147 +132,104 @@ const fn ctrl_shift(key: Key) -> Option<KeyboardShortcut> {
 /// The registry.
 ///
 /// `Modifiers::COMMAND` is Ctrl on Windows and Linux and Cmd on macOS, so the
-/// platform mapping described in PLAN.md §6 comes for free rather than needing
+/// platform mapping described in PLAN.md Â§6 comes for free rather than needing
 /// a `cfg!` at every call site.
 pub(crate) fn registry() -> &'static [Command] {
     &REGISTRY
 }
 
 static REGISTRY: [Command; CommandId::ALL.len()] = [
-    Command {
-        id: CommandId::NewFile,
-        title: "New File",
-        category: "File",
-        shortcut: ctrl(Key::N),
-    },
-    Command {
-        id: CommandId::OpenFile,
-        title: "Open File",
-        category: "File",
-        shortcut: ctrl(Key::O),
-    },
-    Command {
-        id: CommandId::OpenFolder,
-        title: "Open Folder",
-        category: "File",
-        shortcut: ctrl_shift(Key::O),
-    },
-    Command {
-        id: CommandId::Save,
-        title: "Save",
-        category: "File",
-        shortcut: ctrl(Key::S),
-    },
-    Command {
-        id: CommandId::SaveAs,
-        title: "Save As",
-        category: "File",
-        shortcut: ctrl_shift(Key::S),
-    },
-    Command {
-        id: CommandId::SaveAll,
-        title: "Save All",
-        category: "File",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::CloseTab,
-        title: "Close Tab",
-        category: "File",
-        shortcut: ctrl(Key::W),
-    },
-    Command {
-        id: CommandId::CloseFolder,
-        title: "Close Folder",
-        category: "File",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::Exit,
-        title: "Exit",
-        category: "File",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::ToggleExplorer,
-        title: "Toggle Explorer",
-        category: "View",
-        shortcut: ctrl(Key::B),
-    },
-    Command {
-        id: CommandId::ThemeDark,
-        title: "Theme: Dark",
-        category: "View",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::ThemeLight,
-        title: "Theme: Light",
-        category: "View",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::ThemeSystem,
-        title: "Theme: Follow System",
-        category: "View",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::ToggleHiddenFiles,
-        title: "Toggle Hidden Files",
-        category: "View",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::ZoomIn,
-        title: "Zoom In",
-        category: "View",
-        shortcut: ctrl(Key::Plus),
-    },
-    Command {
-        id: CommandId::ZoomOut,
-        title: "Zoom Out",
-        category: "View",
-        shortcut: ctrl(Key::Minus),
-    },
-    Command {
-        id: CommandId::ZoomReset,
-        title: "Reset Zoom",
-        category: "View",
-        shortcut: ctrl(Key::Num0),
-    },
-    Command {
-        id: CommandId::CommandPalette,
-        title: "Command Palette",
-        category: "Tools",
-        shortcut: ctrl_shift(Key::P),
-    },
-    Command {
-        id: CommandId::OpenSettingsFile,
-        title: "Open settings.toml",
-        category: "Tools",
-        shortcut: ctrl(Key::Comma),
-    },
-    Command {
-        id: CommandId::About,
-        title: "About The Editor",
-        category: "Help",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::KeyboardShortcuts,
-        title: "Keyboard Shortcuts",
-        category: "Help",
-        shortcut: None,
-    },
-    Command {
-        id: CommandId::OpenLogFolder,
-        title: "Open Log Folder",
-        category: "Help",
-        shortcut: None,
-    },
+    cmd(CommandId::NewFile, "File", "New File", ctrl(Key::N)),
+    cmd(CommandId::OpenFile, "File", "Open File", ctrl(Key::O)),
+    cmd(
+        CommandId::OpenFolder,
+        "File",
+        "Open Folder",
+        ctrl_shift(Key::O),
+    ),
+    cmd(CommandId::Save, "File", "Save", ctrl(Key::S)),
+    cmd(CommandId::SaveAs, "File", "Save As", ctrl_shift(Key::S)),
+    cmd(CommandId::SaveAll, "File", "Save All", None),
+    cmd(CommandId::CloseTab, "File", "Close Tab", ctrl(Key::W)),
+    cmd(CommandId::CloseFolder, "File", "Close Folder", None),
+    cmd(CommandId::Exit, "File", "Exit", None),
+    cmd(CommandId::Undo, "Edit", "Undo", ctrl(Key::Z)),
+    cmd(CommandId::Redo, "Edit", "Redo", ctrl_shift(Key::Z)),
+    // Clipboard bindings are listed for display but not claimed globally; see
+    // the `global` field on `Command`.
+    view_cmd(CommandId::Cut, "Edit", "Cut", ctrl(Key::X)),
+    view_cmd(CommandId::Copy, "Edit", "Copy", ctrl(Key::C)),
+    view_cmd(CommandId::Paste, "Edit", "Paste", ctrl(Key::V)),
+    cmd(CommandId::SelectAll, "Edit", "Select All", ctrl(Key::A)),
+    cmd(
+        CommandId::ToggleExplorer,
+        "View",
+        "Toggle Explorer",
+        ctrl(Key::B),
+    ),
+    cmd(CommandId::ThemeDark, "View", "Theme: Dark", None),
+    cmd(CommandId::ThemeLight, "View", "Theme: Light", None),
+    cmd(CommandId::ThemeSystem, "View", "Theme: Follow System", None),
+    cmd(
+        CommandId::ToggleHiddenFiles,
+        "View",
+        "Toggle Hidden Files",
+        None,
+    ),
+    cmd(CommandId::ZoomIn, "View", "Zoom In", ctrl(Key::Plus)),
+    cmd(CommandId::ZoomOut, "View", "Zoom Out", ctrl(Key::Minus)),
+    cmd(CommandId::ZoomReset, "View", "Reset Zoom", ctrl(Key::Num0)),
+    cmd(
+        CommandId::CommandPalette,
+        "Tools",
+        "Command Palette",
+        ctrl_shift(Key::P),
+    ),
+    cmd(
+        CommandId::OpenSettingsFile,
+        "Tools",
+        "Open settings.toml",
+        ctrl(Key::Comma),
+    ),
+    cmd(CommandId::About, "Help", "About The Editor", None),
+    cmd(
+        CommandId::KeyboardShortcuts,
+        "Help",
+        "Keyboard Shortcuts",
+        None,
+    ),
+    cmd(CommandId::OpenLogFolder, "Help", "Open Log Folder", None),
 ];
 
+/// A command whose shortcut the application claims globally.
+const fn cmd(
+    id: CommandId,
+    category: &'static str,
+    title: &'static str,
+    shortcut: Option<KeyboardShortcut>,
+) -> Command {
+    Command {
+        id,
+        title,
+        category,
+        shortcut,
+        global: true,
+    }
+}
+
+/// A command the focused view handles itself. The binding is recorded so menus
+/// show the accelerator, but it is not consumed at the application level.
+const fn view_cmd(
+    id: CommandId,
+    category: &'static str,
+    title: &'static str,
+    shortcut: Option<KeyboardShortcut>,
+) -> Command {
+    Command {
+        global: false,
+        ..cmd(id, category, title, shortcut)
+    }
+}
 /// Look up a registered command.
 pub(crate) fn get(id: CommandId) -> &'static Command {
     registry()
@@ -263,6 +243,9 @@ pub(crate) fn get(id: CommandId) -> &'static Command {
 /// Consuming the shortcut prevents it also reaching a focused text field.
 pub(crate) fn triggered(ctx: &eframe::egui::Context) -> Option<CommandId> {
     registry().iter().find_map(|cmd| {
+        if !cmd.global {
+            return None;
+        }
         let sc = cmd.shortcut?;
         ctx.input_mut(|i| i.consume_shortcut(&sc)).then_some(cmd.id)
     })

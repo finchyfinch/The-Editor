@@ -17,14 +17,13 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod document;
+pub mod edit;
+pub mod history;
+pub mod selection;
 
-// M2 populates these. Declared now so the module boundaries are visible from
-// the start rather than being discovered halfway through.
+// Still to come.
 //
-// pub mod edit;        // Transaction, Change, apply()
-// pub mod history;     // undo/redo with coalescing
-// pub mod selection;   // Selection, multi-cursor arithmetic
-// pub mod indent;      // language-aware indentation engine
+// pub mod indent;      // M4: language-aware indentation engine
 
 /// The version of The Editor, from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

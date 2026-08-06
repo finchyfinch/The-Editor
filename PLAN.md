@@ -843,7 +843,16 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
       blank `eframe` window, cargo aliases, git repo. See `docs/M0-NOTES.md`.
 - [x] **Spike — virtualised rope rendering.** `cargo spike` runs it; findings in
       `docs/SPIKE-NOTES.md`.
-- [ ] **M1 — Shell & layout.** In progress, roughly two thirds done.
+- [ ] **M1 — Shell & layout.** Mostly done; the remaining items are listed below.
+- [ ] **M2 — Editor core.** Core editing works: typing, selections, undo/redo
+      with coalescing, clipboard, caret motion, virtualised painting.
+
+**Sequencing change.** M2's editing widget was brought forward ahead of the rest
+of M1. An IDE you cannot type into is impossible to evaluate, and the M1
+leftovers (session restore, tab drag-reorder, filesystem watching) are polish by
+comparison. The **New File dialog** — name, language, boilerplate template
+(§7) — moves from M8 to immediately after M2 for the same reason: a "new file"
+command that cannot name the file or pick its language is only half a feature.
 
 **M1 landed so far:** command registry driving the menus, toolbar, keyboard and
 palette from one source; fuzzy command palette; dark/light/follow-system theme
@@ -853,12 +862,25 @@ atomic saves; file tree with lazy expansion; tab strip with close/dirty/preview
 behaviour; status bar; About and generated Keyboard Shortcuts windows; toast
 messages for errors.
 
+**M2 landed so far:** the real editor widget — virtualised painting on the
+technique the spike validated, typing, selection by click/drag/double-click,
+caret motion with a sticky goal column, smart backspace to the tab stop,
+auto-indent carried from the previous line, cut/copy/paste, select all, and
+undo/redo with typing coalesced into single steps.
+
 **M1 still to do:** filesystem watcher (`notify`) so external changes refresh the
 tree; session persistence (reopen tabs, scroll positions, window geometry);
 file-tree context menu (new/rename/delete-to-trash/reveal); tab drag-reorder and
 the overflow dropdown; Ctrl+Tab most-recently-used cycling; go-to-file
 (Ctrl+P); native macOS menu bar via `muda`; and a build/run pass on Linux and
 macOS.
+
+**M2 still to do:** the New File dialog (pulled forward from M8); prompting
+Save / Don't Save / Cancel when closing a dirty tab; multi-cursor and column
+selection; word-wise motion and deletion (Ctrl+arrow, Ctrl+Backspace); line
+manipulation (duplicate, move up/down, delete); external-change detection;
+crash-recovery autosave; and the performance benchmarks that assert the §2.4
+budgets.
 
 Still outstanding, none of it blocking:
 - Set up the bare backup remote (`git remote add origin <path-to-nas>/the-editor.git`).

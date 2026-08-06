@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use ropey::Rope;
 
+use crate::edit::{self, Change, Transaction};
+use crate::history::History;
+use crate::selection::Selection;
+
 /// Files above this size open as read-only plain text with no highlighting and
 /// no language server. See PLAN.md §8 "Large files".
 pub const LARGE_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -99,17 +103,28 @@ pub enum ReadOnlyReason {
 }
 
 /// An open file.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Document {
     path: Option<PathBuf>,
     text: Rope,
     encoding: Encoding,
     line_ending: LineEnding,
-    dirty: bool,
     read_only: Option<ReadOnlyReason>,
     /// True when the file exceeded [`LARGE_FILE_BYTES`], so callers know to
     /// skip highlighting and language-server registration.
     large: bool,
+
+    history: History,
+    /// Bumped by every mutation, including undo and redo. Compared against
+    /// [`Self::saved_version`] to decide whether the tab shows an unsaved
+    /// marker.
+    ///
+    /// Deliberately not "history depth at last save": undoing past the save
+    /// point and then editing again can land back at the same depth with
+    /// different content, and a document that wrongly reports itself clean
+    /// loses the user's work. Over-reporting dirty costs an unnecessary save.
+    version: u64,
+    saved_version: u64,
 }
 
 impl Document {
@@ -121,9 +136,11 @@ impl Document {
             text: Rope::new(),
             encoding: Encoding::Utf8,
             line_ending: LineEnding::platform_default(),
-            dirty: false,
             read_only: None,
             large: false,
+            history: History::default(),
+            version: 0,
+            saved_version: 0,
         }
     }
 
@@ -178,9 +195,11 @@ impl Document {
             text: Rope::from_str(&normalised),
             encoding,
             line_ending,
-            dirty: false,
             read_only,
             large,
+            history: History::default(),
+            version: 0,
+            saved_version: 0,
         })
     }
 
@@ -226,8 +245,128 @@ impl Document {
         std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
 
         self.path = Some(path.to_path_buf());
-        self.dirty = false;
+        self.saved_version = self.version;
+        // A save is an undo boundary: typing before and after it must not be
+        // folded into one step.
+        self.history.break_run();
         Ok(())
+    }
+
+    // ---- editing ---------------------------------------------------------
+
+    /// Apply a transaction. **The only way this document's text changes.**
+    ///
+    /// `before` and `after` are the selection either side of the edit, so undo
+    /// can restore the caret to where the change happened.
+    pub fn apply(&mut self, tx: &Transaction, before: Selection, after: Selection) -> Vec<Change> {
+        if tx.is_empty() {
+            return Vec::new();
+        }
+        let applied = edit::apply(&mut self.text, tx);
+        self.history
+            .push(tx.clone(), applied.inverse, before, after);
+        self.version = self.version.wrapping_add(1);
+        // M3 feeds `applied.changes` to the incremental parser and M6 to the
+        // language server; both hang off this single return value.
+        applied.changes
+    }
+
+    /// Undo one step. Returns the selection to restore, or `None` if there is
+    /// nothing to undo.
+    pub fn undo(&mut self) -> Option<Selection> {
+        let step = self.history.undo()?;
+        edit::apply(&mut self.text, &step.transaction);
+        self.version = self.version.wrapping_add(1);
+        Some(step.selection.clamped(self.text.len_chars()))
+    }
+
+    /// Redo one step. Returns the selection to restore.
+    pub fn redo(&mut self) -> Option<Selection> {
+        let step = self.history.redo()?;
+        edit::apply(&mut self.text, &step.transaction);
+        self.version = self.version.wrapping_add(1);
+        Some(step.selection.clamped(self.text.len_chars()))
+    }
+
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// Force the next edit to begin a new undo entry.
+    pub fn break_undo_run(&mut self) {
+        self.history.break_run();
+    }
+
+    // ---- positions -------------------------------------------------------
+
+    /// Total characters, the upper bound for any offset.
+    #[must_use]
+    pub fn len_chars(&self) -> usize {
+        self.text.len_chars()
+    }
+
+    /// Line containing `offset`, clamped into range.
+    #[must_use]
+    pub fn line_of(&self, offset: usize) -> usize {
+        self.text.char_to_line(offset.min(self.text.len_chars()))
+    }
+
+    /// First character offset of `line`, clamped into range.
+    #[must_use]
+    pub fn line_start(&self, line: usize) -> usize {
+        self.text
+            .line_to_char(line.min(self.text.len_lines().saturating_sub(1)))
+    }
+
+    /// Characters in `line`, excluding its trailing newline.
+    #[must_use]
+    pub fn line_len(&self, line: usize) -> usize {
+        if line >= self.text.len_lines() {
+            return 0;
+        }
+        let slice = self.text.line(line);
+        let mut len = slice.len_chars();
+        // Trim the terminator, however it is represented.
+        if slice.chars_at(len).reversed().next() == Some('\n') {
+            len -= 1;
+            if slice.chars_at(len).reversed().next() == Some('\r') {
+                len -= 1;
+            }
+        }
+        len
+    }
+
+    /// The text of `line` without its terminator.
+    #[must_use]
+    pub fn line_text(&self, line: usize) -> String {
+        if line >= self.text.len_lines() {
+            return String::new();
+        }
+        let start = self.line_start(line);
+        let end = start + self.line_len(line);
+        self.text.slice(start..end).to_string()
+    }
+
+    /// One-based line and column, for the status bar.
+    #[must_use]
+    pub fn line_col(&self, offset: usize) -> (usize, usize) {
+        let offset = offset.min(self.text.len_chars());
+        let line = self.text.char_to_line(offset);
+        (line + 1, offset - self.text.line_to_char(line) + 1)
+    }
+
+    /// Offset of `column` on `line`, clamped to that line's length so that
+    /// moving down onto a shorter line lands at its end rather than wrapping.
+    #[must_use]
+    pub fn offset_at(&self, line: usize, column: usize) -> usize {
+        let line = line.min(self.text.len_lines().saturating_sub(1));
+        self.line_start(line) + column.min(self.line_len(line))
     }
 
     #[must_use]
@@ -268,13 +407,21 @@ impl Document {
     pub fn set_line_ending(&mut self, ending: LineEnding) {
         if self.line_ending != ending {
             self.line_ending = ending;
-            self.dirty = true;
+            self.version = self.version.wrapping_add(1);
         }
     }
 
+    /// True when there are changes not yet written to disk.
     #[must_use]
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.version != self.saved_version
+    }
+
+    /// True when edits should be refused — a read-only file, or one too large
+    /// to edit safely.
+    #[must_use]
+    pub fn is_editable(&self) -> bool {
+        self.read_only.is_none()
     }
 
     #[must_use]

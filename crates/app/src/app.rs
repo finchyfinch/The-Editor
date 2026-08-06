@@ -14,6 +14,7 @@ use editor_config::settings::Settings;
 use editor_config::theme::{ResolvedTheme, ThemePreference};
 use editor_core::document::Document;
 use editor_syntax::LanguageId;
+use editor_widgets::editor_view::{EditorOptions, EditorView};
 use editor_widgets::{file_tree::FileTree, tab_bar, theme as ui_theme};
 use eframe::egui;
 
@@ -47,10 +48,11 @@ struct Toast {
     born: Instant,
 }
 
-/// One open document and its tab state.
+/// One open document, its view state, and its tab state.
 #[derive(Debug)]
 struct OpenDoc {
     doc: Document,
+    view: EditorView,
     language: LanguageId,
     /// Preview tabs are replaced by the next single-clicked file instead of
     /// accumulating. Promoted to permanent on double-click or first edit.
@@ -154,6 +156,18 @@ impl EditorApp {
         self.active.and_then(|i| self.docs.get(i))
     }
 
+    fn active_mut(&mut self) -> Option<&mut OpenDoc> {
+        self.active.and_then(|i| self.docs.get_mut(i))
+    }
+
+    /// Give the keyboard to the active editor, so an opened or selected
+    /// document can be typed into without clicking into it first.
+    fn focus_active(&mut self) {
+        if let Some(entry) = self.active_mut() {
+            entry.view.focus();
+        }
+    }
+
     /// Open a file in a tab, or focus the tab it is already in.
     ///
     /// `preview` opens it in the reusable preview tab (single click in the
@@ -164,6 +178,7 @@ impl EditorApp {
             if !preview {
                 self.docs[existing].preview = false;
             }
+            self.focus_active();
             return;
         }
 
@@ -189,6 +204,7 @@ impl EditorApp {
 
         let entry = OpenDoc {
             doc,
+            view: EditorView::default(),
             language,
             preview,
         };
@@ -197,11 +213,11 @@ impl EditorApp {
         if preview && let Some(slot) = self.docs.iter().position(|d| d.preview) {
             self.docs[slot] = entry;
             self.active = Some(slot);
-            return;
+        } else {
+            self.docs.push(entry);
+            self.active = Some(self.docs.len() - 1);
         }
-
-        self.docs.push(entry);
-        self.active = Some(self.docs.len() - 1);
+        self.focus_active();
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -258,13 +274,17 @@ impl EditorApp {
     fn run_command(&mut self, id: CommandId, ctx: &egui::Context) {
         match id {
             CommandId::NewFile => {
-                // The full New File wizard (name, language, boilerplate) is M8.
+                // The New File dialog — name, language, boilerplate template —
+                // is the next thing after M2. This creates a blank buffer that
+                // Save As can name.
                 self.docs.push(OpenDoc {
                     doc: Document::untitled(),
+                    view: EditorView::default(),
                     language: LanguageId::PlainText,
                     preview: false,
                 });
                 self.active = Some(self.docs.len() - 1);
+                self.focus_active();
             }
             CommandId::OpenFile => {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
@@ -304,6 +324,50 @@ impl EditorApp {
                 self.tree = FileTree::default();
             }
             CommandId::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+
+            CommandId::Undo => {
+                if let Some(entry) = self.active_mut() {
+                    let changed = entry.view.undo(&mut entry.doc);
+                    if !changed {
+                        self.info("Nothing to undo");
+                    }
+                }
+            }
+            CommandId::Redo => {
+                if let Some(entry) = self.active_mut() {
+                    let changed = entry.view.redo(&mut entry.doc);
+                    if !changed {
+                        self.info("Nothing to redo");
+                    }
+                }
+            }
+            CommandId::Copy => {
+                if let Some(entry) = self.active_mut()
+                    && let Some(text) = entry.view.copy(&entry.doc)
+                {
+                    ctx.copy_text(text);
+                }
+            }
+            CommandId::Cut => {
+                if let Some(entry) = self.active_mut()
+                    && let Some(text) = entry.view.cut(&mut entry.doc)
+                {
+                    ctx.copy_text(text);
+                }
+            }
+            CommandId::Paste => match read_clipboard() {
+                Ok(text) => {
+                    if let Some(entry) = self.active_mut() {
+                        entry.view.paste(&mut entry.doc, &text);
+                    }
+                }
+                Err(e) => self.error(format!("Paste failed: {e}")),
+            },
+            CommandId::SelectAll => {
+                if let Some(entry) = self.active_mut() {
+                    entry.view.select_all(&entry.doc);
+                }
+            }
 
             CommandId::ToggleExplorer => {
                 let show = !self.settings.show_file_tree();
@@ -434,13 +498,17 @@ impl EditorApp {
 
         // Read what the status bar needs before the closure borrows self.
         let summary = self.active_doc().map(|entry| {
-            (
-                entry.language.display_name(),
-                entry.doc.encoding().label(),
-                entry.doc.line_ending().label(),
-                entry.doc.line_count(),
-                entry.doc.read_only().is_some(),
-            )
+            let (line, column) = entry.view.cursor_position(&entry.doc);
+            StatusSummary {
+                language: entry.language.display_name(),
+                encoding: entry.doc.encoding().label(),
+                eol: entry.doc.line_ending().label(),
+                lines: entry.doc.line_count(),
+                read_only: entry.doc.read_only().is_some(),
+                line,
+                column,
+                selected: entry.view.selection_len(),
+            }
         });
         let theme_label = self.settings.theme().label();
         let tab_width = self.settings.tab_width();
@@ -451,20 +519,25 @@ impl EditorApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     match &summary {
-                        Some((lang, encoding, eol, lines, read_only)) => {
-                            ui.weak(*lang);
+                        Some(s) => {
+                            ui.weak(format!("Ln {}, Col {}", s.line, s.column));
+                            if s.selected > 0 {
+                                ui.weak(format!("({} selected)", s.selected));
+                            }
                             ui.separator();
-                            ui.weak(*encoding);
+                            ui.weak(s.language);
                             ui.separator();
-                            ui.weak(*eol);
+                            ui.weak(s.encoding);
+                            ui.separator();
+                            ui.weak(s.eol);
                             ui.separator();
                             ui.weak(format!(
                                 "{}: {tab_width}",
                                 if insert_spaces { "Spaces" } else { "Tabs" }
                             ));
                             ui.separator();
-                            ui.weak(format!("{lines} lines"));
-                            if *read_only {
+                            ui.weak(format!("{} lines", s.lines));
+                            if s.read_only {
                                 ui.separator();
                                 ui.weak("Read-only");
                             }
@@ -523,8 +596,19 @@ impl EditorApp {
             }
             ui.separator();
 
-            if let Some(entry) = self.active.and_then(|i| self.docs.get(i)) {
-                view_document(ui, &entry.doc, self.settings.font_size());
+            let opts = EditorOptions {
+                font_size: self.settings.font_size(),
+                tab_width: self.settings.tab_width(),
+                insert_spaces: self.settings.insert_spaces(),
+                show_line_numbers: true,
+            };
+
+            if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
+                // Editing a preview tab promotes it: the file is being worked
+                // on, so it must not be replaced by the next explorer click.
+                if entry.view.ui(ui, &mut entry.doc, opts) {
+                    entry.preview = false;
+                }
             }
         });
 
@@ -718,7 +802,10 @@ impl eframe::App for EditorApp {
 
         if let Some(action) = self.editor_pane(ui) {
             match action {
-                tab_bar::Action::Select(i) => self.active = Some(i),
+                tab_bar::Action::Select(i) => {
+                    self.active = Some(i);
+                    self.focus_active();
+                }
                 tab_bar::Action::Close(i) => self.close_tab(i),
                 tab_bar::Action::CloseOthers(keep) => {
                     if keep < self.docs.len() {
@@ -751,41 +838,27 @@ impl eframe::App for EditorApp {
 
 // ---- free functions ------------------------------------------------------
 
-/// Read-only document view. Rows are virtualised through egui's `show_rows`,
-/// which is enough for looking at a file; M2 replaces this wholesale with the
-/// real editor widget validated by `crates/spike`.
-fn view_document(ui: &mut egui::Ui, doc: &Document, font_size: f32) {
-    let font = egui::FontId::monospace(font_size);
-    let row_height = ui.fonts_mut(|f| f.row_height(&font));
-    let digits = doc.line_count().to_string().len();
-    let text = doc.text();
+/// What the status bar displays about the active document.
+struct StatusSummary {
+    language: &'static str,
+    encoding: &'static str,
+    eol: &'static str,
+    lines: usize,
+    read_only: bool,
+    line: usize,
+    column: usize,
+    selected: usize,
+}
 
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show_rows(ui, row_height, doc.line_count(), |ui, rows| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for line in rows {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("{:>digits$}", line + 1))
-                                .font(font.clone())
-                                .weak(),
-                        )
-                        .selectable(false),
-                    );
-                    let content = text
-                        .get_line(line)
-                        .map(|l| l.to_string())
-                        .unwrap_or_default();
-                    ui.label(
-                        egui::RichText::new(content.trim_end_matches(['\n', '\r']))
-                            .font(font.clone()),
-                    );
-                });
-            }
-        });
+/// Read the system clipboard, for the Edit → Paste menu item.
+///
+/// Keyboard paste does not come through here: egui synthesises `Event::Paste`
+/// with the text already attached, and the editor widget handles it. This
+/// exists only because a menu click carries no such event.
+fn read_clipboard() -> Result<String, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.get_text())
+        .map_err(|e| e.to_string())
 }
 
 /// Which theme command the status-bar button should fire: cycle Dark → Light →
@@ -815,6 +888,8 @@ fn toolbar_glyph(id: CommandId) -> &'static str {
         CommandId::OpenFile => "\u{1f4c2}",
         CommandId::Save => "\u{1f4be}",
         CommandId::SaveAll => "\u{1f5c3}",
+        CommandId::Undo => "\u{21b6}",
+        CommandId::Redo => "\u{21b7}",
         CommandId::ToggleExplorer => "\u{2630}",
         CommandId::CommandPalette => "\u{2318}",
         CommandId::OpenSettingsFile => "\u{2699}",
@@ -874,6 +949,19 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
         ],
     ),
     (
+        "Edit",
+        &[
+            MenuEntry::Item(CommandId::Undo),
+            MenuEntry::Item(CommandId::Redo),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::Cut),
+            MenuEntry::Item(CommandId::Copy),
+            MenuEntry::Item(CommandId::Paste),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::SelectAll),
+        ],
+    ),
+    (
         "View",
         &[
             MenuEntry::Item(CommandId::ToggleExplorer),
@@ -904,6 +992,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
 const TOOLBAR: &[&[CommandId]] = &[
     &[CommandId::NewFile, CommandId::OpenFile],
     &[CommandId::Save, CommandId::SaveAll],
+    &[CommandId::Undo, CommandId::Redo],
     &[CommandId::ToggleExplorer],
     &[CommandId::CommandPalette, CommandId::OpenSettingsFile],
 ];
