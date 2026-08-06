@@ -7,14 +7,14 @@
 //! See PLAN.md §3.9.
 
 pub mod paths;
+pub mod settings;
+pub mod theme;
 
-// M8 populates these.
+// Still to come.
 //
-// pub mod settings;    // the typed Settings struct + layering + round-trip
-// pub mod keymap;      // bindings, contexts, chords, conflict detection
-// pub mod theme;       // theme loading
-// pub mod project;     // ProjectKind detection (Cargo.toml, pyproject.toml, …)
-// pub mod session;     // open tabs, scroll positions, window geometry
+// pub mod keymap;      // M8: bindings, contexts, chords, conflict detection
+// pub mod project;     // M7: ProjectKind detection (Cargo.toml, pyproject.toml)
+// pub mod session;     // M1: open tabs, scroll positions, window geometry
 
 /// Application identity. Used for window titles, the About box, and to derive
 /// the per-platform config, data and log directory paths.

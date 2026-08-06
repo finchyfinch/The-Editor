@@ -9,6 +9,9 @@ publish = false
 description = "Text buffers, edits, undo history, selections and indentation for The Editor"
 
 [dependencies]
+anyhow.workspace = true
+encoding_rs.workspace = true
+ropey.workspace = true
 
 [lints]
 workspace = true

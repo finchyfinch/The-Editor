@@ -37,7 +37,12 @@ editor-widgets = { path = "crates/widgets" }
 anyhow = "1.0.104"
 directories = "6.0.0"
 eframe = "0.36.0"
+encoding_rs = "0.8.35"
+nucleo-matcher = "0.3.1"
+rfd = "0.17.2"
 ropey = "1.6.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml_edit = "0.25.13"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "editor-config"
 version.workspace = true
 edition.workspace = true
@@ -11,6 +11,8 @@ description = "Layered settings, keymap, themes and project detection"
 [dependencies]
 anyhow.workspace = true
 directories.workspace = true
+serde.workspace = true
+toml_edit.workspace = true
 
 [lints]
 workspace = true

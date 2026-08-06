@@ -10,6 +10,34 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **M1 (in progress) — Shell & layout.**
+  - **Themes.** Dark (default), Light, and Follow System, switchable from the
+    View menu, the command palette, or the status-bar indicator. Applied live,
+    persisted immediately. Both themes are checked against WCAG AA contrast by
+    unit tests rather than by eye, and share identical geometry so switching
+    changes colour only.
+  - **Command registry.** Every action is registered once with its title,
+    category and shortcut; the menus, toolbar, keyboard handling, palette and
+    the Help → Keyboard Shortcuts window are all generated from it. Tests
+    enforce that no command is unregistered, duplicated, or sharing a shortcut.
+  - **Command palette** (Ctrl+Shift+P) with `nucleo` fuzzy matching.
+  - **Settings** at `config/settings.toml`, written documented on first run.
+    Unknown keys, comments and key order survive a rewrite, so downgrading The
+    Editor cannot silently delete settings written by a newer build. Malformed
+    or wrongly typed values fall back to defaults with a visible message instead
+    of preventing startup; out-of-range values are clamped.
+  - **Documents** with encoding detection (UTF-8, UTF-8 BOM, UTF-16 LE/BE,
+    Windows-1252 fallback) and line-ending preservation — a CRLF file opens,
+    saves, and is byte-identical. Saves are atomic. Binary files are refused
+    rather than corrupted; files over 5 MB open read-only; over 100 MB refused.
+  - **Explorer** with lazy directory expansion, noise directories excluded,
+    hidden-file toggle, and a filter box.
+  - **Tabs** with close buttons, unsaved markers, preview tabs, middle-click
+    close and a context menu.
+  - Status bar showing language, encoding, line ending, indentation and line
+    count; toast messages for errors; About and Keyboard Shortcuts windows.
+  - The editor pane is a read-only viewer until M2 replaces it.
+
 - **M0 — Bootstrap.** Cargo workspace with eight crates plus a throwaway
   rendering spike; pinned toolchain; MIT licence; `cargo-deny` policy allowing
   permissive licences only; cargo aliases for the standard checks.

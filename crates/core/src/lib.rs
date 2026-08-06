@@ -16,16 +16,15 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::indexing_slicing)]
 
+pub mod document;
+
 // M2 populates these. Declared now so the module boundaries are visible from
 // the start rather than being discovered halfway through.
 //
-// pub mod buffer;      // Rope wrapper, line/offset conversions
-// pub mod document;    // Document, encoding, line endings, dirty tracking
 // pub mod edit;        // Transaction, Change, apply()
 // pub mod history;     // undo/redo with coalescing
 // pub mod selection;   // Selection, multi-cursor arithmetic
 // pub mod indent;      // language-aware indentation engine
-// pub mod encoding;    // detection and transcoding
 
 /// The version of The Editor, from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

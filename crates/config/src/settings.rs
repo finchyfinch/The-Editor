@@ -1,0 +1,443 @@
+//! User settings, stored as TOML.
+//!
+//! The backing store is a `toml_edit::DocumentMut` rather than a plain struct
+//! deserialised with serde, and that is deliberate. Settings must survive a
+//! round trip through a *different version* of The Editor: if a newer build
+//! wrote a key this build has never heard of, saving here must not delete it,
+//! and the user's comments and key ordering must not be reshuffled. A struct
+//! round trip loses all three. See PLAN.md §3.9.
+//!
+//! Typed accessors read through to the document and fall back to a documented
+//! default when a key is absent or the wrong type — a hand-edited settings file
+//! with `tab_width = "four"` in it should ignore that line, not fail to start.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use toml_edit::{DocumentMut, Item, Table, Value, value};
+
+use crate::theme::ThemePreference;
+
+/// Written on first run so the file people open is documented rather than
+/// empty. Keys match the defaults in the accessors below.
+pub const DEFAULT_SETTINGS_TOML: &str = "\
+# The Editor - user settings.
+#
+# Keys not listed here are left at their defaults. Anything this version of
+# The Editor does not recognise is preserved untouched when the file is
+# rewritten, so it is safe to hand-edit.
+
+[ui]
+# \"dark\" (default), \"light\", or \"system\" to follow the operating system.
+theme = \"dark\"
+# Syntax colours for the code pane. \"follow\" keeps them in step with `theme`.
+syntax_theme = \"follow\"
+# Scales the interface only; editor.font_size is independent.
+ui_scale = 1.0
+show_file_tree = true
+restore_session = true
+
+[editor]
+font_size = 13.0
+tab_width = 4
+insert_spaces = true
+word_wrap = false
+";
+
+/// Defaults, in one place so the accessors and the documentation above cannot
+/// drift apart.
+mod defaults {
+    pub(super) const SYNTAX_THEME: &str = "follow";
+    pub(super) const UI_SCALE: f32 = 1.0;
+    pub(super) const SHOW_FILE_TREE: bool = true;
+    pub(super) const RESTORE_SESSION: bool = true;
+    pub(super) const FONT_SIZE: f32 = 13.0;
+    pub(super) const TAB_WIDTH: usize = 4;
+    pub(super) const INSERT_SPACES: bool = true;
+    pub(super) const WORD_WRAP: bool = false;
+
+    /// Guard rails for hand-edited values. A `ui_scale = 40.0` should clamp to
+    /// something usable rather than render an unrecoverable window.
+    pub(super) const UI_SCALE_RANGE: (f32, f32) = (0.5, 3.0);
+    pub(super) const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
+    pub(super) const TAB_WIDTH_RANGE: (usize, usize) = (1, 16);
+}
+
+/// Loaded settings plus the file they came from.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    doc: DocumentMut,
+    path: Option<PathBuf>,
+    /// Set by every mutator, cleared by [`Settings::save`]. Lets the app save
+    /// on a timer without rewriting an unchanged file every tick.
+    dirty: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            doc: DEFAULT_SETTINGS_TOML
+                .parse::<DocumentMut>()
+                .unwrap_or_default(),
+            path: None,
+            dirty: false,
+        }
+    }
+}
+
+impl Settings {
+    /// Load from `path`.
+    ///
+    /// A missing file is not an error — it yields the documented defaults,
+    /// which [`Settings::save`] will then write out. A *malformed* file is also
+    /// not fatal: the defaults are used and the parse error is returned
+    /// alongside them so the caller can show it, because refusing to start
+    /// because of a stray bracket in a config file is unacceptable behaviour
+    /// for an editor.
+    #[must_use]
+    pub fn load(path: &Path) -> (Self, Option<anyhow::Error>) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (
+                    Self {
+                        path: Some(path.to_path_buf()),
+                        dirty: true,
+                        ..Self::default()
+                    },
+                    None,
+                );
+            }
+            Err(e) => {
+                let err = anyhow::Error::new(e).context(format!("reading {}", path.display()));
+                return (
+                    Self {
+                        path: Some(path.to_path_buf()),
+                        ..Self::default()
+                    },
+                    Some(err),
+                );
+            }
+        };
+
+        match text.parse::<DocumentMut>() {
+            Ok(doc) => (
+                Self {
+                    doc,
+                    path: Some(path.to_path_buf()),
+                    dirty: false,
+                },
+                None,
+            ),
+            Err(e) => (
+                Self {
+                    path: Some(path.to_path_buf()),
+                    ..Self::default()
+                },
+                Some(anyhow::Error::new(e).context(format!("parsing {}", path.display()))),
+            ),
+        }
+    }
+
+    /// Write back to the file it was loaded from, if anything changed.
+    ///
+    /// The write is atomic: a temporary file in the same directory, then a
+    /// rename over the original. A power cut mid-save leaves the old settings
+    /// intact rather than a half-written file.
+    ///
+    /// # Errors
+    /// If the file cannot be written or replaced.
+    pub fn save(&mut self) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        if !self.dirty {
+            return Ok(());
+        }
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, self.doc.to_string())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// True if there are unsaved changes.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// The file these settings live in, for "Open settings.toml".
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The whole document as text, for the settings editor's escape hatch.
+    #[must_use]
+    pub fn to_toml(&self) -> String {
+        self.doc.to_string()
+    }
+
+    // ---- typed accessors -------------------------------------------------
+
+    /// UI theme preference. Unrecognised values fall back to the default
+    /// rather than refusing to start.
+    #[must_use]
+    pub fn theme(&self) -> ThemePreference {
+        self.str_at("ui", "theme")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_theme(&mut self, theme: ThemePreference) {
+        self.set("ui", "theme", value(theme.to_string()));
+    }
+
+    /// Name of the syntax theme, or `"follow"` to track the UI theme.
+    #[must_use]
+    pub fn syntax_theme(&self) -> String {
+        self.str_at("ui", "syntax_theme")
+            .unwrap_or(defaults::SYNTAX_THEME)
+            .to_owned()
+    }
+
+    pub fn set_syntax_theme(&mut self, name: &str) {
+        self.set("ui", "syntax_theme", value(name));
+    }
+
+    #[must_use]
+    pub fn ui_scale(&self) -> f32 {
+        clamp_f32(
+            self.f32_at("ui", "ui_scale").unwrap_or(defaults::UI_SCALE),
+            defaults::UI_SCALE_RANGE,
+        )
+    }
+
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        let scale = clamp_f32(scale, defaults::UI_SCALE_RANGE);
+        self.set("ui", "ui_scale", value(f64::from(scale)));
+    }
+
+    #[must_use]
+    pub fn show_file_tree(&self) -> bool {
+        self.bool_at("ui", "show_file_tree")
+            .unwrap_or(defaults::SHOW_FILE_TREE)
+    }
+
+    pub fn set_show_file_tree(&mut self, show: bool) {
+        self.set("ui", "show_file_tree", value(show));
+    }
+
+    #[must_use]
+    pub fn restore_session(&self) -> bool {
+        self.bool_at("ui", "restore_session")
+            .unwrap_or(defaults::RESTORE_SESSION)
+    }
+
+    #[must_use]
+    pub fn font_size(&self) -> f32 {
+        clamp_f32(
+            self.f32_at("editor", "font_size")
+                .unwrap_or(defaults::FONT_SIZE),
+            defaults::FONT_SIZE_RANGE,
+        )
+    }
+
+    pub fn set_font_size(&mut self, size: f32) {
+        let size = clamp_f32(size, defaults::FONT_SIZE_RANGE);
+        self.set("editor", "font_size", value(f64::from(size)));
+    }
+
+    #[must_use]
+    pub fn tab_width(&self) -> usize {
+        let (lo, hi) = defaults::TAB_WIDTH_RANGE;
+        self.int_at("editor", "tab_width")
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(defaults::TAB_WIDTH)
+            .clamp(lo, hi)
+    }
+
+    #[must_use]
+    pub fn insert_spaces(&self) -> bool {
+        self.bool_at("editor", "insert_spaces")
+            .unwrap_or(defaults::INSERT_SPACES)
+    }
+
+    #[must_use]
+    pub fn word_wrap(&self) -> bool {
+        self.bool_at("editor", "word_wrap")
+            .unwrap_or(defaults::WORD_WRAP)
+    }
+
+    pub fn set_word_wrap(&mut self, wrap: bool) {
+        self.set("editor", "word_wrap", value(wrap));
+    }
+
+    // ---- document plumbing -----------------------------------------------
+
+    fn item_at(&self, section: &str, key: &str) -> Option<&Item> {
+        self.doc.get(section)?.as_table_like()?.get(key)
+    }
+
+    fn str_at(&self, section: &str, key: &str) -> Option<&str> {
+        self.item_at(section, key)?.as_str()
+    }
+
+    fn f32_at(&self, section: &str, key: &str) -> Option<f32> {
+        let item = self.item_at(section, key)?;
+        // Accept `ui_scale = 1` as well as `1.0`; TOML distinguishes them and
+        // users do not.
+        item.as_float()
+            .map(|f| f as f32)
+            .or_else(|| item.as_integer().map(|i| i as f32))
+    }
+
+    fn int_at(&self, section: &str, key: &str) -> Option<i64> {
+        self.item_at(section, key)?.as_integer()
+    }
+
+    fn bool_at(&self, section: &str, key: &str) -> Option<bool> {
+        self.item_at(section, key)?.as_bool()
+    }
+
+    fn set(&mut self, section: &str, key: &str, item: Item) {
+        let entry = self
+            .doc
+            .entry(section)
+            .or_insert_with(|| Item::Table(Table::new()));
+        if let Some(table) = entry.as_table_like_mut() {
+            table.insert(key, item);
+            self.dirty = true;
+        } else {
+            // The section exists but is not a table (e.g. `ui = 3` in a
+            // hand-edited file). Replace it rather than silently doing nothing.
+            let mut table = Table::new();
+            table.insert(key, item);
+            *entry = Item::Table(table);
+            self.dirty = true;
+        }
+    }
+}
+
+fn clamp_f32(v: f32, (lo, hi): (f32, f32)) -> f32 {
+    if v.is_finite() { v.clamp(lo, hi) } else { lo }
+}
+
+/// Convenience so callers can write `value(x)` for the common scalar types.
+#[allow(dead_code)]
+fn as_value(v: impl Into<Value>) -> Item {
+    Item::Value(v.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn from_toml(s: &str) -> Settings {
+        Settings {
+            doc: s.parse().expect("test input must be valid TOML"),
+            path: None,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_parse_and_match_the_accessors() {
+        let s = from_toml(DEFAULT_SETTINGS_TOML);
+        assert_eq!(s.theme(), ThemePreference::Dark);
+        assert_eq!(s.syntax_theme(), "follow");
+        assert!((s.ui_scale() - 1.0).abs() < f32::EPSILON);
+        assert!(s.show_file_tree());
+        assert!(s.restore_session());
+        assert!((s.font_size() - 13.0).abs() < f32::EPSILON);
+        assert_eq!(s.tab_width(), 4);
+        assert!(s.insert_spaces());
+        assert!(!s.word_wrap());
+    }
+
+    #[test]
+    fn an_empty_file_yields_every_default() {
+        let s = from_toml("");
+        assert_eq!(s.theme(), ThemePreference::Dark);
+        assert_eq!(s.tab_width(), 4);
+        assert!(!s.word_wrap());
+    }
+
+    #[test]
+    fn unknown_keys_and_comments_survive_a_write() {
+        let original = "\
+# my notes
+[ui]
+theme = \"light\"
+something_from_a_newer_version = 42
+
+[experimental]
+whatever = true
+";
+        let mut s = from_toml(original);
+        s.set_theme(ThemePreference::Dark);
+        let out = s.to_toml();
+
+        assert!(out.contains("# my notes"), "comments must survive");
+        assert!(
+            out.contains("something_from_a_newer_version = 42"),
+            "unknown keys must survive: {out}"
+        );
+        assert!(out.contains("[experimental]"), "unknown sections too");
+        assert!(out.contains("theme = \"dark\""), "the change must apply");
+    }
+
+    #[test]
+    fn wrong_types_fall_back_instead_of_failing() {
+        let s = from_toml("[editor]\ntab_width = \"four\"\nfont_size = true\n");
+        assert_eq!(s.tab_width(), 4);
+        assert!((s.font_size() - 13.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped_to_something_usable() {
+        let s = from_toml("[ui]\nui_scale = 40.0\n\n[editor]\ntab_width = 900\n");
+        assert!((s.ui_scale() - 3.0).abs() < f32::EPSILON);
+        assert_eq!(s.tab_width(), 16);
+    }
+
+    #[test]
+    fn integers_are_accepted_where_floats_are_expected() {
+        let s = from_toml("[ui]\nui_scale = 2\n");
+        assert!((s.ui_scale() - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_section_that_is_not_a_table_gets_replaced_rather_than_ignored() {
+        let mut s = from_toml("ui = 3\n");
+        s.set_theme(ThemePreference::Light);
+        assert_eq!(s.theme(), ThemePreference::Light);
+    }
+
+    #[test]
+    fn mutating_marks_dirty_and_reading_does_not() {
+        let mut s = from_toml(DEFAULT_SETTINGS_TOML);
+        assert!(!s.is_dirty());
+        let _ = s.theme();
+        assert!(!s.is_dirty());
+        s.set_theme(ThemePreference::Light);
+        assert!(s.is_dirty());
+    }
+
+    #[test]
+    fn theme_round_trips_through_the_file() {
+        let mut s = from_toml("");
+        for pref in ThemePreference::ALL {
+            s.set_theme(pref);
+            assert_eq!(from_toml(&s.to_toml()).theme(), pref);
+        }
+    }
+}

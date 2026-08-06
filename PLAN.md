@@ -483,6 +483,57 @@ hot_exit = true             # restore unsaved buffers after a crash
   "Language Server Diagnostics", "Check Toolchains" (a panel showing detected python/cargo/servers
   with ✓/✗ and remediation hints — this will absorb most of the "why doesn't it work" questions).
 
+### 3.11 Appearance and themes
+
+**Dark is the default.** The Editor ships dark and light themes and can follow
+the operating system. This is a first-class feature, not a preference buried in
+a settings file, so it is reachable three ways: **View → Theme ▸**, a
+click-target in the status bar, and the command palette (`Theme: Dark`,
+`Theme: Light`, `Theme: Follow System`).
+
+**Two layers, deliberately separable.** Conflating them is why so many editors
+end up with a light UI frame around a dark code pane, or vice versa:
+
+| Layer | Controls | Source |
+|---|---|---|
+| **UI theme** | window chrome, panels, menus, tabs, file tree, dialogs, buttons | `[ui] theme = "dark" \| "light" \| "system"` |
+| **Syntax theme** | the code pane: token colours, selection, current line, gutter, diagnostics | `[ui] syntax_theme = "<name>"`, a TOML file (§3.5) |
+
+By default the syntax theme follows the UI theme — pick dark, get the dark
+syntax theme — but either can be pinned independently for people who want a
+dark frame around a light editor pane or the reverse.
+
+**Follow-system** reads the OS preference at startup and reacts to changes at
+runtime (Windows `AppsUseLightTheme`, macOS `AppleInterfaceStyle`, Linux
+`org.freedesktop.appearance color-scheme` via the XDG settings portal, falling
+back to the GTK theme name). egui surfaces this through winit, so it costs
+almost nothing; a manual choice always overrides it.
+
+**Switching is live and instant** — no restart, no reload of open files, no
+flash. The setting persists immediately on change.
+
+**Constraints that apply to every theme, built-in or user-supplied:**
+- Both themes meet WCAG AA (4.5:1) for body text and 3:1 for UI borders and
+  icons. This is checked by a unit test over the theme files, not by eye — a
+  contrast regression in a hand-edited colour must fail CI, not ship.
+- Syntax colours must remain distinguishable under the common forms of colour
+  blindness; don't let "keyword" and "function" differ only in red/green.
+- Diagnostics never rely on colour alone: errors get a squiggle shape and a
+  gutter glyph as well as a red.
+- A theme that fails to load falls back to the built-in dark theme with a
+  toast, rather than rendering an unreadable window.
+
+**Implementation.** UI theme lives in `editor-config::theme`, applied through
+egui's per-theme `Style`/`Visuals`; syntax theme lives in `editor-syntax::theme`
+as a capture-name → style map. Both are plain TOML and user-extensible from
+`{config_dir}/themes/`. Custom theme authoring gets a documented format in M8;
+a live theme editor is post-1.0.
+
+The basic UI light/dark/system toggle lands in **M1** rather than M8 — it is
+nearly free once the settings layer exists, and building the rest of the UI
+against a theme that can already change catches hardcoded colours immediately
+instead of after nine milestones of accumulation.
+
 ---
 
 ## 4. Menus & toolbar
@@ -496,7 +547,8 @@ Files/Replace in Files · Go to Line · Go to File (Ctrl+P) · Go to Symbol (Ctr
 Toggle Comment · Indent/Outdent · Duplicate/Delete Line · Move Line Up/Down · Add Cursor Above/Below
 
 **View** — Explorer · Problems · Output · Terminal · Toggle Word Wrap · Show Whitespace ·
-Show Indent Guides · Zoom In/Out/Reset · Theme ▸ · Full Screen (F11)
+Show Indent Guides · Zoom In/Out/Reset · **Theme ▸ (Dark · Light · Follow System · ─ · Syntax
+Theme ▸)** · Full Screen (F11)
 
 **Run** — Run (F5) · Run Without Building · Stop (Shift+F5) · Restart · Run Tests (Ctrl+F5) ·
 Build (Ctrl+Shift+B) · Select Run Configuration ▸ · Edit Run Configurations…
@@ -676,7 +728,7 @@ Each milestone ends with a tagged build and a manual smoke test on all three pla
 | # | Milestone | Deliverables | Acceptance criteria | Est. |
 |---|---|---|---|---|
 | **M0** | Bootstrap | Workspace, crate skeletons, `rust-toolchain.toml`, deny.toml, logging, panic hook, blank window on all 3 OSes, build scripts | `cargo build --release` clean on Windows/Linux/macOS; window opens; log file written | 3–5 d |
-| **M1** | Shell & layout | Docks with draggable splitters, menu bar (native on macOS), toolbar, status bar, tab bar with ×/dirty/reorder/overflow, file tree with lazy expand + watcher, open/save/save-as, session persistence, **command registry + palette** | Open a folder, double-click 4 files → 4 tabs, close via ×, edit + save, quit and relaunch → same tabs and scroll positions | 3–4 wk |
+| **M1** | Shell & layout | Docks with draggable splitters, menu bar (native on macOS), toolbar, status bar, tab bar with ×/dirty/reorder/overflow, file tree with lazy expand + watcher, open/save/save-as, session persistence, **command registry + palette**, settings persistence, **UI theme: dark/light/follow-system (§3.11)** | Open a folder, double-click 4 files → 4 tabs, close via ×, edit + save, quit and relaunch → same tabs and scroll positions; theme switches live and survives a restart | 3–4 wk |
 | **M2** | Editor core | Ropey buffer, custom virtualised editor widget, gutter/line numbers, cursor + selection + multi-cursor, undo/redo with coalescing, clipboard, all navigation/line-manipulation commands, encoding + line-ending handling, atomic save, external-change detection | 200k-line file scrolls at 60 fps; 5 MB file opens < 150 ms; undo/redo survives a 10k-edit fuzz test; no data loss under the save/reload matrix | 5–7 wk |
 | **M3** | Syntax highlighting | tree-sitter integration, 9 languages, HTML injections, incremental reparse, theme format, dark + light themes, bracket matching, folding, indent guides | Highlighting correct on a golden corpus; single-char edit reparse < 1 ms in a 5k-line file; unknown extension degrades to plain text | 2–3 wk |
 | **M4** | Editing intelligence | Indent engine (esp. the Python rules in §3.4), auto-close/surround, comment toggle, smart backspace/home, re-indent on paste, `.editorconfig`, whitespace-on-save policies | The Python indentation test suite (≈60 cases) passes; hand-editing a real Django/Flask file feels right | 2–3 wk |
@@ -791,7 +843,22 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
       blank `eframe` window, cargo aliases, git repo. See `docs/M0-NOTES.md`.
 - [x] **Spike — virtualised rope rendering.** `cargo spike` runs it; findings in
       `docs/SPIKE-NOTES.md`.
-- [ ] **M1 — Shell & layout.** Next up.
+- [ ] **M1 — Shell & layout.** In progress, roughly two thirds done.
+
+**M1 landed so far:** command registry driving the menus, toolbar, keyboard and
+palette from one source; fuzzy command palette; dark/light/follow-system theme
+with contrast enforced by tests; settings persistence that preserves unknown
+keys and comments; document model with encoding and line-ending preservation and
+atomic saves; file tree with lazy expansion; tab strip with close/dirty/preview
+behaviour; status bar; About and generated Keyboard Shortcuts windows; toast
+messages for errors.
+
+**M1 still to do:** filesystem watcher (`notify`) so external changes refresh the
+tree; session persistence (reopen tabs, scroll positions, window geometry);
+file-tree context menu (new/rename/delete-to-trash/reveal); tab drag-reorder and
+the overflow dropdown; Ctrl+Tab most-recently-used cycling; go-to-file
+(Ctrl+P); native macOS menu bar via `muda`; and a build/run pass on Linux and
+macOS.
 
 Still outstanding, none of it blocking:
 - Set up the bare backup remote (`git remote add origin <path-to-nas>/the-editor.git`).

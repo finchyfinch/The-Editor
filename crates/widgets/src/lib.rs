@@ -9,13 +9,13 @@
 //! paint only the visible line range, so a 200k-line file costs the same per
 //! frame as a 50-line one. See PLAN.md §2.4 and the spike in `crates/spike`.
 
-// M1–M2 populate these.
+pub mod file_tree;
+pub mod tab_bar;
+pub mod theme;
+
+// Still to come.
 //
-// pub mod editor_view; // the custom code editor widget
-// pub mod gutter;      // line numbers, diagnostics, folds, modified bar
-// pub mod file_tree;
-// pub mod tab_bar;
-// pub mod palette;     // command palette / go-to-file / go-to-symbol
-// pub mod find_bar;
-// pub mod console;     // run output dock
-// pub mod status_bar;
+// pub mod editor_view; // M2: the custom code editor widget
+// pub mod gutter;      // M2: line numbers, diagnostics, folds, modified bar
+// pub mod find_bar;    // M5
+// pub mod console;     // M7: run output dock
