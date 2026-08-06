@@ -32,7 +32,11 @@ pub const DEFAULT_SETTINGS_TOML: &str = "\
 theme = \"dark\"
 # Syntax colours for the code pane. \"follow\" keeps them in step with `theme`.
 syntax_theme = \"follow\"
-# Scales the interface only; editor.font_size is independent.
+# Size of interface text - menus, tabs, the file tree, the status bar.
+# The code pane has its own independent editor.font_size below.
+font_size = 14.0
+# Zoom, applied on top of the display's own DPI scaling. Leave at 1.0 to use
+# whatever the monitor reports; raise it to make everything larger.
 ui_scale = 1.0
 show_file_tree = true
 restore_session = true
@@ -48,6 +52,7 @@ word_wrap = false
 /// drift apart.
 mod defaults {
     pub(super) const SYNTAX_THEME: &str = "follow";
+    pub(super) const UI_FONT_SIZE: f32 = 14.0;
     pub(super) const UI_SCALE: f32 = 1.0;
     pub(super) const SHOW_FILE_TREE: bool = true;
     pub(super) const RESTORE_SESSION: bool = true;
@@ -60,6 +65,7 @@ mod defaults {
     /// something usable rather than render an unrecoverable window.
     pub(super) const UI_SCALE_RANGE: (f32, f32) = (0.5, 3.0);
     pub(super) const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
+    pub(super) const UI_FONT_SIZE_RANGE: (f32, f32) = (9.0, 32.0);
     pub(super) const TAB_WIDTH_RANGE: (usize, usize) = (1, 16);
 }
 
@@ -213,6 +219,24 @@ impl Settings {
         self.set("ui", "syntax_theme", value(name));
     }
 
+    /// Size of interface text — menus, tabs, the file tree, the status bar.
+    /// Independent of [`Self::font_size`], which is the code pane.
+    #[must_use]
+    pub fn ui_font_size(&self) -> f32 {
+        clamp_f32(
+            self.f32_at("ui", "font_size")
+                .unwrap_or(defaults::UI_FONT_SIZE),
+            defaults::UI_FONT_SIZE_RANGE,
+        )
+    }
+
+    pub fn set_ui_font_size(&mut self, size: f32) {
+        let size = clamp_f32(size, defaults::UI_FONT_SIZE_RANGE);
+        self.set("ui", "font_size", value(f64::from(size)));
+    }
+
+    /// Zoom applied on top of the display's own DPI scaling. 1.0 means "use
+    /// whatever the monitor reports".
     #[must_use]
     pub fn ui_scale(&self) -> f32 {
         clamp_f32(
@@ -354,6 +378,7 @@ mod tests {
         let s = from_toml(DEFAULT_SETTINGS_TOML);
         assert_eq!(s.theme(), ThemePreference::Dark);
         assert_eq!(s.syntax_theme(), "follow");
+        assert!((s.ui_font_size() - 14.0).abs() < f32::EPSILON);
         assert!((s.ui_scale() - 1.0).abs() < f32::EPSILON);
         assert!(s.show_file_tree());
         assert!(s.restore_session());
@@ -404,9 +429,20 @@ whatever = true
 
     #[test]
     fn out_of_range_values_are_clamped_to_something_usable() {
-        let s = from_toml("[ui]\nui_scale = 40.0\n\n[editor]\ntab_width = 900\n");
-        assert!((s.ui_scale() - 3.0).abs() < f32::EPSILON);
+        let s = from_toml("[ui]\nui_scale = 40.0\nfont_size = 0.1\n\n[editor]\ntab_width = 900\n");
+        assert!(
+            (s.ui_scale() - 3.0).abs() < f32::EPSILON,
+            "a hand-edited ui_scale of 40 must not render an unusable window"
+        );
+        assert!((s.ui_font_size() - 9.0).abs() < f32::EPSILON);
         assert_eq!(s.tab_width(), 16);
+    }
+
+    #[test]
+    fn interface_and_editor_font_sizes_are_independent() {
+        let s = from_toml("[ui]\nfont_size = 18.0\n\n[editor]\nfont_size = 11.0\n");
+        assert!((s.ui_font_size() - 18.0).abs() < f32::EPSILON);
+        assert!((s.font_size() - 11.0).abs() < f32::EPSILON);
     }
 
     #[test]

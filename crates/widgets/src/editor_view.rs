@@ -175,6 +175,8 @@ impl EditorView {
                 if std::mem::take(&mut self.grab_focus) {
                     response.request_focus();
                 }
+                // The code pane *is* text, so here the I-beam is correct.
+                let response = response.on_hover_cursor(egui::CursorIcon::Text);
 
                 let text_left = rect.left() + gutter_width;
                 let visible = ui.clip_rect().intersect(rect);

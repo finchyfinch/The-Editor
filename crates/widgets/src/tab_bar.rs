@@ -52,80 +52,148 @@ pub fn ui(ui: &mut egui::Ui, tabs: &[TabInfo], active: Option<usize>) -> Action 
     action
 }
 
+/// Horizontal padding inside a tab.
+const PAD_X: f32 = 10.0;
+/// Vertical padding inside a tab.
+const PAD_Y: f32 = 5.0;
+/// Gap between the title and the close affordance.
+const GAP: f32 = 8.0;
+/// Side of the square close-button hit area.
+const CLOSE_SIZE: f32 = 16.0;
+
+/// Draw one tab.
+///
+/// The tab is measured and its rectangle allocated **before** anything is
+/// painted, rather than being laid out by nested `horizontal` scopes. That
+/// matters for two reasons that both showed up as bugs:
+///
+/// * The hover state is exact. Laying out first meant asking whether the
+///   pointer was inside a rectangle that had not been decided yet, so the
+///   dirty-dot / close-cross swap was reading the wrong rect.
+/// * The whole tab is one clickable widget with one cursor icon. Building it
+///   out of `Label`s meant egui applied the *text* cursor on hover, because
+///   that is what a label does — which is wrong for something that behaves
+///   like a button.
 fn tab_ui(ui: &mut egui::Ui, index: usize, tab: &TabInfo, active: bool, action: &mut Action) {
-    let visuals = ui.visuals();
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let visuals = ui.visuals().clone();
+
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &tab.title,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: visuals.text_color(),
+            italics: tab.preview,
+            ..Default::default()
+        },
+    );
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+
+    let size = egui::vec2(
+        PAD_X * 2.0 + galley.size().x + GAP + CLOSE_SIZE,
+        galley.size().y.max(CLOSE_SIZE) + PAD_Y * 2.0,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    // Registered after the tab, so it wins the overlap and a click on the ×
+    // closes rather than selects.
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - PAD_X - CLOSE_SIZE / 2.0, rect.center().y),
+        egui::Vec2::splat(CLOSE_SIZE),
+    );
+    let close = ui.interact(close_rect, response.id.with("close"), egui::Sense::click());
+
+    let hovered = response.hovered() || close.hovered();
+
+    // ---- paint -----------------------------------------------------------
+
     let bg = if active {
         visuals.widgets.active.bg_fill
+    } else if hovered {
+        visuals.widgets.hovered.weak_bg_fill
     } else {
         visuals.widgets.inactive.weak_bg_fill
     };
-
-    egui::Frame::new()
-        .fill(bg)
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .corner_radius(egui::CornerRadius {
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius {
             nw: 4,
             ne: 4,
             sw: 0,
             se: 0,
-        })
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+        },
+        bg,
+    );
 
-                let mut text = egui::RichText::new(&tab.title);
-                if tab.preview {
-                    text = text.italics();
-                }
-                if active {
-                    text = text.strong();
-                }
+    let text_colour = if active {
+        visuals.strong_text_color()
+    } else {
+        visuals.text_color()
+    };
+    painter.galley(
+        egui::pos2(rect.left() + PAD_X, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text_colour,
+    );
 
-                let label = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-                let label = label.on_hover_text(&tab.tooltip);
+    // A dirty tab shows a dot until the pointer is over the tab, so the unsaved
+    // state is never hidden underneath the mouse at the moment the user is
+    // about to click the button that would discard it.
+    let glyph = if tab.dirty && !hovered {
+        "\u{25cf}" // filled circle
+    } else {
+        "\u{00d7}" // multiplication sign
+    };
+    if close.hovered() {
+        painter.rect_filled(close_rect, 3, visuals.widgets.hovered.bg_fill);
+    }
+    painter.text(
+        close_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        font,
+        if tab.dirty && !hovered {
+            visuals.warn_fg_color
+        } else {
+            text_colour
+        },
+    );
 
-                if label.clicked() {
-                    *action = Action::Select(index);
-                }
-                if label.middle_clicked() {
-                    *action = Action::Close(index);
-                }
-                label.context_menu(|ui| {
-                    if ui.button("Close").clicked() {
-                        *action = Action::Close(index);
-                        ui.close();
-                    }
-                    if ui.button("Close Others").clicked() {
-                        *action = Action::CloseOthers(index);
-                        ui.close();
-                    }
-                    if ui.button("Close All").clicked() {
-                        *action = Action::CloseAll;
-                        ui.close();
-                    }
-                });
+    // ---- interaction -----------------------------------------------------
 
-                // The close affordance. Dirty tabs show a dot until hovered,
-                // so the unsaved state is never hidden behind the mouse.
-                let hovered = ui.rect_contains_pointer(ui.max_rect());
-                let glyph = if tab.dirty && !hovered {
-                    "\u{25cf}" // ●
-                } else {
-                    "\u{00d7}" // ×
-                };
-                let close = ui.add(
-                    egui::Button::new(glyph)
-                        .frame(false)
-                        .min_size(egui::vec2(14.0, 14.0)),
-                );
-                if close.clicked() {
-                    *action = Action::Close(index);
-                }
-                if close.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-            });
-        });
+    // A tab is a button, not text. Without this, egui leaves the I-beam that a
+    // label sets, which reads as "you can select this text".
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(&tab.tooltip);
+    let close = close.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if close.clicked() {
+        *action = Action::Close(index);
+    } else if response.clicked() {
+        *action = Action::Select(index);
+    }
+    if response.middle_clicked() {
+        *action = Action::Close(index);
+    }
+
+    response.context_menu(|ui| {
+        if ui.button("Close").clicked() {
+            *action = Action::Close(index);
+            ui.close();
+        }
+        if ui.button("Close Others").clicked() {
+            *action = Action::CloseOthers(index);
+            ui.close();
+        }
+        if ui.button("Close All").clicked() {
+            *action = Action::CloseAll;
+            ui.close();
+        }
+    });
 }
 
 #[cfg(test)]

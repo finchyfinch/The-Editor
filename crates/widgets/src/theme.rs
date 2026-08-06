@@ -12,15 +12,63 @@
 use editor_config::theme::{ResolvedTheme, ThemePreference};
 use eframe::egui::{self, Color32};
 
-/// Apply a resolved theme to the context, along with the UI scale.
-pub fn apply(ctx: &egui::Context, theme: ResolvedTheme, ui_scale: f32) {
+/// Apply a resolved theme, the interface font size, and the zoom factor.
+pub fn apply(ctx: &egui::Context, theme: ResolvedTheme, ui_scale: f32, ui_font_size: f32) {
     ctx.set_visuals_of(egui::Theme::Dark, visuals(ResolvedTheme::Dark));
     ctx.set_visuals_of(egui::Theme::Light, visuals(ResolvedTheme::Light));
     ctx.set_theme(match theme {
         ResolvedTheme::Dark => egui::Theme::Dark,
         ResolvedTheme::Light => egui::Theme::Light,
     });
-    ctx.set_pixels_per_point(ui_scale);
+
+    ctx.all_styles_mut(|style| style.text_styles = text_styles(ui_font_size));
+
+    // `set_zoom_factor`, NOT `set_pixels_per_point`.
+    //
+    // `set_pixels_per_point(1.0)` means "one physical pixel per logical point",
+    // which *cancels* the display's DPI scaling — on a 150% or 200% display
+    // everything renders at 1x and the whole interface comes out tiny. The zoom
+    // factor multiplies the native scale instead, so 1.0 means "whatever this
+    // monitor says", which is what HiDPI requires. eframe keeps the native
+    // value up to date when the window moves between monitors.
+    ctx.set_zoom_factor(ui_scale);
+}
+
+/// Interface text sizes, derived from one base size so that changing it scales
+/// the whole UI consistently.
+///
+/// egui's defaults (Body 13.0, Small 9.0) are tuned for tool panels embedded in
+/// a game. Body moves to 14.0 and Small to base-2, because 9pt secondary text
+/// in an application someone reads all day is not readable.
+///
+/// Note that the interface being too small was mostly *not* this: it was the
+/// zoom bug in [`apply`] above. This is a modest 13 -> 14 adjustment on top of
+/// the restored DPI scaling, and `ui.font_size` in settings tunes it further.
+fn text_styles(base: f32) -> std::collections::BTreeMap<egui::TextStyle, egui::FontId> {
+    use egui::{FontFamily, FontId, TextStyle};
+
+    [
+        (
+            TextStyle::Small,
+            FontId::new(base - 2.0, FontFamily::Proportional),
+        ),
+        (TextStyle::Body, FontId::new(base, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(base, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Heading,
+            FontId::new(base * 1.45, FontFamily::Proportional),
+        ),
+        // UI monospace — paths, the shortcut column, log output. The code pane
+        // has its own independent `editor.font_size`.
+        (
+            TextStyle::Monospace,
+            FontId::new(base - 1.0, FontFamily::Monospace),
+        ),
+    ]
+    .into()
 }
 
 /// Read the operating system's light/dark preference, as reported through
@@ -206,6 +254,46 @@ mod tests {
             d.widgets.inactive.corner_radius,
             l.widgets.inactive.corner_radius
         );
+    }
+
+    #[test]
+    fn text_styles_scale_together_from_the_base_size() {
+        use egui::TextStyle;
+
+        let small = text_styles(14.0);
+        let large = text_styles(20.0);
+
+        for style in [
+            TextStyle::Small,
+            TextStyle::Body,
+            TextStyle::Button,
+            TextStyle::Heading,
+            TextStyle::Monospace,
+        ] {
+            let a = small.get(&style).expect("style present").size;
+            let b = large.get(&style).expect("style present").size;
+            assert!(b > a, "{style:?} must grow with the base size");
+        }
+    }
+
+    #[test]
+    fn the_default_interface_size_is_larger_than_eguis() {
+        // egui's stock Body is 13.0 and Small is 9.0.
+        let styles = text_styles(14.0);
+        let size = |style| styles.get(&style).expect("style present").size;
+        assert!(size(egui::TextStyle::Body) >= 14.0);
+        assert!(
+            size(egui::TextStyle::Small) >= 11.0,
+            "9pt secondary text is not readable"
+        );
+    }
+
+    #[test]
+    fn headings_and_small_text_stay_ordered() {
+        let s = text_styles(14.0);
+        let size = |style| s.get(&style).expect("style present").size;
+        assert!(size(egui::TextStyle::Small) < size(egui::TextStyle::Body));
+        assert!(size(egui::TextStyle::Body) < size(egui::TextStyle::Heading));
     }
 
     #[test]

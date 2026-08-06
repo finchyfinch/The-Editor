@@ -77,6 +77,7 @@ pub(crate) struct EditorApp {
     /// which is how "follow system" reacts to the OS switching at runtime.
     applied_theme: Option<ResolvedTheme>,
     applied_scale: f32,
+    applied_ui_font: f32,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -109,6 +110,7 @@ impl EditorApp {
             toasts: Vec::new(),
             applied_theme: None,
             applied_scale: settings.ui_scale(),
+            applied_ui_font: settings.ui_font_size(),
             settings,
         };
 
@@ -426,16 +428,22 @@ impl EditorApp {
         }
     }
 
-    /// Apply the theme and scale if either has changed since last frame.
+    /// Apply the theme, interface font size and zoom if any has changed since
+    /// the last frame.
     fn sync_appearance(&mut self, ctx: &egui::Context) {
         let resolved = ui_theme::resolve(ctx, self.settings.theme());
         let scale = self.settings.ui_scale();
+        let font_size = self.settings.ui_font_size();
 
-        if self.applied_theme != Some(resolved) || (self.applied_scale - scale).abs() > f32::EPSILON
-        {
-            ui_theme::apply(ctx, resolved, scale);
+        let changed = self.applied_theme != Some(resolved)
+            || (self.applied_scale - scale).abs() > f32::EPSILON
+            || (self.applied_ui_font - font_size).abs() > f32::EPSILON;
+
+        if changed {
+            ui_theme::apply(ctx, resolved, scale, font_size);
             self.applied_theme = Some(resolved);
             self.applied_scale = scale;
+            self.applied_ui_font = font_size;
         }
     }
 
@@ -472,23 +480,29 @@ impl EditorApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) -> Option<CommandId> {
         let mut invoked = None;
 
-        egui::Panel::top("toolbar").exact_size(36.0).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                for group in TOOLBAR {
-                    for id in *group {
-                        let cmd = commands::get(*id);
-                        let tip = cmd.shortcut_text(ui.ctx()).map_or_else(
-                            || cmd.title.to_owned(),
-                            |sc| format!("{} ({sc})", cmd.title),
-                        );
-                        if ui.button(toolbar_glyph(*id)).on_hover_text(tip).clicked() {
-                            invoked = Some(*id);
+        // Panel heights follow the text size rather than being fixed, so
+        // raising ui.font_size does not clip the toolbar or status bar.
+        let row = ui.text_style_height(&egui::TextStyle::Body);
+
+        egui::Panel::top("toolbar")
+            .exact_size(row * 2.2)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    for group in TOOLBAR {
+                        for id in *group {
+                            let cmd = commands::get(*id);
+                            let tip = cmd.shortcut_text(ui.ctx()).map_or_else(
+                                || cmd.title.to_owned(),
+                                |sc| format!("{} ({sc})", cmd.title),
+                            );
+                            if ui.button(toolbar_glyph(*id)).on_hover_text(tip).clicked() {
+                                invoked = Some(*id);
+                            }
                         }
+                        ui.separator();
                     }
-                    ui.separator();
-                }
+                });
             });
-        });
 
         invoked
     }
@@ -514,8 +528,10 @@ impl EditorApp {
         let tab_width = self.settings.tab_width();
         let insert_spaces = self.settings.insert_spaces();
 
+        let row = ui.text_style_height(&egui::TextStyle::Body);
+
         egui::Panel::bottom("status_bar")
-            .exact_size(24.0)
+            .exact_size(row * 1.6)
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     match &summary {

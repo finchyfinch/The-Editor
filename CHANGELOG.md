@@ -30,9 +30,28 @@ Entries are written as each milestone lands, not retroactively at release time.
     fixed character width, so accented and CJK text behaves correctly.
   - Status bar shows Ln/Col and the selection size; opening a document or
     selecting its tab focuses the editor so it can be typed into immediately.
+- **Interface text size** is now a setting, `[ui] font_size` (default 14.0),
+  independent of `[editor] font_size` for the code pane. All interface text
+  scales from it, and panel heights follow the text size rather than being
+  fixed, so raising it does not clip the toolbar or status bar.
 
 ### Fixed
 
+- **HiDPI displays rendered the whole interface at the wrong scale.** Applying
+  the UI scale used `set_pixels_per_point`, which means "one physical pixel per
+  logical point" and therefore *cancels* the display's own DPI scaling. On a
+  150% display the interface came out at 67% of its intended size; on a 200%
+  display, 50%. It now uses `set_zoom_factor`, which multiplies the native
+  scale, so 1.0 means "whatever this monitor reports". `ui_scale` is now a true
+  zoom on top of DPI, and Ctrl+`+` / Ctrl+`-` / Ctrl+`0` compose correctly with
+  it.
+- Hovering a tab showed the text I-beam instead of a pointer. Tabs were built
+  from `Label` widgets, which set the text cursor because that is what a label
+  does. Each tab is now a single measured, allocated widget with an explicit
+  pointer cursor. The code pane, which really is text, keeps the I-beam.
+- The tab's unsaved-dot / close-cross swap tested the pointer against a
+  rectangle that had not been decided yet, so it responded to the wrong region.
+  The tab is now measured before it is painted, making the hover state exact.
 - Multi-edit transactions recorded their inverse in pre-edit coordinates, so
   undoing a transaction containing two edits of differing lengths corrupted the
   document. Single-edit undo was unaffected, which is why it was invisible until
