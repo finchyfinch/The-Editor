@@ -14,13 +14,15 @@
 //! spans for exactly the rows it is about to draw, so a 50,000-line file costs
 //! the same per frame as a 50-line one.
 //!
-//! Not here yet: language-aware indentation and bracket handling (M4),
-//! find/replace (M5), multi-cursor and folding.
+//! Not here yet: find/replace (M5), multi-cursor, code folding, and word-wise
+//! motion.
 
 use editor_core::document::Document;
 use editor_core::edit::Transaction;
 use editor_core::selection::Selection;
+use editor_syntax::LanguageId;
 use editor_syntax::highlight::Highlighter;
+use editor_syntax::indent::{self, IndentOptions};
 use editor_syntax::theme::SyntaxTheme;
 use eframe::egui;
 
@@ -37,6 +39,9 @@ pub struct EditorOptions {
     pub tab_width: usize,
     pub insert_spaces: bool,
     pub show_line_numbers: bool,
+    /// Drives the indentation, comment and bracket rules.
+    pub language: LanguageId,
+    pub auto_close_brackets: bool,
 }
 
 impl Default for EditorOptions {
@@ -46,6 +51,17 @@ impl Default for EditorOptions {
             tab_width: 4,
             insert_spaces: true,
             show_line_numbers: true,
+            language: LanguageId::PlainText,
+            auto_close_brackets: true,
+        }
+    }
+}
+
+impl EditorOptions {
+    fn indent(self) -> IndentOptions {
+        IndentOptions {
+            tab_width: self.tab_width,
+            insert_spaces: self.insert_spaces,
         }
     }
 }
@@ -321,7 +337,7 @@ impl EditorView {
         for event in events {
             match event {
                 egui::Event::Text(text) => {
-                    changed |= self.insert(doc, &text);
+                    changed |= self.type_text(doc, opts, &text);
                 }
                 egui::Event::Paste(text) => {
                     doc.break_undo_run();
@@ -372,20 +388,45 @@ impl EditorView {
         match key {
             Key::Enter => {
                 doc.break_undo_run();
-                // Carry the current line's leading whitespace onto the new
-                // line. The language-aware rules (dedent on `return`, align to
-                // an open bracket) arrive in M4.
-                let line = doc.line_of(self.selection.head);
-                let indent: String = doc
-                    .line_text(line)
-                    .chars()
-                    .take_while(|c| *c == ' ' || *c == '\t')
-                    .collect();
-                let inserted = self.insert(doc, &format!("\n{indent}"));
+                let indent = indent::new_line_indent(
+                    doc.text(),
+                    self.selection.range().start,
+                    opts.language,
+                    opts.indent(),
+                );
+
+                // Pressing Enter between a freshly auto-closed pair opens the
+                // block out, rather than leaving the closer stranded:
+                //
+                //     fn f() {|}   ->   fn f() {
+                //                           |
+                //                       }
+                let between_pair = self.selection.is_empty()
+                    && char_before(doc, self.selection.head).is_some_and(|before| {
+                        indent::auto_close(opts.language, before)
+                            .is_some_and(|closer| char_at(doc, self.selection.head) == Some(closer))
+                    });
+
+                let changed = if between_pair {
+                    let inner = format!("{indent}{}", opts.indent().one_level());
+                    let caret = self.selection.range().start + 1 + inner.chars().count();
+                    let changed = self.insert(doc, &format!("\n{inner}\n{indent}"));
+                    self.selection = Selection::at(caret);
+                    changed
+                } else {
+                    self.insert(doc, &format!("\n{indent}"))
+                };
+
                 doc.break_undo_run();
-                inserted
+                changed
             }
             Key::Tab if !extend => {
+                // With a selection spanning lines, Tab indents the block. The
+                // alternative — replacing the selection with a tab character —
+                // silently deletes whatever was selected.
+                if self.spans_multiple_lines(doc) {
+                    return self.shift_lines(doc, opts, 1);
+                }
                 let text = if opts.insert_spaces {
                     let col = doc.line_col(self.selection.head).1 - 1;
                     " ".repeat(opts.tab_width - (col % opts.tab_width))
@@ -394,6 +435,7 @@ impl EditorView {
                 };
                 self.insert(doc, &text)
             }
+            Key::Tab if extend => self.shift_lines(doc, opts, -1),
             Key::Backspace => {
                 if self.selection.is_empty() {
                     if self.selection.head == 0 {
@@ -482,6 +524,103 @@ impl EditorView {
 
     // ---- editing helpers -------------------------------------------------
 
+    /// Handle typed text, applying the bracket, quote and dedent rules.
+    fn type_text(&mut self, doc: &mut Document, opts: EditorOptions, text: &str) -> bool {
+        // Only single characters get special treatment. Anything longer is a
+        // paste or an IME commit and must go in verbatim.
+        let single = (text.chars().count() == 1)
+            .then(|| text.chars().next())
+            .flatten();
+        let Some(c) = single.filter(|_| opts.auto_close_brackets) else {
+            return self.insert(doc, text);
+        };
+
+        // Surround: typing an opener with text selected wraps it instead of
+        // replacing it. Losing a selection to a stray bracket is infuriating.
+        if let Some(closer) = indent::auto_close(opts.language, c)
+            && !self.selection.is_empty()
+        {
+            let range = self.selection.range();
+            let before = self.selection;
+            doc.break_undo_run();
+            doc.apply(
+                &editor_core::edit::Transaction::new(vec![
+                    editor_core::edit::Edit::insert(range.start, c.to_string()),
+                    editor_core::edit::Edit::insert(range.end, closer.to_string()),
+                ]),
+                before,
+                Selection::new(range.start + 1, range.end + 1),
+            );
+            self.selection = Selection::new(range.start + 1, range.end + 1);
+            doc.break_undo_run();
+            self.scroll_to_caret = true;
+            return true;
+        }
+
+        // Type-over: typing the closer that is already sitting under the caret
+        // steps past it rather than doubling it.
+        if indent::is_closing(c)
+            && self.selection.is_empty()
+            && char_at(doc, self.selection.head) == Some(c)
+        {
+            self.set_head(self.selection.head + 1, false);
+            return false;
+        }
+
+        if let Some(closer) = indent::auto_close(opts.language, c)
+            && should_auto_close(doc, self.selection.head, c)
+        {
+            let changed = self.insert(doc, &format!("{c}{closer}"));
+            // Leave the caret between the pair.
+            self.selection = Selection::at(self.selection.head.saturating_sub(1));
+            return changed;
+        }
+
+        let changed = self.insert(doc, text);
+
+        // Re-align `else`, `except` and friends as soon as the word is
+        // complete, and a closing brace as soon as it is typed.
+        let line = doc.line_of(self.selection.head);
+        if let Some(target) =
+            indent::dedent_after_typing(doc.text(), line, opts.language, opts.indent())
+        {
+            self.reindent_line(doc, opts, line, target);
+        }
+        changed
+    }
+
+    /// Replace a line's leading whitespace with `width` columns, keeping the
+    /// caret in the same place relative to the text.
+    fn reindent_line(
+        &mut self,
+        doc: &mut Document,
+        opts: EditorOptions,
+        line: usize,
+        width: usize,
+    ) {
+        let text = doc.line_text(line);
+        let existing: String = text
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        let replacement = opts.indent().columns(width);
+        if replacement == existing {
+            return;
+        }
+        let start = doc.line_start(line);
+        let existing_len = existing.chars().count();
+        let delta = replacement.chars().count() as isize - existing_len as isize;
+
+        let before = self.selection;
+        let after = Selection::at(before.head.saturating_add_signed(delta));
+        doc.apply(
+            &editor_core::edit::Transaction::replace(start..start + existing_len, replacement),
+            before,
+            after,
+        );
+        self.selection = after.clamped(doc.len_chars());
+    }
+
     fn insert(&mut self, doc: &mut Document, text: &str) -> bool {
         if !doc.is_editable() || text.is_empty() {
             return false;
@@ -510,6 +649,167 @@ impl EditorView {
         self.selection = after;
         self.goal_column = None;
         self.scroll_to_caret = true;
+        true
+    }
+
+    /// True when the selection covers more than one line.
+    fn spans_multiple_lines(&self, doc: &Document) -> bool {
+        let range = self.selection.range();
+        doc.line_of(range.start) != doc.line_of(range.end)
+    }
+
+    /// The lines the selection touches, inclusive.
+    fn selected_lines(&self, doc: &Document) -> std::ops::RangeInclusive<usize> {
+        let range = self.selection.range();
+        let first = doc.line_of(range.start);
+        // A selection ending exactly at a line start does not include that
+        // line — otherwise selecting one whole line indents two.
+        let last = if range.end > range.start && doc.line_start(doc.line_of(range.end)) == range.end
+        {
+            doc.line_of(range.end).saturating_sub(1)
+        } else {
+            doc.line_of(range.end)
+        };
+        first..=last.max(first)
+    }
+
+    /// Indent (`levels > 0`) or dedent (`levels < 0`) the selected lines.
+    ///
+    /// One transaction, so the whole block is a single undo step, and the
+    /// selection is preserved so Tab can be pressed repeatedly.
+    pub fn shift_lines(&mut self, doc: &mut Document, opts: EditorOptions, levels: isize) -> bool {
+        if !doc.is_editable() {
+            return false;
+        }
+        let indent_opts = opts.indent();
+        let lines = self.selected_lines(doc);
+        let mut edits = Vec::new();
+        let mut first_delta = 0isize;
+        let mut total_delta = 0isize;
+
+        for line in lines.clone() {
+            let text = doc.line_text(line);
+            if text.trim().is_empty() && levels > 0 {
+                continue; // do not indent blank lines into trailing whitespace
+            }
+            let start = doc.line_start(line);
+            let existing: String = text
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let width = visual_width(&existing, opts.tab_width);
+            let target = if levels > 0 {
+                width + opts.tab_width * levels.unsigned_abs()
+            } else {
+                width.saturating_sub(opts.tab_width * levels.unsigned_abs())
+            };
+            if target == width {
+                continue;
+            }
+
+            let replacement = indent_opts.columns(target);
+            let delta = replacement.chars().count() as isize - existing.chars().count() as isize;
+            if line == *lines.start() {
+                first_delta = delta;
+            }
+            total_delta += delta;
+            edits.push(editor_core::edit::Edit::replace(
+                start..start + existing.chars().count(),
+                replacement,
+            ));
+        }
+
+        if edits.is_empty() {
+            return false;
+        }
+
+        let before = self.selection;
+        doc.break_undo_run();
+        // Keep the same text selected afterwards so Tab can be pressed again.
+        let anchor = before
+            .anchor
+            .saturating_add_signed(if before.anchor <= before.head {
+                first_delta
+            } else {
+                total_delta
+            });
+        let head = before
+            .head
+            .saturating_add_signed(if before.anchor <= before.head {
+                total_delta
+            } else {
+                first_delta
+            });
+        let after = Selection::new(anchor, head);
+
+        doc.apply(&editor_core::edit::Transaction::new(edits), before, after);
+        self.selection = after.clamped(doc.len_chars());
+        doc.break_undo_run();
+        self.scroll_to_caret = true;
+        true
+    }
+
+    /// Toggle line comments on the selected lines.
+    ///
+    /// If every non-blank line is already commented, uncomment; otherwise
+    /// comment all of them. Comment markers go at the shallowest common indent
+    /// so the block keeps its shape.
+    pub fn toggle_comment(&mut self, doc: &mut Document, opts: EditorOptions) -> bool {
+        if !doc.is_editable() {
+            return false;
+        }
+        let Some(token) = indent::line_comment_token(opts.language) else {
+            return false;
+        };
+        let lines = self.selected_lines(doc);
+
+        let content: Vec<(usize, String)> = lines
+            .clone()
+            .map(|line| (line, doc.line_text(line)))
+            .filter(|(_, text)| !text.trim().is_empty())
+            .collect();
+        if content.is_empty() {
+            return false;
+        }
+
+        let all_commented = content
+            .iter()
+            .all(|(_, text)| text.trim_start().starts_with(token));
+
+        let column = content
+            .iter()
+            .map(|(_, text)| text.len() - text.trim_start().len())
+            .min()
+            .unwrap_or(0);
+
+        let mut edits = Vec::new();
+        for (line, text) in &content {
+            let start = doc.line_start(*line);
+            if all_commented {
+                let indent_len = text.len() - text.trim_start().len();
+                let at = start + text[..indent_len].chars().count();
+                let rest = text.trim_start();
+                // Remove the token and one following space, which is what was
+                // inserted; leave anything else the user wrote.
+                let mut remove = token.chars().count();
+                if rest[token.len()..].starts_with(' ') {
+                    remove += 1;
+                }
+                edits.push(editor_core::edit::Edit::delete(at..at + remove));
+            } else {
+                let at = start + text[..column.min(text.len())].chars().count();
+                edits.push(editor_core::edit::Edit::insert(at, format!("{token} ")));
+            }
+        }
+
+        if edits.is_empty() {
+            return false;
+        }
+        let before = self.selection;
+        doc.break_undo_run();
+        doc.apply(&editor_core::edit::Transaction::new(edits), before, before);
+        self.selection = before.clamped(doc.len_chars());
+        doc.break_undo_run();
         true
     }
 
@@ -838,6 +1138,45 @@ fn format_for(
     }
 }
 
+fn char_at(doc: &Document, offset: usize) -> Option<char> {
+    (offset < doc.len_chars()).then(|| doc.text().char(offset))
+}
+
+fn char_before(doc: &Document, offset: usize) -> Option<char> {
+    (offset > 0).then(|| doc.text().char(offset - 1))
+}
+
+/// Whether typing `open` here should also insert its closer.
+///
+/// Auto-closing in front of a word produces `(word` → `()word`, which is
+/// almost never wanted; it is only helpful before whitespace, a closing
+/// bracket, or the end of the line. Quotes additionally refuse to close when
+/// the character before is a word character, so `it's` and `don't` type
+/// normally.
+fn should_auto_close(doc: &Document, offset: usize, open: char) -> bool {
+    if matches!(open, '"' | '\'' | '`')
+        && char_before(doc, offset).is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return false;
+    }
+    match char_at(doc, offset) {
+        None => true,
+        Some(c) => c.is_whitespace() || indent::is_closing(c) || matches!(c, ',' | ';' | ':'),
+    }
+}
+
+fn visual_width(text: &str, tab_width: usize) -> usize {
+    let mut width = 0;
+    for c in text.chars() {
+        if c == '\t' {
+            width += tab_width - (width % tab_width);
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
 fn ccursor(index: usize) -> egui::text::CCursor {
     egui::text::CCursor::new(index)
 }
@@ -1011,6 +1350,267 @@ mod tests {
         let mut view = EditorView::default();
         assert!(view.insert(&mut doc, "x"));
         assert_eq!(doc.text().to_string(), "x");
+    }
+
+    fn python_opts() -> EditorOptions {
+        EditorOptions {
+            language: LanguageId::Python,
+            ..EditorOptions::default()
+        }
+    }
+
+    /// Type each character in turn, as the keyboard would deliver them.
+    fn type_all(view: &mut EditorView, doc: &mut Document, opts: EditorOptions, text: &str) {
+        for c in text.chars() {
+            view.type_text(doc, opts, &c.to_string());
+        }
+    }
+
+    #[test]
+    fn typing_an_opening_bracket_inserts_its_closer_and_stays_inside() {
+        let mut doc = doc_with("");
+        let mut view = EditorView::default();
+        view.type_text(&mut doc, python_opts(), "(");
+
+        assert_eq!(doc.text().to_string(), "()");
+        assert_eq!(view.selection, Selection::at(1), "caret sits between them");
+    }
+
+    #[test]
+    fn typing_the_closer_over_an_auto_inserted_one_steps_past_it() {
+        let mut doc = doc_with("");
+        let mut view = EditorView::default();
+        type_all(&mut view, &mut doc, python_opts(), "()");
+
+        assert_eq!(
+            doc.text().to_string(),
+            "()",
+            "typing the closer must not double it"
+        );
+        assert_eq!(view.selection, Selection::at(2));
+    }
+
+    #[test]
+    fn brackets_do_not_auto_close_in_front_of_a_word() {
+        // `(word` becoming `()word` is almost never what anyone wants.
+        let mut doc = doc_with("word");
+        let mut view = EditorView {
+            selection: Selection::at(0),
+            ..EditorView::default()
+        };
+        view.type_text(&mut doc, python_opts(), "(");
+        assert_eq!(doc.text().to_string(), "(word");
+    }
+
+    #[test]
+    fn an_apostrophe_after_a_word_character_does_not_auto_close() {
+        let mut doc = doc_with("dont");
+        let mut view = EditorView {
+            selection: Selection::at(3),
+            ..EditorView::default()
+        };
+        view.type_text(&mut doc, python_opts(), "'");
+        assert_eq!(
+            doc.text().to_string(),
+            "don't",
+            "typing an apostrophe mid-word must not produce don''t"
+        );
+    }
+
+    #[test]
+    fn typing_a_bracket_with_a_selection_surrounds_it() {
+        let mut doc = doc_with("hello world");
+        let mut view = EditorView {
+            selection: Selection::new(0, 5),
+            ..EditorView::default()
+        };
+        view.type_text(&mut doc, python_opts(), "(");
+
+        assert_eq!(
+            doc.text().to_string(),
+            "(hello) world",
+            "the selection must be wrapped, not replaced"
+        );
+        assert_eq!(
+            doc.text().slice(view.selection.range()).to_string(),
+            "hello",
+            "and it stays selected"
+        );
+    }
+
+    #[test]
+    fn auto_close_can_be_switched_off() {
+        let opts = EditorOptions {
+            auto_close_brackets: false,
+            ..python_opts()
+        };
+        let mut doc = doc_with("");
+        let mut view = EditorView::default();
+        view.type_text(&mut doc, opts, "(");
+        assert_eq!(doc.text().to_string(), "(");
+    }
+
+    #[test]
+    fn tab_with_a_multi_line_selection_indents_rather_than_replacing_it() {
+        let mut doc = doc_with("a\nb\nc\n");
+        let mut view = EditorView {
+            selection: Selection::new(0, 3),
+            ..EditorView::default()
+        };
+        assert!(view.shift_lines(&mut doc, python_opts(), 1));
+
+        assert_eq!(
+            doc.text().to_string(),
+            "    a\n    b\nc\n",
+            "the selected text must survive"
+        );
+    }
+
+    #[test]
+    fn outdent_removes_one_level_and_stops_at_the_margin() {
+        let mut doc = doc_with("        a\n    b\nc\n");
+        let mut view = EditorView {
+            selection: Selection::new(0, doc.len_chars()),
+            ..EditorView::default()
+        };
+        view.shift_lines(&mut doc, python_opts(), -1);
+        assert_eq!(doc.text().to_string(), "    a\nb\nc\n");
+
+        view.shift_lines(&mut doc, python_opts(), -1);
+        assert_eq!(
+            doc.text().to_string(),
+            "a\nb\nc\n",
+            "outdenting past column zero must not remove text"
+        );
+    }
+
+    #[test]
+    fn indenting_leaves_the_same_text_selected_so_tab_can_repeat() {
+        let mut doc = doc_with("a\nb\n");
+        let mut view = EditorView {
+            selection: Selection::new(0, 3),
+            ..EditorView::default()
+        };
+        view.shift_lines(&mut doc, python_opts(), 1);
+        assert_eq!(
+            doc.text().slice(view.selection.range()).to_string(),
+            "a\n    b"
+        );
+
+        view.shift_lines(&mut doc, python_opts(), 1);
+        assert_eq!(doc.text().to_string(), "        a\n        b\n");
+    }
+
+    #[test]
+    fn a_selection_ending_at_a_line_start_does_not_indent_the_next_line() {
+        let mut doc = doc_with("a\nb\n");
+        let mut view = EditorView {
+            // Exactly the first line, including its newline.
+            selection: Selection::new(0, 2),
+            ..EditorView::default()
+        };
+        view.shift_lines(&mut doc, python_opts(), 1);
+        assert_eq!(doc.text().to_string(), "    a\nb\n");
+    }
+
+    #[test]
+    fn blank_lines_are_not_indented_into_trailing_whitespace() {
+        let mut doc = doc_with("a\n\nb\n");
+        let mut view = EditorView {
+            selection: Selection::new(0, doc.len_chars()),
+            ..EditorView::default()
+        };
+        view.shift_lines(&mut doc, python_opts(), 1);
+        assert_eq!(doc.text().to_string(), "    a\n\n    b\n");
+    }
+
+    #[test]
+    fn comment_toggle_comments_then_uncomments_exactly() {
+        let original = "def f():\n    a = 1\n    b = 2\n";
+        let mut doc = doc_with(original);
+        let mut view = EditorView {
+            selection: Selection::new(0, doc.len_chars()),
+            ..EditorView::default()
+        };
+
+        assert!(view.toggle_comment(&mut doc, python_opts()));
+        assert_eq!(
+            doc.text().to_string(),
+            "# def f():\n#     a = 1\n#     b = 2\n"
+        );
+
+        assert!(view.toggle_comment(&mut doc, python_opts()));
+        assert_eq!(
+            doc.text().to_string(),
+            original,
+            "uncommenting must restore the original exactly"
+        );
+    }
+
+    #[test]
+    fn comment_markers_align_to_the_shallowest_line_in_the_block() {
+        let mut doc = doc_with("    a = 1\n        b = 2\n");
+        let mut view = EditorView {
+            selection: Selection::new(0, doc.len_chars()),
+            ..EditorView::default()
+        };
+        view.toggle_comment(&mut doc, python_opts());
+        assert_eq!(
+            doc.text().to_string(),
+            "    # a = 1\n    #     b = 2\n",
+            "the block keeps its relative shape"
+        );
+    }
+
+    #[test]
+    fn a_partly_commented_block_is_commented_rather_than_uncommented() {
+        let mut doc = doc_with("# a\nb\n");
+        let mut view = EditorView {
+            selection: Selection::new(0, doc.len_chars()),
+            ..EditorView::default()
+        };
+        view.toggle_comment(&mut doc, python_opts());
+        assert_eq!(doc.text().to_string(), "# # a\n# b\n");
+    }
+
+    #[test]
+    fn comment_toggle_uses_the_right_token_per_language() {
+        for (language, expected) in [
+            (LanguageId::Python, "# x\n"),
+            (LanguageId::Rust, "// x\n"),
+            (LanguageId::Ini, "; x\n"),
+        ] {
+            let mut doc = doc_with("x\n");
+            let mut view = EditorView {
+                selection: Selection::at(0),
+                ..EditorView::default()
+            };
+            view.toggle_comment(
+                &mut doc,
+                EditorOptions {
+                    language,
+                    ..EditorOptions::default()
+                },
+            );
+            assert_eq!(doc.text().to_string(), expected, "{language:?}");
+        }
+    }
+
+    #[test]
+    fn comment_toggle_reports_failure_for_a_language_without_line_comments() {
+        let mut doc = doc_with("{}\n");
+        let mut view = EditorView::default();
+        assert!(
+            !view.toggle_comment(
+                &mut doc,
+                EditorOptions {
+                    language: LanguageId::Json,
+                    ..EditorOptions::default()
+                }
+            ),
+            "JSON has no comment syntax, so the command must decline"
+        );
+        assert_eq!(doc.text().to_string(), "{}\n");
     }
 
     #[test]

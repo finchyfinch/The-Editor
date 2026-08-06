@@ -852,6 +852,11 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
       embedded `<script>` and `<style>` are highlighted as JS and CSS, shebang
       and manual language override, the user-editable TOML theme format, and
       the fold/bracket queries that M4 builds on.
+- [ ] **M4 — Editing intelligence.** The indentation engine is done, including
+      the full Python rule set, along with auto-closing brackets, comment
+      toggling and block indent/dedent. Still to do: `.editorconfig` support,
+      trim-trailing-whitespace and final-newline on save, re-indent on paste,
+      bracket-match highlighting, and code folding.
 
 **Sequencing change.** M2's editing widget was brought forward ahead of the rest
 of M1. An IDE you cannot type into is impossible to evaluate, and the M1

@@ -34,6 +34,9 @@ pub(crate) enum CommandId {
     Copy,
     Paste,
     SelectAll,
+    ToggleComment,
+    Indent,
+    Outdent,
     // View
     ToggleExplorer,
     ThemeDark,
@@ -72,6 +75,9 @@ impl CommandId {
         Self::Copy,
         Self::Paste,
         Self::SelectAll,
+        Self::ToggleComment,
+        Self::Indent,
+        Self::Outdent,
         Self::ToggleExplorer,
         Self::ThemeDark,
         Self::ThemeLight,
@@ -169,6 +175,27 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
     view_cmd(CommandId::Copy, "Edit", "Copy", ctrl(Key::C)),
     view_cmd(CommandId::Paste, "Edit", "Paste", ctrl(Key::V)),
     cmd(CommandId::SelectAll, "Edit", "Select All", ctrl(Key::A)),
+    cmd(
+        CommandId::ToggleComment,
+        "Edit",
+        "Toggle Comment",
+        ctrl(Key::Slash),
+    ),
+    // Tab and Shift+Tab are handled by the editor view, which has to decide
+    // between indenting a block and inserting a tab character. These are the
+    // menu-reachable equivalents.
+    cmd(
+        CommandId::Indent,
+        "Edit",
+        "Indent Lines",
+        ctrl(Key::CloseBracket),
+    ),
+    cmd(
+        CommandId::Outdent,
+        "Edit",
+        "Outdent Lines",
+        ctrl(Key::OpenBracket),
+    ),
     cmd(
         CommandId::ToggleExplorer,
         "View",

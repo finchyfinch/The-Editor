@@ -10,6 +10,37 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **M4 (in progress) — Language-aware editing.**
+  - **Python indentation**, the case that has to be right, because getting a
+    newline wrong there changes what the program means:
+    - a line ending in `:` opens a block, so the next line indents;
+    - continuation lines inside an unclosed bracket align to the column after
+      the opener, or take a hanging indent of one level when nothing follows the
+      opener on its line — both as PEP 8 asks;
+    - `return`, `pass`, `raise`, `break` and `continue` dedent the next line;
+    - typing `else`, `elif`, `except`, `finally` or `case` re-aligns the line to
+      the block it continues, as soon as the word is complete.
+    Brackets and colons inside strings and comments are ignored, escaped quotes
+    do not end a string early, and the backwards scan is bounded so Enter costs
+    the same in a long file as a short one.
+  - Rust, JavaScript, CSS, JSON and HTML indent after their openers, and a
+    closing brace typed on its own line re-aligns to match its opener.
+  - **Auto-closing brackets and quotes**, with the behaviours that stop them
+    being a nuisance: typing the closer steps over an auto-inserted one instead
+    of doubling it; typing an opener with text selected surrounds the selection
+    rather than replacing it; nothing auto-closes in front of a word; and an
+    apostrophe after a word character stays an apostrophe, so `don't` types
+    normally. Enter between a pair opens the block out. Switchable off with
+    `[editor] auto_close_brackets`.
+  - **Toggle Comment** (Ctrl+/), using the right token per language, aligning
+    markers to the shallowest line in the block so it keeps its shape, and
+    restoring the original exactly when toggled back. A partly commented block
+    comments rather than uncomments.
+  - **Block indent and outdent** — Tab and Shift+Tab with a multi-line
+    selection, or Ctrl+] and Ctrl+[ from the Edit menu. The selection survives,
+    so Tab can be pressed repeatedly; blank lines are not indented into trailing
+    whitespace; outdenting stops at the margin.
+
 - **M3 — Syntax highlighting.** Tree-sitter grammars compiled in for Python,
   Rust, JSON, JavaScript, HTML, CSS, TOML and Markdown; INI gets a small
   hand-written line highlighter, since the format is strictly line-oriented and

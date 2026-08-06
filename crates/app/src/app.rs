@@ -200,6 +200,19 @@ impl EditorApp {
         self.active.and_then(|i| self.docs.get_mut(i))
     }
 
+    /// Editor options from settings, with the language left at its default —
+    /// callers that have a document fill that in.
+    fn editor_options(&self) -> EditorOptions {
+        EditorOptions {
+            font_size: self.settings.font_size(),
+            tab_width: self.settings.tab_width(),
+            insert_spaces: self.settings.insert_spaces(),
+            show_line_numbers: true,
+            language: LanguageId::PlainText,
+            auto_close_brackets: self.settings.auto_close_brackets(),
+        }
+    }
+
     /// Give the keyboard to the active editor, so an opened or selected
     /// document can be typed into without clicking into it first.
     fn focus_active(&mut self) {
@@ -633,6 +646,30 @@ impl EditorApp {
                     entry.view.select_all(&entry.doc);
                 }
             }
+            CommandId::ToggleComment => {
+                let opts = self.editor_options();
+                if let Some(entry) = self.active_mut() {
+                    let opts = EditorOptions {
+                        language: entry.language,
+                        ..opts
+                    };
+                    if !entry.view.toggle_comment(&mut entry.doc, opts) {
+                        let language = entry.language.display_name();
+                        self.info(format!("{language} has no line comment syntax"));
+                    }
+                }
+            }
+            CommandId::Indent | CommandId::Outdent => {
+                let levels = if id == CommandId::Indent { 1 } else { -1 };
+                let opts = self.editor_options();
+                if let Some(entry) = self.active_mut() {
+                    let opts = EditorOptions {
+                        language: entry.language,
+                        ..opts
+                    };
+                    entry.view.shift_lines(&mut entry.doc, opts, levels);
+                }
+            }
 
             CommandId::ToggleExplorer => {
                 let show = !self.settings.show_file_tree();
@@ -878,15 +915,11 @@ impl EditorApp {
             }
             ui.separator();
 
-            let opts = EditorOptions {
-                font_size: self.settings.font_size(),
-                tab_width: self.settings.tab_width(),
-                insert_spaces: self.settings.insert_spaces(),
-                show_line_numbers: true,
-            };
+            let mut opts = self.editor_options();
             let syntax = &self.syntax_theme;
 
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
+                opts.language = entry.language;
                 // Bring the parse tree up to date before painting from it.
                 // Draining the outbox here means every edit path — typing,
                 // paste, undo, redo — feeds the highlighter without each one
@@ -1284,6 +1317,10 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::Paste),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::SelectAll),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::ToggleComment),
+            MenuEntry::Item(CommandId::Indent),
+            MenuEntry::Item(CommandId::Outdent),
         ],
     ),
     (

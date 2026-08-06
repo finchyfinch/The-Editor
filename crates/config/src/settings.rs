@@ -46,6 +46,8 @@ font_size = 13.0
 tab_width = 4
 insert_spaces = true
 word_wrap = false
+# Typing an opening bracket or quote also inserts its closer.
+auto_close_brackets = true
 ";
 
 /// Defaults, in one place so the accessors and the documentation above cannot
@@ -60,6 +62,7 @@ mod defaults {
     pub(super) const TAB_WIDTH: usize = 4;
     pub(super) const INSERT_SPACES: bool = true;
     pub(super) const WORD_WRAP: bool = false;
+    pub(super) const AUTO_CLOSE_BRACKETS: bool = true;
 
     /// Guard rails for hand-edited values. A `ui_scale = 40.0` should clamp to
     /// something usable rather than render an unrecoverable window.
@@ -299,6 +302,13 @@ impl Settings {
     pub fn word_wrap(&self) -> bool {
         self.bool_at("editor", "word_wrap")
             .unwrap_or(defaults::WORD_WRAP)
+    }
+
+    /// Whether typing an opening bracket or quote inserts its closer.
+    #[must_use]
+    pub fn auto_close_brackets(&self) -> bool {
+        self.bool_at("editor", "auto_close_brackets")
+            .unwrap_or(defaults::AUTO_CLOSE_BRACKETS)
     }
 
     pub fn set_word_wrap(&mut self, wrap: bool) {

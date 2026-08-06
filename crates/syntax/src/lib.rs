@@ -6,6 +6,7 @@
 //! `Tree::edit` on every transaction. See PLAN.md §3.5.
 
 pub mod highlight;
+pub mod indent;
 pub mod templates;
 pub mod theme;
 
