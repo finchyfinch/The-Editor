@@ -1,4 +1,4 @@
-﻿//! The application shell: layout, command routing, and the document set.
+//! The application shell: layout, command routing, and the document set.
 //!
 //! Everything the user can trigger goes through [`EditorApp::run_command`], so
 //! the menus, the toolbar, the keyboard and the palette cannot diverge in
@@ -49,6 +49,14 @@ pub(crate) const BUILD: BuildInfo = BuildInfo {
 
 /// How long a transient message stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
+
+/// Height of the output dock when it first appears.
+const DEFAULT_DOCK_HEIGHT: f32 = 220.0;
+/// Smallest useful dock: enough for the header and a couple of lines.
+const MIN_DOCK_HEIGHT: f32 = 80.0;
+/// Largest the dock can be dragged to. A hard cap as well as the
+/// leave-room-for-the-editor clamp, so no window size can hide the editor.
+const MAX_DOCK_HEIGHT: f32 = 900.0;
 
 /// A transient message. Errors surface here rather than as a panic or a
 /// silently swallowed `Result`.
@@ -127,6 +135,8 @@ pub(crate) struct EditorApp {
     runner: Runner,
     /// Whether the bottom dock is showing the run output.
     show_output: bool,
+    /// Height of the bottom dock, owned here rather than by the panel.
+    dock_height: f32,
     venv_dialog: venv_dialog::Dialog,
     /// What to do once a virtual environment finishes being created. Held
     /// across frames because creation is three processes, not a function call.
@@ -196,6 +206,7 @@ impl EditorApp {
             syntax_theme: SyntaxTheme::for_ui(ResolvedTheme::Dark),
             runner: Runner::default(),
             show_output: false,
+            dock_height: DEFAULT_DOCK_HEIGHT,
             venv_dialog: venv_dialog::Dialog::default(),
             pending_venv: None,
             watcher: None,
@@ -1969,11 +1980,38 @@ impl eframe::App for EditorApp {
         if self.show_output {
             let mut console_action = None;
             let mut problem_clicked = None;
+
+            // The height is owned here rather than left to the panel.
+            //
+            // egui 0.36 lays a panel's content out against `size_range.max` and
+            // then stores whatever size the content came out at, so a panel
+            // containing a `ScrollArea` that fills its space grows to the
+            // maximum on the second frame and stays there — which is how the
+            // output panel could swallow the whole window with no way back.
+            // An exact size plus a drag strip of our own gives the behaviour
+            // that was wanted anyway: a sensible fixed height that can be
+            // dragged larger.
+            let dock_height = clamp_dock_height(self.dock_height, ui.available_height());
+
             egui::Panel::bottom("dock")
-                .resizable(true)
-                .default_size(220.0)
-                .size_range(60.0..=800.0)
+                .resizable(false)
+                .exact_size(dock_height)
                 .show(ui, |ui| {
+                    // Drag strip along the top edge.
+                    let (strip, drag) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 5.0),
+                        egui::Sense::drag(),
+                    );
+                    let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                    if drag.dragged() {
+                        // Dragging up makes the panel taller.
+                        self.dock_height = (self.dock_height - drag.drag_delta().y)
+                            .clamp(MIN_DOCK_HEIGHT, MAX_DOCK_HEIGHT);
+                    }
+                    if drag.hovered() || drag.dragged() {
+                        ui.painter()
+                            .rect_filled(strip, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                    }
                     let counts = self.lsp.diagnostics().total_counts();
                     ui.horizontal(|ui| {
                         if ui
@@ -2214,6 +2252,23 @@ fn toolbar_glyph(id: CommandId) -> &'static str {
     }
 }
 
+/// How tall the output dock may actually be, given the space available.
+///
+/// The editor pane always keeps a usable strip, whatever height was dragged or
+/// however small the window becomes. A dock that fills the window leaves no way
+/// back to the code, which is exactly the state this guards against.
+fn clamp_dock_height(desired: f32, available: f32) -> f32 {
+    /// Rows of editor that must remain visible.
+    const RESERVED_FOR_EDITOR: f32 = 120.0;
+
+    let ceiling = (available - RESERVED_FOR_EDITOR).clamp(MIN_DOCK_HEIGHT, MAX_DOCK_HEIGHT);
+    if desired.is_finite() {
+        desired.clamp(MIN_DOCK_HEIGHT, ceiling)
+    } else {
+        DEFAULT_DOCK_HEIGHT.min(ceiling)
+    }
+}
+
 /// A name inside `directory` that is not already taken.
 fn unique_path(directory: &Path, stem: &str, extension: &str) -> PathBuf {
     let build = |suffix: String| {
@@ -2417,6 +2472,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression: the output panel grew to fill the whole window, hiding the
+    /// editor with no way to get it back.
+    #[test]
+    fn the_dock_always_leaves_room_for_the_editor() {
+        let window = 800.0;
+        // Even asking for far more than the window has.
+        let height = clamp_dock_height(10_000.0, window);
+        assert!(
+            height < window,
+            "the dock must not fill the window: {height} of {window}"
+        );
+        assert!(
+            window - height >= 100.0,
+            "too little editor left: {} points",
+            window - height
+        );
+    }
+
+    #[test]
+    fn the_dock_keeps_its_requested_height_when_there_is_room() {
+        assert!((clamp_dock_height(220.0, 900.0) - 220.0).abs() < f32::EPSILON);
+        assert!((clamp_dock_height(400.0, 900.0) - 400.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_dock_stays_usable_in_a_very_short_window() {
+        // A window too short to honour both minimums has to break one of them;
+        // the dock keeps its minimum so its header and buttons stay reachable.
+        let height = clamp_dock_height(220.0, 150.0);
+        assert!(height >= MIN_DOCK_HEIGHT);
+        assert!(height.is_finite());
+    }
+
+    #[test]
+    fn a_nonsense_height_falls_back_to_the_default() {
+        // Guards against a NaN reaching the panel, which lays out as an
+        // invisible or infinite rectangle.
+        let height = clamp_dock_height(f32::NAN, 900.0);
+        assert!(height.is_finite());
+        assert!((height - DEFAULT_DOCK_HEIGHT).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_dock_is_never_dragged_past_its_hard_cap() {
+        assert!(clamp_dock_height(5_000.0, 10_000.0) <= MAX_DOCK_HEIGHT);
     }
 
     #[test]

@@ -271,6 +271,30 @@ impl EditorView {
                 if std::mem::take(&mut self.grab_focus) {
                     response.request_focus();
                 }
+
+                // Claim the keys egui would otherwise use to move focus
+                // between widgets. Without this, pressing Up in the editor
+                // moves focus to the toolbar instead of moving the caret —
+                // egui's focus navigation consumes the arrows first, and a
+                // custom widget has to say it wants them. `TextEdit` does
+                // exactly this; a hand-written editor has to as well.
+                //
+                // Escape is deliberately left alone, so it still closes the
+                // find bar and dismisses dialogs.
+                if response.has_focus() {
+                    ui.memory_mut(|memory| {
+                        memory.set_focus_lock_filter(
+                            response.id,
+                            egui::EventFilter {
+                                tab: true,
+                                horizontal_arrows: true,
+                                vertical_arrows: true,
+                                escape: false,
+                            },
+                        );
+                    });
+                }
+
                 // The code pane *is* text, so here the I-beam is correct.
                 let response = response.on_hover_cursor(egui::CursorIcon::Text);
 

@@ -8,6 +8,23 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Arrow keys moved focus out of the editor instead of the caret.** egui's
+  focus navigation claims the arrow and Tab keys before a widget sees them
+  unless the widget declares an event filter saying it wants them. `TextEdit`
+  does this; the custom editor did not, so pressing Up jumped to the toolbar.
+  Escape is deliberately still left to egui, so it continues to close the find
+  bar and dismiss dialogs.
+- **The output panel could grow to fill the entire window**, hiding the editor
+  with no way to get it back. In egui 0.36 a panel lays its content out against
+  `size_range.max` and then stores whatever size the content settled at — so a
+  panel containing a `ScrollArea` that fills its space grows to the maximum on
+  the second frame and stays there. The dock now has a fixed default height it
+  owns itself, with its own drag strip along the top edge to make it taller,
+  and a clamp that always leaves the editor a usable strip whatever the window
+  size or drag distance.
+
 ### Added
 
 - **M6 (in progress) — Language servers.** Diagnostics from `rust-analyzer`,
