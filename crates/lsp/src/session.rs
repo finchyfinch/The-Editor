@@ -71,6 +71,51 @@ pub struct Location {
     pub column: u32,
 }
 
+/// One suggestion from a language server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// What to show in the list.
+    pub label: String,
+    /// What to put in the document. Often the same as `label`, but not always:
+    /// a function may be labelled `parse(data)` and insert only `parse`.
+    pub insert: String,
+    /// A type signature or module path, shown greyed beside the label.
+    pub detail: Option<String>,
+    /// The protocol's numeric kind, for the glyph. 3 is Function, 6 Variable,
+    /// 7 Class, 9 Module, 21 Constant -- see `CompletionItemKind`.
+    pub kind: Option<u8>,
+    /// What the server wants this sorted by, which is not the label: servers
+    /// use it to float likely candidates, and ignoring it makes a good list
+    /// look random.
+    pub sort_text: Option<String>,
+}
+
+impl Completion {
+    /// A one-character cue for the kind, so the list is skimmable without
+    /// relying on colour alone.
+    #[must_use]
+    pub fn glyph(&self) -> &'static str {
+        match self.kind {
+            Some(2 | 3) => "\u{192}",
+            Some(5) => "\u{25ab}",
+            Some(6) => "\u{25aa}",
+            Some(7 | 22) => "\u{25c7}",
+            Some(8) => "\u{25c8}",
+            Some(9) => "\u{25a6}",
+            Some(14) => "\u{25b8}",
+            Some(21) => "\u{25cf}",
+            _ => "\u{b7}",
+        }
+    }
+}
+
+/// A request sent and not yet answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    Locations(Query),
+    Completions,
+}
+
 /// What happened that the application should react to.
 #[derive(Debug, Clone)]
 pub enum Notice {
@@ -84,6 +129,8 @@ pub enum Notice {
         query: Query,
         locations: Vec<Location>,
     },
+    /// Suggestions came back for the position last asked about.
+    Completions(Vec<Completion>),
     /// A server died. `restarting` is false once it has given up.
     ServerDied {
         id: &'static str,
@@ -118,7 +165,7 @@ pub struct Lsp {
     ///
     /// Request ids are allocated per server, so the server id has to be part of
     /// the key or two servers would collide on id 1.
-    pending: HashMap<(&'static str, i64), Query>,
+    pending: HashMap<(&'static str, i64), Pending>,
 }
 
 impl Lsp {
@@ -313,7 +360,46 @@ impl Lsp {
                 params["context"] = json!({ "includeDeclaration": true });
             }
             if let Ok(request) = server.send_request(query.method(), params) {
-                self.pending.insert((id, request), query);
+                self.pending
+                    .insert((id, request), Pending::Locations(query));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Ask for completions at a position.
+    ///
+    /// Returns false if nothing could be asked, so the caller does not sit
+    /// waiting for a popup that is never going to appear.
+    ///
+    /// Any answer still outstanding is forgotten first. Completion requests are
+    /// sent while the user types, so several can be in flight at once and only
+    /// the last one is about the text now on screen; without this, an older,
+    /// slower reply would arrive last and replace the right list with a stale
+    /// one.
+    pub fn complete(&mut self, path: &Path, line: u32, column: u32) -> bool {
+        self.pending.retain(|_, kind| *kind != Pending::Completions);
+
+        let Some(document) = self.documents.get(path) else {
+            return false;
+        };
+        let told = document.told.clone();
+        let uri = server::path_to_uri(path);
+
+        for id in told {
+            let Some(server) = self.servers.get_mut(id) else {
+                continue;
+            };
+            if !server.is_ready() || !server.supports("completionProvider") {
+                continue;
+            }
+            let params = json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": column },
+            });
+            if let Ok(request) = server.send_request("textDocument/completion", params) {
+                self.pending.insert((id, request), Pending::Completions);
                 return true;
             }
         }
@@ -419,14 +505,18 @@ impl Lsp {
                     Event::Response {
                         id: request,
                         result,
-                    } => {
-                        if let Some(query) = self.pending.remove(&(id, request)) {
+                    } => match self.pending.remove(&(id, request)) {
+                        Some(Pending::Locations(query)) => {
                             notices.push(Notice::Answered {
                                 query,
                                 locations: parse_locations(&result),
                             });
                         }
-                    }
+                        Some(Pending::Completions) => {
+                            notices.push(Notice::Completions(parse_completions(&result)));
+                        }
+                        None => {}
+                    },
                 }
             }
 
@@ -475,6 +565,74 @@ impl Drop for Lsp {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// The most suggestions kept from one response.
+///
+/// A bare `.` on a Python module can return several thousand. Past a few
+/// hundred the list is a scrolling wall nobody reads, and the filtering the
+/// user is about to do narrows it in a keystroke or two anyway.
+const MAX_COMPLETIONS: usize = 300;
+
+/// Read completions out of a response.
+///
+/// The protocol allows either a bare array or a `CompletionList` with an
+/// `items` field, and servers use both.
+fn parse_completions(result: &serde_json::Value) -> Vec<Completion> {
+    let items = match result {
+        serde_json::Value::Array(items) => items.as_slice(),
+        serde_json::Value::Object(_) => match result.get("items") {
+            Some(serde_json::Value::Array(items)) => items.as_slice(),
+            _ => &[],
+        },
+        _ => &[],
+    };
+
+    let mut out: Vec<Completion> = items
+        .iter()
+        .filter_map(|item| {
+            let label = item.get("label")?.as_str()?.trim().to_owned();
+            if label.is_empty() {
+                return None;
+            }
+            // `insertText` wins where present, because a label may be
+            // decorative -- pyright labels a function `parse` but a snippet
+            // server may label it `parse(data)`, which must not be typed in
+            // whole. A `textEdit` would be more correct still, but applying one
+            // needs its range, and the range is stated against a document that
+            // may have moved on since the request was sent.
+            let insert = item
+                .get("insertText")
+                .and_then(|v| v.as_str())
+                .map_or_else(|| label.clone(), str::to_owned);
+            Some(Completion {
+                detail: item
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                kind: item
+                    .get("kind")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|k| u8::try_from(k).ok()),
+                sort_text: item
+                    .get("sortText")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                label,
+                insert,
+            })
+        })
+        .collect();
+
+    // Servers rank with `sortText`, falling back to the label. Sorting by label
+    // alone throws that ranking away and buries the obvious candidate.
+    out.sort_by(|a, b| {
+        let key = |c: &Completion| c.sort_text.clone().unwrap_or_else(|| c.label.clone());
+        key(a).cmp(&key(b)).then_with(|| a.label.cmp(&b.label))
+    });
+    out.dedup_by(|a, b| a.label == b.label && a.insert == b.insert);
+    out.truncate(MAX_COMPLETIONS);
+    out
 }
 
 /// Read a `Location`, `Location[]` or `LocationLink[]` out of a response.

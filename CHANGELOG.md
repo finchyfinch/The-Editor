@@ -10,6 +10,15 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Completion popup.** Suggestions from the language server appear under the
+  caret after two characters of a name, or immediately after a `.`. Up/Down to
+  choose, Enter or Tab to accept, Escape to dismiss, or click. Accepting is one
+  undo step. The list is fetched once per word and narrowed locally as you keep
+  typing, rather than re-requested on every keystroke — a server answers several
+  frames later, and replacing the list wholesale on each reply makes it flicker
+  and reorder under the fingers. A reply that no longer describes the word being
+  typed is dropped.
+
 - **Go to Definition (F12) and Find Uses (Shift+F12)**, from the Edit menu or
   the editor's new right-click menu, with **Next/Previous Use (F8, Shift+F8)**
   to walk the results. Uses the language server where one can answer, so it

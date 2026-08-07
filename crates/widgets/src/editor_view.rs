@@ -90,6 +90,13 @@ pub struct EditorView {
     diagnostics: Vec<Underline>,
     /// Set by the context menu, taken by the application next frame.
     context_action: Option<ContextAction>,
+    /// Where the caret was painted last frame, in screen coordinates.
+    ///
+    /// Kept so the completion popup can be anchored under the caret. Only the
+    /// paint pass knows this: the x position comes from the laid-out galley,
+    /// which accounts for tabs, proportional glyphs and horizontal scrolling in
+    /// a way no arithmetic over the character offset would.
+    caret_screen_rect: Option<egui::Rect>,
 }
 
 /// A range to underline, and how seriously.
@@ -221,6 +228,15 @@ impl EditorView {
     /// and several views may show the same one.
     pub fn set_diagnostics(&mut self, diagnostics: Vec<Underline>) {
         self.diagnostics = diagnostics;
+    }
+
+    /// Where the caret is on screen, as of the last frame that painted it.
+    ///
+    /// `None` before the first paint, or when the caret has scrolled out of the
+    /// visible range.
+    #[must_use]
+    pub fn caret_screen_rect(&self) -> Option<egui::Rect> {
+        self.caret_screen_rect
     }
 
     /// Taken by the application after each frame; see [`ContextAction`].
@@ -1294,6 +1310,7 @@ impl EditorView {
             }
         }
 
+        self.caret_screen_rect = caret_rect;
         if let Some(caret) = caret_rect {
             if response.has_focus() && self.blink_on() {
                 painter.rect_filled(caret, 0.0, visuals.strong_text_color());

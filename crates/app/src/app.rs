@@ -26,6 +26,7 @@ use editor_widgets::{file_tree::FileTree, tab_bar, theme as ui_theme};
 use eframe::egui;
 
 use crate::commands::{self, CommandId};
+use crate::completion;
 use crate::new_file;
 use crate::palette::Palette;
 use crate::runner::Runner;
@@ -206,6 +207,11 @@ pub(crate) struct EditorApp {
     pending_delete: Option<PathBuf>,
     /// Results of the last Find Uses, and where in them the user is.
     uses: UseResults,
+    /// The completion popup, and the request behind it.
+    completion: completion::Popup,
+    /// Document version the popup was last synced against, so the word under
+    /// the caret is only re-examined when something actually changed.
+    completion_version: Option<u64>,
 
     lsp: editor_lsp::session::Lsp,
     /// Which bottom-dock tab is showing.
@@ -273,6 +279,8 @@ impl EditorApp {
             pending_recent: None,
             pending_delete: None,
             uses: UseResults::default(),
+            completion: completion::Popup::default(),
+            completion_version: None,
             lsp: editor_lsp::session::Lsp::default(),
             dock: DockTab::default(),
             synced: std::collections::HashMap::new(),
@@ -921,6 +929,159 @@ impl EditorApp {
         open_toolchains
     }
 
+    /// The word being typed at the caret: where it starts, and what it is.
+    ///
+    /// `None` when the caret is not immediately after an identifier character,
+    /// which is how the popup knows to close: the moment you type a space or a
+    /// bracket, the word you were completing has ended.
+    fn completion_prefix(&self) -> Option<(usize, String)> {
+        let entry = self.active.and_then(|i| self.docs.get(i))?;
+        let caret = entry.view.selection.head;
+        if !entry.view.selection.is_empty() {
+            // With a selection, typing replaces it; there is no prefix.
+            return None;
+        }
+        let text = entry.doc.text();
+
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut start = caret;
+        while start > 0 && is_word(text.char(start - 1)) {
+            start -= 1;
+        }
+        if start == caret {
+            // No word yet, but a `.` just typed is the single most common
+            // reason to want a list: `os.` and then everything the module has.
+            // The prefix is empty and the suggestion replaces nothing.
+            return (caret > 0 && text.char(caret - 1) == '.').then(|| (caret, String::new()));
+        }
+        // A name cannot begin with a digit, so `1234` is a number being typed,
+        // not a prefix worth asking a server about.
+        if text.char(start).is_ascii_digit() {
+            return None;
+        }
+        Some((start, text.slice(start..caret).chars().collect()))
+    }
+
+    /// Keep the completion popup in step with the document.
+    ///
+    /// Called once per frame. Asks for suggestions when a new word starts,
+    /// narrows the list locally while the same word grows, and closes when the
+    /// word ends.
+    fn sync_completion(&mut self) {
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            self.completion.close();
+            return;
+        };
+        let version = entry.doc.version();
+        if self.completion_version == Some(version) {
+            return;
+        }
+        self.completion_version = Some(version);
+
+        let Some((start, prefix)) = self.completion_prefix() else {
+            self.completion.close();
+            return;
+        };
+
+        // Below this the list is most of what the server knows, which is
+        // thousands of entries and no help. An empty prefix is exempt: it means
+        // a `.` was just typed, where the member list is exactly what is
+        // wanted and is already narrowed by the thing before the dot.
+        const MIN_PREFIX: usize = 2;
+
+        if self.completion.is_open() {
+            self.completion.refilter(&prefix);
+            return;
+        }
+        let long_enough = prefix.is_empty() || prefix.chars().count() >= MIN_PREFIX;
+        if self.completion.is_waiting() || !long_enough {
+            return;
+        }
+        self.request_completions(start, &prefix);
+    }
+
+    /// Ask the servers about the word starting at `start`.
+    fn request_completions(&mut self, start: usize, prefix: &str) {
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            return;
+        };
+        let Some(path) = entry.doc.path().map(Path::to_path_buf) else {
+            return;
+        };
+        // Asked about the *start* of the word, not the caret: a server given
+        // the position after `par` may filter to what it thinks matches, and
+        // its idea of matching is not the one the popup then applies. After a
+        // `.` the two are the same position anyway.
+        let (line, column) = entry.doc.line_col(start);
+        let (line, column) = (line as u32 - 1, column as u32 - 1);
+
+        if self.lsp.complete(&path, line, column) {
+            self.completion.requested(start, prefix);
+        }
+    }
+
+    /// Let the popup claim its keys, and apply an acceptance.
+    ///
+    /// Runs near the top of the frame, before the editor reads events.
+    fn completion_keys(&mut self, ctx: &egui::Context) {
+        let Some((_, prefix)) = self.completion_prefix() else {
+            return;
+        };
+        let action = self.completion.handle_keys(ctx, prefix.chars().count());
+        self.apply_completion(action);
+    }
+
+    /// Draw the popup, and apply a choice made with the mouse.
+    fn completion_draw(&mut self, ctx: &egui::Context) {
+        let Some((_, prefix)) = self.completion_prefix() else {
+            return;
+        };
+        let Some(caret) = self
+            .active
+            .and_then(|i| self.docs.get(i))
+            .and_then(|e| e.view.caret_screen_rect())
+        else {
+            return;
+        };
+        let action = self.completion.draw(ctx, caret, prefix.chars().count());
+        self.apply_completion(action);
+    }
+
+    /// Put an accepted suggestion into the document.
+    fn apply_completion(&mut self, action: completion::Action) {
+        let completion::Action::Accept { insert, replacing } = action else {
+            return;
+        };
+        let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) else {
+            return;
+        };
+        let caret_offset = entry.view.selection.head;
+        let start = caret_offset.saturating_sub(replacing);
+
+        // One transaction, so accepting a suggestion is one undo step rather
+        // than a delete and an insert. The run is broken either side so it does
+        // not coalesce with the typing that led up to it.
+        use editor_core::edit::{Edit, Transaction};
+        let before = entry.view.selection;
+        let after = editor_core::selection::Selection::at(start + insert.chars().count());
+        entry.doc.break_undo_run();
+        entry.doc.apply(
+            &Transaction::new(vec![Edit::replace(start..caret_offset, insert)]),
+            before,
+            after,
+        );
+        entry.view.set_caret(after.head);
+        entry.doc.break_undo_run();
+        entry.view.focus();
+
+        // The edit bumps the version. Recording it here stops the next frame
+        // treating the freshly inserted word as a new prefix and asking again.
+        self.completion_version = self
+            .active
+            .and_then(|i| self.docs.get(i))
+            .map(|e| e.doc.version());
+    }
+
     /// The name the caret is on, for messages about a server's answer.
     fn symbol_under_caret(&self) -> Option<String> {
         let entry = self.active.and_then(|i| self.docs.get(i))?;
@@ -1205,6 +1366,13 @@ impl EditorApp {
                     }
                 }
                 editor_lsp::session::Notice::DiagnosticsChanged(_) => {}
+                editor_lsp::session::Notice::Completions(items) => {
+                    // Matched against the word as it is *now*, not as it was
+                    // when the request went out; the popup decides whether the
+                    // reply still describes the word being typed.
+                    let prefix = self.completion_prefix().map(|(_, p)| p).unwrap_or_default();
+                    self.completion.answered(items, &prefix);
+                }
                 editor_lsp::session::Notice::Answered { query, locations } => {
                     // A stale answer to a question the user has moved on from
                     // would yank the caret somewhere unexpected.
@@ -2602,6 +2770,10 @@ impl eframe::App for EditorApp {
         }
         self.poll_watcher();
         self.sync_highlighters(&ctx);
+        self.sync_completion();
+        // Before the menu bar, toolbar and editor read this frame's events:
+        // whoever looks first gets the key.
+        self.completion_keys(&ctx);
         self.sync_language_servers();
 
         // Never let the window close with unsaved work. This must run before
@@ -2623,7 +2795,11 @@ impl eframe::App for EditorApp {
         // so a shortcut is not swallowed by a menu that happens to be open —
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
-        let modal_open = self.settings_form.is_open()
+        // The popup is modal for keyboard purposes: while it is up, Enter,
+        // Tab, Escape and the arrows belong to it, and a global shortcut firing
+        // behind it would act on a document the user is not looking at.
+        let modal_open = self.completion.is_open()
+            || self.settings_form.is_open()
             || self.pending_delete.is_some()
             || self.palette.is_open()
             || self.new_file.is_open()
@@ -2787,6 +2963,9 @@ impl eframe::App for EditorApp {
         self.shortcuts_window(&ctx);
         self.toolchains_window(&ctx);
         self.settings_form_ui(&ctx);
+        // After the editor has painted, so the caret rect it anchors to is
+        // from this frame rather than the last one.
+        self.completion_draw(&ctx);
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
         self.toasts_ui(&ctx);

@@ -8,6 +8,7 @@
 
 mod app;
 mod commands;
+mod completion;
 mod logging;
 mod new_file;
 mod palette;
