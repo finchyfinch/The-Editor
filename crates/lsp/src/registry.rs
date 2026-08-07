@@ -24,6 +24,13 @@ pub struct ServerSpec {
     pub args: &'static [&'static str],
     /// What it is for, shown in the toolchain check.
     pub provides: &'static str,
+    /// The command that installs it.
+    ///
+    /// Carried on the spec rather than in a lookup table beside it, so a new
+    /// server cannot be added with no way to obtain it. Every one of these is a
+    /// single free command — no account, no download page, no licence to buy
+    /// (decision D9).
+    pub install: &'static str,
     /// An argument that makes the server print its version and exit zero.
     ///
     /// Used to check a binary actually works before trying to speak LSP to it.
@@ -46,6 +53,7 @@ pub const RUST_ANALYZER: ServerSpec = ServerSpec {
     commands: &["rust-analyzer"],
     args: &[],
     provides: "completion, diagnostics, go to definition, rename",
+    install: "rustup component add rust-analyzer",
     version_arg: Some("--version"),
 };
 
@@ -56,6 +64,7 @@ pub const RUFF: ServerSpec = ServerSpec {
     commands: &["ruff"],
     args: &["server"],
     provides: "linting and formatting",
+    install: "pip install ruff",
     version_arg: Some("--version"),
 };
 
@@ -67,6 +76,7 @@ pub const PYRIGHT: ServerSpec = ServerSpec {
     commands: &["basedpyright-langserver", "pyright-langserver"],
     args: &["--stdio"],
     provides: "types, completion, go to definition",
+    install: "pip install basedpyright",
     version_arg: Some("--version"),
 };
 
@@ -77,6 +87,7 @@ pub const PYLSP: ServerSpec = ServerSpec {
     commands: &["pylsp"],
     args: &[],
     provides: "completion, diagnostics",
+    install: "pip install python-lsp-server",
     version_arg: Some("--version"),
 };
 
@@ -87,6 +98,7 @@ pub const TAPLO: ServerSpec = ServerSpec {
     commands: &["taplo"],
     args: &["lsp", "stdio"],
     provides: "TOML validation and formatting",
+    install: "cargo install taplo-cli --locked",
     version_arg: Some("--version"),
 };
 
@@ -291,6 +303,13 @@ mod tests {
             assert!(!spec.name.is_empty());
             assert!(!spec.provides.is_empty(), "{} says nothing useful", spec.id);
             assert!(!spec.commands.is_empty(), "{} has no executable", spec.id);
+            // Naming a tool the user has not got, without saying how to get it,
+            // is the report that started this: three names and no next step.
+            assert!(
+                !spec.install.is_empty(),
+                "{} can be reported missing with no way to install it",
+                spec.id
+            );
         }
     }
 
@@ -310,6 +329,7 @@ mod tests {
             commands: &["definitely-not-a-real-language-server-xyzzy"],
             args: &[],
             provides: "nothing",
+            install: "",
             version_arg: None,
         };
         assert_eq!(find(missing, &[]), None);
@@ -384,6 +404,7 @@ mod tests {
             commands: &["fake-shim"],
             args: &[],
             provides: "nothing",
+            install: "",
             version_arg: Some("--version"),
         };
         assert_eq!(

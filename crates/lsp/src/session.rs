@@ -626,6 +626,7 @@ while True:
             // A test process is about to exit anyway.
             args: Box::leak(vec!["-c", MOCK_SERVER].into_boxed_slice()),
             provides: "a deliberate problem",
+            install: "",
             version_arg: None,
         }
     }

@@ -756,6 +756,7 @@ mod tests {
             commands: &["definitely-not-a-real-language-server-xyzzy"],
             args: &[],
             provides: "nothing",
+            install: "",
             version_arg: None,
         };
         let result = Server::start(

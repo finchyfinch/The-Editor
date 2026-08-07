@@ -750,31 +750,19 @@ impl EditorApp {
     fn problems_ui(&mut self, ui: &mut egui::Ui) -> Option<(PathBuf, usize, usize)> {
         let files = self.lsp.diagnostics().all();
 
+        // The what-is-missing notice sits at the bottom and is drawn first, so
+        // it keeps its place while the list above it scrolls. It shows whether
+        // or not there are diagnostics: finding a syntax error does not mean a
+        // type checker has stopped being missing.
+        if self.lsp.running().is_empty() && self.missing_tools_ui(ui) {
+            self.toolchains = Some(editor_lsp::registry::find_all(&self.tool_search_path()));
+        }
+
         if files.is_empty() {
-            let mut open_toolchains = false;
             ui.vertical_centered(|ui| {
                 ui.add_space(16.0);
                 ui.weak("No problems");
-                if self.lsp.running().is_empty() {
-                    // Distinguish "nothing wrong" from "not much is checking",
-                    // which look identical and mean different things. The
-                    // built-in syntax check runs regardless, so this is a
-                    // qualification, not the absence of any checking at all.
-                    ui.add_space(4.0);
-                    ui.small("Syntax is checked; nothing else is.");
-                    for spec in self.lsp.missing() {
-                        ui.small(format!(
-                            "{} is not installed \u{2014} it would provide {}",
-                            spec.name, spec.provides
-                        ));
-                    }
-                    ui.add_space(6.0);
-                    open_toolchains = ui.button("Check Toolchains").clicked();
-                }
             });
-            if open_toolchains {
-                self.toolchains = Some(editor_lsp::registry::find_all(&self.tool_search_path()));
-            }
             return None;
         }
 
@@ -823,6 +811,47 @@ impl EditorApp {
                 }
             });
         clicked
+    }
+
+    /// The strip at the foot of the Problems panel saying what is not checking
+    /// this file, and the exact command that would fix it.
+    ///
+    /// Returns true if the user asked for the full toolchain window.
+    ///
+    /// Naming three tools the user has not got and stopping there is not a
+    /// report, it is a riddle. Each line carries the command that installs it,
+    /// with a button that puts it on the clipboard, because the next thing
+    /// anyone does with a command is paste it into a terminal.
+    fn missing_tools_ui(&self, ui: &mut egui::Ui) -> bool {
+        let missing = self.lsp.missing();
+        let mut open_toolchains = false;
+
+        egui::Panel::bottom("problems_toolchains").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.small("Syntax is checked by The Editor itself. Nothing else is checking.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    open_toolchains = ui.small_button("Check Toolchains...").clicked();
+                });
+            });
+
+            for spec in missing {
+                ui.horizontal(|ui| {
+                    ui.small(format!("{} \u{2014} {}:", spec.name, spec.provides));
+                    ui.code(spec.install);
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy the command to the clipboard")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(spec.install.to_owned());
+                    }
+                });
+            }
+            ui.add_space(4.0);
+        });
+
+        open_toolchains
     }
 
     /// Open a file and put the caret at a zero-based line and column.
@@ -1991,13 +2020,14 @@ impl EditorApp {
                 ui.add_space(8.0);
 
                 egui::Grid::new("toolchains")
-                    .num_columns(3)
+                    .num_columns(4)
                     .striped(true)
                     .spacing([16.0, 6.0])
                     .show(ui, |ui| {
                         ui.strong("Tool");
                         ui.strong("Status");
                         ui.strong("Provides");
+                        ui.strong("Install with");
                         ui.end_row();
 
                         for spec in editor_lsp::registry::ALL {
@@ -2013,25 +2043,32 @@ impl EditorApp {
                                         "Installed",
                                     )
                                     .on_hover_text(f.program.display().to_string());
+                                    ui.weak(spec.provides);
+                                    // Nothing to do, so nothing to copy.
+                                    ui.weak("\u{2014}");
                                 }
                                 None => {
                                     ui.weak("Not found");
+                                    ui.weak(spec.provides);
+                                    ui.horizontal(|ui| {
+                                        ui.code(spec.install);
+                                        if ui.small_button("Copy").clicked() {
+                                            ui.ctx().copy_text(spec.install.to_owned());
+                                        }
+                                    });
                                 }
                             }
-                            ui.weak(spec.provides);
                             ui.end_row();
                         }
                     });
 
                 ui.add_space(8.0);
                 ui.separator();
-                ui.label("To install:");
-                for (tool, how) in INSTALL_HINTS {
-                    ui.horizontal(|ui| {
-                        ui.weak(*tool);
-                        ui.code(*how);
-                    });
-                }
+                ui.small(
+                    "Paste the command into a terminal. `pip` installs into whichever Python \
+                     is on your PATH; to lint a project with its own virtual environment, \
+                     activate it first and The Editor will prefer the tools it finds there.",
+                );
 
                 ui.add_space(8.0);
                 if ui.button("Re-check").clicked() {
@@ -2647,19 +2684,6 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
     ),
 ];
 
-/// How to install each optional tool, for the toolchain window.
-///
-/// Commands rather than URLs: the answer to "it says not found" is a line to
-/// paste, and every one of these is a single command with no account, no
-/// download page and no cost — decision D9.
-const INSTALL_HINTS: &[(&str, &str)] = &[
-    ("rust-analyzer", "rustup component add rust-analyzer"),
-    ("Ruff", "pip install ruff"),
-    ("Pyright", "pip install basedpyright"),
-    ("python-lsp-server", "pip install python-lsp-server"),
-    ("Taplo", "cargo install taplo-cli --locked"),
-];
-
 /// Toolbar groups, separated by dividers.
 const TOOLBAR: &[&[CommandId]] = &[
     &[CommandId::NewFile, CommandId::OpenFile],
@@ -2851,11 +2875,13 @@ mod tests {
     }
 
     #[test]
-    fn every_optional_tool_has_an_install_hint() {
+    fn every_optional_tool_can_be_reported_missing_with_a_way_to_install_it() {
+        // The complaint that prompted this: the panel named three tools the
+        // user did not have and gave no next step.
         for spec in editor_lsp::registry::ALL {
             assert!(
-                INSTALL_HINTS.iter().any(|(name, _)| *name == spec.name),
-                "{} is listed in the toolchain window with no way to install it",
+                !spec.install.is_empty(),
+                "{} is listed as missing with no way to install it",
                 spec.name
             );
         }
