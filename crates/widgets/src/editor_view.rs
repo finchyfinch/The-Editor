@@ -20,6 +20,7 @@
 use editor_core::document::Document;
 use editor_core::edit::Transaction;
 use editor_core::selection::Selection;
+use editor_core::word;
 use editor_syntax::LanguageId;
 use editor_syntax::highlight::Highlighter;
 use editor_syntax::indent::{self, IndentOptions};
@@ -455,6 +456,7 @@ impl EditorView {
         use egui::Key;
 
         let extend = modifiers.shift;
+        let by_word = word_modifier(modifiers);
         self.touch();
 
         match key {
@@ -513,13 +515,28 @@ impl EditorView {
                     if self.selection.head == 0 {
                         return false;
                     }
-                    // Smart backspace: inside leading whitespace, delete back
-                    // to the previous tab stop rather than one space at a time.
-                    let back = self.backspace_width(doc, opts);
                     let head = self.selection.head;
-                    self.selection = Selection::new(head - back, head);
+                    let start = if by_word {
+                        // Ctrl+Backspace deletes the word, not the tab stop.
+                        word::prev_boundary(doc.text(), head)
+                    } else {
+                        // Smart backspace: inside leading whitespace, delete
+                        // back to the previous tab stop rather than one space
+                        // at a time.
+                        head - self.backspace_width(doc, opts)
+                    };
+                    // Deleting a whole word is one undo step, not one per
+                    // character, so the run has to be broken either side of it.
+                    if by_word {
+                        doc.break_undo_run();
+                    }
+                    self.selection = Selection::new(start, head);
                 }
-                self.delete_selection(doc)
+                let changed = self.delete_selection(doc);
+                if by_word {
+                    doc.break_undo_run();
+                }
+                changed
             }
             Key::Delete => {
                 if self.selection.is_empty() {
@@ -527,13 +544,35 @@ impl EditorView {
                     if head >= doc.len_chars() {
                         return false;
                     }
-                    self.selection = Selection::new(head, head + 1);
+                    let end = if by_word {
+                        word::next_boundary(doc.text(), head)
+                    } else {
+                        head + 1
+                    };
+                    if by_word {
+                        doc.break_undo_run();
+                    }
+                    self.selection = Selection::new(head, end);
                 }
-                self.delete_selection(doc)
+                let changed = self.delete_selection(doc);
+                if by_word {
+                    doc.break_undo_run();
+                }
+                changed
             }
             // Undo, redo and select-all are application commands, dispatched
             // through the registry so the menus and the keyboard agree. They
             // are deliberately not handled here.
+            Key::ArrowLeft if by_word => {
+                let target = word::prev_boundary(doc.text(), self.selection.head);
+                self.set_head(target, extend);
+                false
+            }
+            Key::ArrowRight if by_word => {
+                let target = word::next_boundary(doc.text(), self.selection.head);
+                self.set_head(target, extend);
+                false
+            }
             Key::ArrowLeft => {
                 self.move_horizontal(doc, -1, extend);
                 false
@@ -1387,6 +1426,20 @@ fn ccursor(index: usize) -> egui::text::CCursor {
     egui::text::CCursor::new(index)
 }
 
+/// Whether this key press means "by word" rather than "by character".
+///
+/// Ctrl on Windows and Linux; Option on macOS, where Cmd+arrow is start/end of
+/// line and Option+arrow is the word motion. `Modifiers::COMMAND` cannot be used
+/// because it maps to Cmd on macOS, which would put word motion on the one
+/// combination macOS users expect to do something else.
+fn word_modifier(modifiers: egui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.alt
+    } else {
+        modifiers.ctrl
+    }
+}
+
 /// Select the word around `offset`, for double-click.
 ///
 /// A "word" is a run of alphanumerics and underscores — which covers both
@@ -1432,6 +1485,148 @@ mod tests {
             Selection::at(text.chars().count()),
         );
         doc
+    }
+
+    /// Press a key with modifiers, as `handle_keys` would.
+    fn press(
+        view: &mut EditorView,
+        doc: &mut Document,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        view.handle_key(doc, EditorOptions::default(), key, modifiers, 20)
+    }
+
+    /// The platform's "by word" modifier, so these tests exercise the same
+    /// combination the user presses rather than a hard-coded Ctrl.
+    fn ctrl() -> egui::Modifiers {
+        if cfg!(target_os = "macos") {
+            egui::Modifiers::ALT
+        } else {
+            egui::Modifiers::CTRL
+        }
+    }
+
+    fn ctrl_shift() -> egui::Modifiers {
+        ctrl().plus(egui::Modifiers::SHIFT)
+    }
+
+    #[test]
+    fn word_motion_is_on_the_right_modifier_for_the_platform() {
+        // Cmd+arrow on macOS is start/end of line. Putting word motion there
+        // would take over a combination that already means something else.
+        assert!(word_modifier(ctrl()), "the platform modifier must work");
+        if cfg!(target_os = "macos") {
+            assert!(!word_modifier(egui::Modifiers::MAC_CMD));
+        } else {
+            assert!(!word_modifier(egui::Modifiers::ALT));
+        }
+        assert!(!word_modifier(egui::Modifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_arrow_moves_the_caret_a_word_at_a_time() {
+        let mut doc = doc_with("alpha beta_gamma delta");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+
+        press(&mut view, &mut doc, egui::Key::ArrowRight, ctrl());
+        assert_eq!(view.selection.head, 5, "the end of `alpha`");
+        press(&mut view, &mut doc, egui::Key::ArrowRight, ctrl());
+        assert_eq!(view.selection.head, 16, "the end of `beta_gamma`");
+        press(&mut view, &mut doc, egui::Key::ArrowLeft, ctrl());
+        assert_eq!(view.selection.head, 6, "the start of `beta_gamma`");
+    }
+
+    #[test]
+    fn plain_arrows_still_move_one_character() {
+        // The word motion must not swallow the ordinary case.
+        let mut doc = doc_with("abc");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        press(
+            &mut view,
+            &mut doc,
+            egui::Key::ArrowRight,
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(view.selection.head, 1);
+    }
+
+    #[test]
+    fn ctrl_shift_arrow_extends_the_selection_by_a_word() {
+        let mut doc = doc_with("alpha beta");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        press(&mut view, &mut doc, egui::Key::ArrowRight, ctrl_shift());
+        assert_eq!(view.selection.anchor, 0, "the anchor stays put");
+        assert_eq!(view.selection.head, 5);
+        assert_eq!(view.selected_text(&doc).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_the_word_before_the_caret() {
+        let mut doc = doc_with("alpha beta");
+        let mut view = EditorView::default();
+        view.set_caret(10);
+        assert!(press(&mut view, &mut doc, egui::Key::Backspace, ctrl()));
+        assert_eq!(doc.text().to_string(), "alpha ");
+    }
+
+    #[test]
+    fn ctrl_delete_deletes_the_word_after_the_caret() {
+        let mut doc = doc_with("alpha beta");
+        let mut view = EditorView::default();
+        view.set_caret(5);
+        assert!(press(&mut view, &mut doc, egui::Key::Delete, ctrl()));
+        assert_eq!(doc.text().to_string(), "alpha");
+    }
+
+    #[test]
+    fn deleting_a_word_is_one_undo_step() {
+        // Without breaking the undo run either side, a word deletion coalesces
+        // with whatever was typed before it and undo takes back too much.
+        let mut doc = doc_with("alpha beta");
+        let mut view = EditorView::default();
+        view.set_caret(10);
+        press(&mut view, &mut doc, egui::Key::Backspace, ctrl());
+        assert_eq!(doc.text().to_string(), "alpha ");
+        assert!(view.undo(&mut doc));
+        assert_eq!(doc.text().to_string(), "alpha beta", "one undo restores it");
+    }
+
+    #[test]
+    fn plain_backspace_still_deletes_to_the_tab_stop() {
+        // Smart backspace must survive the addition of the Ctrl variant.
+        let mut doc = doc_with("        x");
+        let mut view = EditorView::default();
+        view.set_caret(8);
+        press(
+            &mut view,
+            &mut doc,
+            egui::Key::Backspace,
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(doc.text().to_string(), "    x", "back to the tab stop");
+    }
+
+    #[test]
+    fn ctrl_backspace_with_a_selection_deletes_the_selection() {
+        // A word motion must not override an explicit selection.
+        let mut doc = doc_with("alpha beta gamma");
+        let mut view = EditorView::default();
+        view.select_range(6, 10);
+        press(&mut view, &mut doc, egui::Key::Backspace, ctrl());
+        assert_eq!(doc.text().to_string(), "alpha  gamma");
+    }
+
+    #[test]
+    fn ctrl_backspace_at_the_start_of_the_document_does_nothing() {
+        let mut doc = doc_with("alpha");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        assert!(!press(&mut view, &mut doc, egui::Key::Backspace, ctrl()));
+        assert_eq!(doc.text().to_string(), "alpha");
     }
 
     #[test]
