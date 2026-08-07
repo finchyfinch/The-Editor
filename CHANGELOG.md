@@ -10,6 +10,18 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Go to Definition (F12) and Find Uses (Shift+F12)**, from the Edit menu or
+  the editor's new right-click menu, with **Next/Previous Use (F8, Shift+F8)**
+  to walk the results. Uses the language server where one can answer, so it
+  works across files; falls back to a parse-tree search of the open file when
+  none is running, and says so, because a list that looks complete but only
+  covers one file is worse than an honest partial one. The fallback works off
+  the tree rather than a text search, so a name inside a string or a comment is
+  not counted as a use.
+- **A right-click menu in the editor**: Go to Definition, Find Uses, Cut, Copy,
+  Paste. Right-clicking moves the caret to the word under the pointer first,
+  since otherwise the menu acts on wherever the caret happened to be.
+
 - **Built-in syntax checking, with nothing installed.** Every language server is
   optional, but until now that meant a machine without one showed no diagnostics
   at all — a Python file containing `if bob = kate` looked perfectly healthy.
@@ -40,6 +52,22 @@ Entries are written as each milestone lands, not retroactively at release time.
   waiting. The panel now says so under the file's name.
 
 ### Fixed
+
+- **Pyright was rejected as unusable and never started.** The check that a
+  binary really works runs its version flag, and
+  `basedpyright-langserver --version` does not print a version — it fails with
+  "Connection input stream is not set", because it only ever expects to be
+  handed a transport. It is now taken on trust; the rustup-shim problem that
+  check exists for does not apply to it, and a binary that cannot speak LSP is
+  caught by the handshake anyway.
+- **Definition and reference requests went to whichever server got there
+  first**, which for Python is Ruff — a linter that cannot answer either. Each
+  server's advertised capabilities are now recorded from the handshake, and
+  only a server claiming `definitionProvider` or `referencesProvider` is asked.
+- **Find Uses results were walked in the server's order, not the file's.**
+  Pyright does not answer in document order, so F8 jumped about instead of
+  reading downwards. Results are sorted and de-duplicated, and the walk starts
+  from the result the caret is already on rather than from the top.
 
 - **A console window appeared behind the editor and stayed there.** A release
   build is a GUI application with no console of its own, so Windows allocated
