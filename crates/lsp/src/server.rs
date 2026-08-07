@@ -41,7 +41,10 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 pub enum Event {
     /// The handshake completed; the server is ready for documents.
-    Ready,
+    ///
+    /// Carries what the server said it can do, because the message is parsed
+    /// on the reader thread, which has no access to the `Server` to store it.
+    Ready { capabilities: Value },
     /// Diagnostics for one file.
     Diagnostics {
         path: PathBuf,
@@ -55,6 +58,21 @@ pub enum Event {
     Log(String),
     /// The process ended.
     Exited { restarting: bool },
+}
+
+/// Whether a capabilities object advertises a capability.
+///
+/// A free function so it can be tested without standing up a server process.
+/// The protocol allows `true` or an options object, and both mean yes; only
+/// `false`, `null` and absence mean no. rust-analyzer sends an options object
+/// for `referencesProvider` where pyright sends `true`, so handling only the
+/// boolean silently disables the feature for one of them.
+fn advertises(capabilities: &Value, capability: &str) -> bool {
+    match capabilities.get(capability) {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(supported)) => *supported,
+        Some(_) => true,
+    }
 }
 
 /// A running language server.
@@ -72,6 +90,13 @@ pub struct Server {
     /// When to try starting again after a crash.
     retry_at: Option<Instant>,
     ready: bool,
+    /// What the server said it can do, from the initialize response.
+    ///
+    /// Kept because "which server should answer this question" cannot be
+    /// decided from the registry: Ruff is a linter and serves Python, but
+    /// asking it where something is defined gets an error at best. Only the
+    /// server itself knows.
+    capabilities: Value,
 }
 
 impl std::fmt::Debug for Server {
@@ -104,6 +129,7 @@ impl Server {
             restarts: 0,
             retry_at: None,
             ready: false,
+            capabilities: Value::Null,
         };
         server.spawn()?;
         Ok(server)
@@ -190,6 +216,15 @@ impl Server {
         Ok(id)
     }
 
+    /// Whether the server advertised a capability, e.g. `definitionProvider`.
+    ///
+    /// The protocol allows `true` or an options object, and both mean yes; only
+    /// `false`, `null` and absence mean no.
+    #[must_use]
+    pub fn supports(&self, capability: &str) -> bool {
+        advertises(&self.capabilities, capability)
+    }
+
     /// Send a request with a freshly allocated id.
     ///
     /// # Errors
@@ -256,7 +291,10 @@ impl Server {
         let mut events = Vec::new();
         while let Ok(event) = self.events.try_recv() {
             match &event {
-                Event::Ready => self.ready = true,
+                Event::Ready { capabilities } => {
+                    self.ready = true;
+                    self.capabilities = capabilities.clone();
+                }
                 Event::Exited { .. } => {
                     self.on_exit(&mut events);
                     continue;
@@ -440,8 +478,10 @@ fn parse(text: &str, server_id: &str) -> Vec<Event> {
                 id,
                 result: result.clone(),
             }];
-            if result.get("capabilities").is_some() {
-                events.push(Event::Ready);
+            if let Some(capabilities) = result.get("capabilities") {
+                events.push(Event::Ready {
+                    capabilities: capabilities.clone(),
+                });
             }
             return events;
         }
@@ -650,6 +690,28 @@ mod tests {
     }
 
     #[test]
+    fn a_capability_may_be_true_or_an_options_object() {
+        let capabilities = json!({
+            "definitionProvider": true,
+            "referencesProvider": { "workDoneProgress": false },
+            "renameProvider": false,
+            "hoverProvider": null,
+        });
+        assert!(advertises(&capabilities, "definitionProvider"));
+        assert!(
+            advertises(&capabilities, "referencesProvider"),
+            "an options object means yes"
+        );
+        assert!(!advertises(&capabilities, "renameProvider"), "false is no");
+        assert!(!advertises(&capabilities, "hoverProvider"), "null is no");
+        assert!(!advertises(&capabilities, "neverHeardOfIt"), "absent is no");
+        assert!(
+            !advertises(&Value::Null, "definitionProvider"),
+            "nothing is supported before the handshake"
+        );
+    }
+
+    #[test]
     fn the_initialize_response_signals_readiness() {
         let message = json!({
             "jsonrpc": "2.0",
@@ -660,7 +722,7 @@ mod tests {
 
         let events = parse(&message, "test");
         assert!(
-            events.iter().any(|e| matches!(e, Event::Ready)),
+            events.iter().any(|e| matches!(e, Event::Ready { .. })),
             "got {events:?}"
         );
         assert!(
@@ -674,7 +736,7 @@ mod tests {
     fn an_ordinary_response_does_not_signal_readiness() {
         let message = json!({ "jsonrpc": "2.0", "id": 7, "result": [] }).to_string();
         let events = parse(&message, "test");
-        assert!(!events.iter().any(|e| matches!(e, Event::Ready)));
+        assert!(!events.iter().any(|e| matches!(e, Event::Ready { .. })));
     }
 
     #[test]

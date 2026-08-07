@@ -176,6 +176,18 @@ impl Highlighter {
         }
     }
 
+    /// The parse tree, for callers that need to read structure rather than
+    /// colour — `symbols`, and the error walk below.
+    ///
+    /// `None` for the INI fallback, which has no grammar behind it.
+    #[must_use]
+    pub fn tree(&self) -> Option<&tree_sitter::Tree> {
+        match self {
+            Self::Tree(t) => t.tree.as_ref(),
+            Self::Ini => None,
+        }
+    }
+
     /// Where the parser lost the thread, from the tree it already holds.
     ///
     /// This is what makes broken code visible with no language server

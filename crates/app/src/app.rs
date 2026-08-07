@@ -93,6 +93,32 @@ enum Pending {
     Quit,
 }
 
+/// A place to jump to. `path` is `None` for the file already showing, which is
+/// how an untitled buffer's own results still work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    path: Option<PathBuf>,
+    /// Zero-based, as the protocol and the parse tree both give them.
+    line: usize,
+    column: usize,
+}
+
+/// The state behind Find Uses and its next/previous walk.
+#[derive(Debug, Default)]
+struct UseResults {
+    /// The name being tracked, for the status message.
+    name: String,
+    locations: Vec<Target>,
+    /// Which result the caret is on.
+    index: usize,
+    /// True when the results came from the parse-tree fallback, which only
+    /// ever searches the open file. Said out loud, because a list that looks
+    /// complete but is not is worse than no list.
+    local_only: bool,
+    /// A question asked of a language server and not yet answered.
+    pending: Option<editor_lsp::session::Query>,
+}
+
 /// One open document, its view state, and its tab state.
 #[derive(Debug)]
 struct OpenDoc {
@@ -178,6 +204,8 @@ pub(crate) struct EditorApp {
     pending_recent: Option<PathBuf>,
     /// A file or folder awaiting a yes/no before it is moved to the trash.
     pending_delete: Option<PathBuf>,
+    /// Results of the last Find Uses, and where in them the user is.
+    uses: UseResults,
 
     lsp: editor_lsp::session::Lsp,
     /// Which bottom-dock tab is showing.
@@ -244,6 +272,7 @@ impl EditorApp {
             recent: Vec::new(),
             pending_recent: None,
             pending_delete: None,
+            uses: UseResults::default(),
             lsp: editor_lsp::session::Lsp::default(),
             dock: DockTab::default(),
             synced: std::collections::HashMap::new(),
@@ -892,6 +921,218 @@ impl EditorApp {
         open_toolchains
     }
 
+    /// The name the caret is on, for messages about a server's answer.
+    fn symbol_under_caret(&self) -> Option<String> {
+        let entry = self.active.and_then(|i| self.docs.get(i))?;
+        let tree = entry.highlighter.as_ref().and_then(Highlighter::tree)?;
+        editor_syntax::symbols::identifier_at(tree, entry.doc.text(), entry.view.selection.head)
+            .map(|s| s.name)
+    }
+
+    /// Go to Definition / Find Uses, from the menu, F12 or the context menu.
+    ///
+    /// Asks the language server first and falls back to a parse-tree search of
+    /// the open file. The fallback is genuinely weaker — one file, no scope, no
+    /// imports — so it says so rather than letting a partial answer pass for a
+    /// complete one.
+    fn ask_about_symbol(&mut self, query: editor_lsp::session::Query) {
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            return;
+        };
+        let caret = entry.view.selection.head;
+        let (line, column) = entry.doc.line_col(caret);
+        // `line_col` is one-based for the status bar; the protocol is not.
+        let (line, column) = (line as u32 - 1, column as u32 - 1);
+
+        if let Some(path) = entry.doc.path().map(Path::to_path_buf)
+            && self.lsp.ask(query, &path, line, column)
+        {
+            // The answer arrives through `poll`, possibly several frames later.
+            self.uses.pending = Some(query);
+            return;
+        }
+
+        self.answer_locally(query, caret);
+    }
+
+    /// The no-language-server path: search the open file's parse tree.
+    fn answer_locally(&mut self, query: editor_lsp::session::Query, caret: usize) {
+        use editor_lsp::session::Query;
+        use editor_syntax::symbols;
+
+        let Some(index) = self.active else { return };
+        let Some(entry) = self.docs.get(index) else {
+            return;
+        };
+        let Some(tree) = entry.highlighter.as_ref().and_then(Highlighter::tree) else {
+            self.info("This file has no grammar, so there is nothing to search");
+            return;
+        };
+        let text = entry.doc.text();
+
+        let Some(symbol) = symbols::identifier_at(tree, text, caret) else {
+            self.info("Put the caret on a name first");
+            return;
+        };
+
+        let ranges: Vec<std::ops::Range<usize>> = match query {
+            Query::Definition => symbols::definitions(tree, text, &symbol.name),
+            Query::References => symbols::occurrences(tree, text, &symbol.name)
+                .into_iter()
+                .map(|o| o.range)
+                .collect(),
+        };
+
+        if ranges.is_empty() {
+            self.info(format!(
+                "No {} of `{}` in this file (no language server, so other files were not searched)",
+                query.noun(),
+                symbol.name
+            ));
+            return;
+        }
+
+        let path = entry.doc.path().map(Path::to_path_buf);
+        let locations: Vec<Target> = ranges
+            .iter()
+            .map(|range| {
+                let (line, column) = entry.doc.line_col(range.start);
+                Target {
+                    path: path.clone(),
+                    line: line - 1,
+                    column: column - 1,
+                }
+            })
+            .collect();
+
+        self.land_on(query, symbol.name, locations, true);
+    }
+
+    /// Take a set of results and go to the first one.
+    fn land_on(
+        &mut self,
+        query: editor_lsp::session::Query,
+        name: String,
+        locations: Vec<Target>,
+        local_only: bool,
+    ) {
+        use editor_lsp::session::Query;
+
+        self.uses.pending = None;
+        if locations.is_empty() {
+            self.info(format!("No {} found", query.noun()));
+            return;
+        }
+        let first = locations[0].clone();
+
+        if query == Query::Definition {
+            // A definition is a jump, not a list: keeping the previous Find
+            // Uses results means F8 still walks what the user was walking.
+            self.go_to(&first);
+            if locations.len() > 1 {
+                self.info(format!("{} definitions of `{name}`", locations.len()));
+            }
+            return;
+        }
+
+        // Servers answer in whatever order suits their index -- pyright does
+        // not return references in document order -- so F8 would otherwise jump
+        // about the file rather than walking down it.
+        let mut locations = locations;
+        locations.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.line.cmp(&b.line))
+                .then(a.column.cmp(&b.column))
+        });
+        locations.dedup();
+
+        // Start from the result the caret is already on, if it is one of them,
+        // so the first F8 moves to the *next* use rather than back to the top.
+        let start = self.current_location_index(&locations).unwrap_or(0);
+        let first = locations[start].clone();
+
+        let count = locations.len();
+        self.uses = UseResults {
+            name,
+            locations,
+            index: start,
+            local_only,
+            pending: None,
+        };
+        self.go_to(&first);
+        self.info(format!(
+            "{} of {count}{}  \u{2014}  F8 next, Shift+F8 previous",
+            start + 1,
+            if local_only { " in this file" } else { "" }
+        ));
+    }
+
+    /// Which result the caret is already sitting on, if any.
+    ///
+    /// Find Uses is normally run with the caret on one of its own results, so
+    /// starting at index 0 would mean the first F8 jumped back to the top of
+    /// the file before going anywhere useful.
+    fn current_location_index(&self, locations: &[Target]) -> Option<usize> {
+        let entry = self.active.and_then(|i| self.docs.get(i))?;
+        let here = entry.doc.path();
+        let (line, column) = entry.doc.line_col(entry.view.selection.head);
+        let (line, column) = (line - 1, column - 1);
+
+        locations.iter().position(|target| {
+            let same_file = match (&target.path, here) {
+                (Some(path), Some(current)) => path == current,
+                (None, _) => true,
+                _ => false,
+            };
+            // Column is not compared: the caret can be anywhere within the
+            // name, and the result points at its first character.
+            same_file && target.line == line && target.column <= column
+        })
+    }
+
+    /// Step through the Find Uses results.
+    fn step_use(&mut self, direction: isize) {
+        let count = self.uses.locations.len();
+        if count == 0 {
+            self.info("Nothing to step through \u{2014} run Find Uses first");
+            return;
+        }
+        // Wraps, like Find Next, so walking off the end returns to the start
+        // rather than stopping with no explanation.
+        let next = (self.uses.index as isize + direction).rem_euclid(count as isize) as usize;
+        self.uses.index = next;
+        let target = self.uses.locations[next].clone();
+        self.go_to(&target);
+        self.info(format!(
+            "{} of {count} \u{2014} `{}`{}",
+            next + 1,
+            self.uses.name,
+            // Repeated on every step, not just the first: after three F8s the
+            // opening message is long gone and the list still is not complete.
+            if self.uses.local_only {
+                " in this file"
+            } else {
+                ""
+            }
+        ));
+    }
+
+    /// Move the caret to a result, opening its file if it is not already open.
+    fn go_to(&mut self, target: &Target) {
+        match &target.path {
+            Some(path) => self.open_at(path, target.line, target.column),
+            // A result in the file already showing, which may be untitled.
+            None => {
+                if let Some(entry) = self.active_mut() {
+                    let offset = entry.doc.offset_at(target.line, target.column);
+                    entry.view.set_caret(offset);
+                    entry.view.focus();
+                }
+            }
+        }
+    }
+
     /// Open a file and put the caret at a zero-based line and column.
     fn open_at(&mut self, path: &Path, line: usize, column: usize) {
         self.open_path(path, false);
@@ -964,6 +1205,32 @@ impl EditorApp {
                     }
                 }
                 editor_lsp::session::Notice::DiagnosticsChanged(_) => {}
+                editor_lsp::session::Notice::Answered { query, locations } => {
+                    // A stale answer to a question the user has moved on from
+                    // would yank the caret somewhere unexpected.
+                    if self.uses.pending != Some(query) {
+                        continue;
+                    }
+                    if locations.is_empty() {
+                        // The server knows the project and still found nothing,
+                        // so falling back to a text-shaped search of one file
+                        // would only produce a worse answer to the same
+                        // question.
+                        self.uses.pending = None;
+                        self.info(format!("No {} found", query.noun()));
+                        continue;
+                    }
+                    let name = self.symbol_under_caret().unwrap_or_default();
+                    let targets = locations
+                        .into_iter()
+                        .map(|l| Target {
+                            path: Some(l.path),
+                            line: l.line as usize,
+                            column: l.column as usize,
+                        })
+                        .collect();
+                    self.land_on(query, name, targets, false);
+                }
             }
         }
     }
@@ -1660,6 +1927,14 @@ impl EditorApp {
                 self.persist_settings();
             }
 
+            CommandId::GoToDefinition => {
+                self.ask_about_symbol(editor_lsp::session::Query::Definition);
+            }
+            CommandId::FindUses => {
+                self.ask_about_symbol(editor_lsp::session::Query::References);
+            }
+            CommandId::NextUse => self.step_use(1),
+            CommandId::PreviousUse => self.step_use(-1),
             CommandId::CommandPalette => self.palette.open(),
             CommandId::OpenSettings => self.settings_form.open(&self.settings),
             CommandId::OpenSettingsFile => {
@@ -2516,6 +2791,23 @@ impl eframe::App for EditorApp {
         self.delete_prompt(&ctx);
         self.toasts_ui(&ctx);
 
+        // The editor's right-click menu, drained after the frame it was used in
+        // so nothing mutates the document while it is being painted.
+        if let Some(action) = self
+            .active
+            .and_then(|i| self.docs.get_mut(i))
+            .and_then(|e| e.view.take_context_action())
+        {
+            use editor_widgets::editor_view::ContextAction;
+            match action {
+                ContextAction::GoToDefinition => {
+                    self.run_command(CommandId::GoToDefinition, &ctx);
+                }
+                ContextAction::FindUses => self.run_command(CommandId::FindUses, &ctx),
+                ContextAction::Paste => self.run_command(CommandId::Paste, &ctx),
+            }
+        }
+
         // Opening happens after the menu closes, so the tree and tab bar are
         // not mutated while they are being drawn.
         if let Some(path) = self.pending_recent.take() {
@@ -2931,6 +3223,11 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::Replace),
             MenuEntry::Item(CommandId::FindNext),
             MenuEntry::Item(CommandId::FindPrevious),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::GoToDefinition),
+            MenuEntry::Item(CommandId::FindUses),
+            MenuEntry::Item(CommandId::NextUse),
+            MenuEntry::Item(CommandId::PreviousUse),
         ],
     ),
     (
@@ -3227,6 +3524,76 @@ mod tests {
         assert_eq!(next_theme_command("Dark"), CommandId::ThemeLight);
         assert_eq!(next_theme_command("Light"), CommandId::ThemeSystem);
         assert_eq!(next_theme_command("Follow System"), CommandId::ThemeDark);
+    }
+
+    /// Servers do not answer in document order. pyright returned the uses of
+    /// one function as helpers.py:4, main.py:9, main.py:7 — so pressing F8
+    /// walked *up* the file, which reads as the feature being broken.
+    #[test]
+    fn results_are_sorted_into_document_order_and_deduped() {
+        let a = PathBuf::from("/p/a.py");
+        let b = PathBuf::from("/p/b.py");
+        let mut locations = vec![
+            Target {
+                path: Some(b.clone()),
+                line: 8,
+                column: 4,
+            },
+            Target {
+                path: Some(a.clone()),
+                line: 3,
+                column: 0,
+            },
+            Target {
+                path: Some(b.clone()),
+                line: 6,
+                column: 11,
+            },
+            Target {
+                path: Some(b.clone()),
+                line: 6,
+                column: 4,
+            },
+            // The same place twice: two servers, or a server listing the
+            // declaration alongside a reference to it.
+            Target {
+                path: Some(a.clone()),
+                line: 3,
+                column: 0,
+            },
+        ];
+        locations.sort_by(|x, y| {
+            x.path
+                .cmp(&y.path)
+                .then(x.line.cmp(&y.line))
+                .then(x.column.cmp(&y.column))
+        });
+        locations.dedup();
+
+        let seen: Vec<(String, usize, usize)> = locations
+            .iter()
+            .map(|t| {
+                (
+                    t.path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    t.line,
+                    t.column,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a.py".to_owned(), 3, 0),
+                ("b.py".to_owned(), 6, 4),
+                ("b.py".to_owned(), 6, 11),
+                ("b.py".to_owned(), 8, 4),
+            ],
+            "results must read down the file, and not repeat"
+        );
     }
 
     #[test]

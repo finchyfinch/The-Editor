@@ -88,6 +88,8 @@ pub struct EditorView {
     current_match: Option<std::ops::Range<usize>>,
     /// Diagnostic underlines, supplied by the application each frame.
     diagnostics: Vec<Underline>,
+    /// Set by the context menu, taken by the application next frame.
+    context_action: Option<ContextAction>,
 }
 
 /// A range to underline, and how seriously.
@@ -221,6 +223,11 @@ impl EditorView {
         self.diagnostics = diagnostics;
     }
 
+    /// Taken by the application after each frame; see [`ContextAction`].
+    pub fn take_context_action(&mut self) -> Option<ContextAction> {
+        self.context_action.take()
+    }
+
     /// Ranges to highlight as search results, and which of them is current.
     ///
     /// Set once per frame before drawing; cleared when the find bar closes.
@@ -308,6 +315,62 @@ impl EditorView {
 
                 changed |=
                     self.handle_mouse(ui, doc, &response, &font, rect, text_left, row_height);
+
+                // Right-clicking moves the caret to the word under the pointer
+                // before the menu opens. Otherwise "Go to Definition" acts on
+                // wherever the caret happened to be, which is almost never
+                // what was right-clicked.
+                if response.secondary_clicked()
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    let offset =
+                        self.offset_at_pos(ui, doc, &font, pos, rect, text_left, row_height);
+                    if !self.selection.range().contains(&offset) {
+                        self.selection = Selection::at(offset);
+                        self.goal_column = None;
+                    }
+                    response.request_focus();
+                }
+
+                response.context_menu(|ui| {
+                    if ui.button("Go to Definition").clicked() {
+                        self.context_action = Some(ContextAction::GoToDefinition);
+                        ui.close();
+                    }
+                    if ui.button("Find Uses").clicked() {
+                        self.context_action = Some(ContextAction::FindUses);
+                        ui.close();
+                    }
+                    ui.separator();
+                    let has_selection = !self.selection.is_empty();
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Cut"))
+                        .clicked()
+                    {
+                        if let Some(text) = self.selected_text(doc) {
+                            ui.ctx().copy_text(text);
+                            doc.break_undo_run();
+                            self.delete_selection(doc);
+                            doc.break_undo_run();
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Copy"))
+                        .clicked()
+                    {
+                        if let Some(text) = self.selected_text(doc) {
+                            ui.ctx().copy_text(text);
+                        }
+                        ui.close();
+                    }
+                    // Paste needs the system clipboard, which this crate does
+                    // not reach; the application has it.
+                    if ui.button("Paste").clicked() {
+                        self.context_action = Some(ContextAction::Paste);
+                        ui.close();
+                    }
+                });
                 if response.has_focus() {
                     changed |= self.handle_keys(ui, doc, opts, rows_per_page);
                 }
@@ -1424,6 +1487,18 @@ fn visual_width(text: &str, tab_width: usize) -> usize {
 
 fn ccursor(index: usize) -> egui::text::CCursor {
     egui::text::CCursor::new(index)
+}
+
+/// Something the editor's right-click menu asked the application to do.
+///
+/// Returned rather than performed, because every one of these needs something
+/// the widget does not have: the project's language servers, the whole file
+/// tree, the system clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    GoToDefinition,
+    FindUses,
+    Paste,
 }
 
 /// Whether this key press means "by word" rather than "by character".

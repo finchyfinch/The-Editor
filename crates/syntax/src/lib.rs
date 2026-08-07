@@ -8,6 +8,7 @@
 pub mod errors;
 pub mod highlight;
 pub mod indent;
+pub mod symbols;
 pub mod templates;
 pub mod theme;
 

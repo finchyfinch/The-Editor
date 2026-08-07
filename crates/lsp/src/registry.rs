@@ -77,7 +77,14 @@ pub const PYRIGHT: ServerSpec = ServerSpec {
     args: &["--stdio"],
     provides: "types, completion, go to definition",
     install: "pip install basedpyright",
-    version_arg: Some("--version"),
+    // No version check. `basedpyright-langserver --version` does not print a
+    // version: it fails with "Connection input stream is not set", because the
+    // binary only ever expects to be handed a transport. Probing it therefore
+    // rejects a server that works perfectly. There is no shim to guard against
+    // here in any case -- the rustup case that `version_arg` exists for does
+    // not apply -- and a binary that cannot speak LSP is caught by the
+    // handshake and the crash-recovery path behind it.
+    version_arg: None,
 };
 
 /// A fallback Python server for people who already use it.

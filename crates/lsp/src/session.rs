@@ -28,6 +28,49 @@ use crate::server::{self, Event, Server};
 /// other.
 pub const BUILTIN_SOURCE: &str = "syntax";
 
+/// A question asked of a language server that returns places in the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Query {
+    /// Where is the thing under the caret defined?
+    Definition,
+    /// Where else is it used?
+    References,
+}
+
+impl Query {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Definition => "textDocument/definition",
+            Self::References => "textDocument/references",
+        }
+    }
+
+    /// The capability a server must advertise to be worth asking.
+    fn capability(self) -> &'static str {
+        match self {
+            Self::Definition => "definitionProvider",
+            Self::References => "referencesProvider",
+        }
+    }
+
+    /// For messages: "no definition found", "no uses found".
+    #[must_use]
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Definition => "definition",
+            Self::References => "uses",
+        }
+    }
+}
+
+/// Somewhere in the project, in the protocol's zero-based line and column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub line: u32,
+    pub column: u32,
+}
+
 /// What happened that the application should react to.
 #[derive(Debug, Clone)]
 pub enum Notice {
@@ -35,6 +78,12 @@ pub enum Notice {
     DiagnosticsChanged(PathBuf),
     /// A server became usable.
     ServerReady(&'static str),
+    /// A [`Query`] came back. An empty list means the server had no answer,
+    /// which is different from no server having been asked.
+    Answered {
+        query: Query,
+        locations: Vec<Location>,
+    },
     /// A server died. `restarting` is false once it has given up.
     ServerDied {
         id: &'static str,
@@ -65,6 +114,11 @@ pub struct Lsp {
     /// Servers that were wanted but could not be found, so the toolchain check
     /// can say which and the editor does not retry them every keystroke.
     missing: Vec<ServerSpec>,
+    /// Requests sent and not yet answered, keyed by server and request id.
+    ///
+    /// Request ids are allocated per server, so the server id has to be part of
+    /// the key or two servers would collide on id 1.
+    pending: HashMap<(&'static str, i64), Query>,
 }
 
 impl Lsp {
@@ -86,6 +140,7 @@ impl Lsp {
         self.documents.clear();
         self.diagnostics.clear();
         self.missing.clear();
+        self.pending.clear();
     }
 
     #[must_use]
@@ -220,6 +275,51 @@ impl Lsp {
         }
     }
 
+    /// Ask a server where something is defined, or where else it is used.
+    ///
+    /// Returns false if nothing could be asked — no server for this language,
+    /// none running yet, or the file was never opened — so the caller knows to
+    /// fall back rather than waiting for an answer that is not coming.
+    ///
+    /// Only the first server that knows the file is asked. Two servers on one
+    /// Python file would both answer, and merging "where is this defined"
+    /// results from a linter and a type checker produces a list with the same
+    /// place in it twice.
+    pub fn ask(&mut self, query: Query, path: &Path, line: u32, column: u32) -> bool {
+        let Some(document) = self.documents.get(path) else {
+            return false;
+        };
+        let told = document.told.clone();
+        let uri = server::path_to_uri(path);
+
+        for id in told {
+            let Some(server) = self.servers.get_mut(id) else {
+                continue;
+            };
+            // Ruff serves Python and cannot answer either of these. Asking it
+            // anyway gets a "method not found" and, worse, stops the loop
+            // before the server that *can* answer is reached.
+            if !server.is_ready() || !server.supports(query.capability()) {
+                continue;
+            }
+            let mut params = json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": column },
+            });
+            if query == Query::References {
+                // Without this the definition itself is left out of the list,
+                // and "find uses" that skips the declaration is confusing when
+                // there is only one use.
+                params["context"] = json!({ "includeDeclaration": true });
+            }
+            if let Ok(request) = server.send_request(query.method(), params) {
+                self.pending.insert((id, request), query);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Tell the servers a file is closed, and forget its diagnostics.
     pub fn close(&mut self, path: &Path) {
         // Diagnostics go first and unconditionally. A server can publish for a
@@ -286,7 +386,7 @@ impl Lsp {
             };
             let spec = server.spec();
             let events = server.poll();
-            let became_ready = events.iter().any(|e| matches!(e, Event::Ready));
+            let became_ready = events.iter().any(|e| matches!(e, Event::Ready { .. }));
 
             for event in events {
                 match event {
@@ -315,8 +415,18 @@ impl Lsp {
                     } => {
                         tracing::debug!(server = id, request, "request failed: {message}");
                     }
-                    Event::Ready => {}
-                    Event::Response { .. } => {}
+                    Event::Ready { .. } => {}
+                    Event::Response {
+                        id: request,
+                        result,
+                    } => {
+                        if let Some(query) = self.pending.remove(&(id, request)) {
+                            notices.push(Notice::Answered {
+                                query,
+                                locations: parse_locations(&result),
+                            });
+                        }
+                    }
                 }
             }
 
@@ -367,9 +477,117 @@ impl Drop for Lsp {
     }
 }
 
+/// Read a `Location`, `Location[]` or `LocationLink[]` out of a response.
+///
+/// The protocol allows all three for `textDocument/definition`, and servers
+/// genuinely differ: `rust-analyzer` sends `LocationLink`s, `pyright` sends
+/// plain `Location`s, and a server with nothing to say sends `null`. Handling
+/// only one shape means the feature works for one language and silently does
+/// nothing for the other.
+fn parse_locations(result: &serde_json::Value) -> Vec<Location> {
+    fn one(value: &serde_json::Value) -> Option<Location> {
+        // `LocationLink` names things differently from `Location`; take
+        // whichever pair is present.
+        let uri = value
+            .get("uri")
+            .or_else(|| value.get("targetUri"))?
+            .as_str()?;
+        let range = value
+            .get("range")
+            .or_else(|| value.get("targetSelectionRange"))
+            .or_else(|| value.get("targetRange"))?;
+        let start = range.get("start")?;
+        Some(Location {
+            path: server::uri_to_path(uri)?,
+            line: u32::try_from(start.get("line")?.as_u64()?).ok()?,
+            column: u32::try_from(start.get("character")?.as_u64()?).ok()?,
+        })
+    }
+
+    match result {
+        serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+        serde_json::Value::Object(_) => one(result).into_iter().collect(),
+        // `null` is a valid answer meaning "I do not know".
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rust-analyzer` answers with `LocationLink`, `pyright` with `Location`,
+    /// and a server with nothing to say answers `null`. Handling one shape
+    /// means the feature works for one language and silently does nothing for
+    /// the other.
+    #[test]
+    fn every_shape_the_protocol_allows_is_understood() {
+        let uri = server::path_to_uri(Path::new("/project/main.py"));
+
+        let single = json!({
+            "uri": uri,
+            "range": { "start": { "line": 4, "character": 8 },
+                       "end": { "line": 4, "character": 13 } }
+        });
+        let from_single = parse_locations(&single);
+        assert_eq!(from_single.len(), 1, "a bare Location");
+        assert_eq!(from_single[0].line, 4);
+        assert_eq!(from_single[0].column, 8);
+
+        let array = json!([single]);
+        assert_eq!(parse_locations(&array).len(), 1, "a Location array");
+
+        let link = json!([{
+            "targetUri": uri,
+            "targetSelectionRange": { "start": { "line": 9, "character": 3 },
+                                      "end": { "line": 9, "character": 7 } }
+        }]);
+        let from_link = parse_locations(&link);
+        assert_eq!(from_link.len(), 1, "a LocationLink array");
+        assert_eq!(from_link[0].line, 9);
+
+        assert!(
+            parse_locations(&serde_json::Value::Null).is_empty(),
+            "null means the server had no answer"
+        );
+        assert!(parse_locations(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_entry_is_skipped_rather_than_taking_the_rest_with_it() {
+        // One server sending something unexpected must not lose the results
+        // from the entries either side of it.
+        let uri = server::path_to_uri(Path::new("/project/main.py"));
+        let mixed = json!([
+            { "uri": uri, "range": { "start": { "line": 1, "character": 0 } } },
+            { "nonsense": true },
+            { "uri": uri, "range": { "start": { "line": 2, "character": 0 } } },
+        ]);
+        assert_eq!(parse_locations(&mixed).len(), 2);
+    }
+
+    #[test]
+    fn asking_with_no_server_running_says_so_rather_than_waiting() {
+        // The caller uses this to decide whether to fall back to the in-file
+        // search; a silent false-positive would mean no answer ever appears.
+        let mut lsp = Lsp::default();
+        assert!(!lsp.ask(Query::Definition, Path::new("/project/main.py"), 0, 0));
+    }
+
+    /// Ruff serves Python and cannot answer either query. Sending it a
+    /// definition request gets "method not found" and, worse, means the server
+    /// that *can* answer is never reached.
+    #[test]
+    fn a_query_only_goes_to_a_server_that_advertises_it() {
+        assert_eq!(Query::Definition.capability(), "definitionProvider");
+        assert_eq!(Query::References.capability(), "referencesProvider");
+    }
+
+    #[test]
+    fn the_two_queries_use_the_methods_the_protocol_defines() {
+        assert_eq!(Query::Definition.method(), "textDocument/definition");
+        assert_eq!(Query::References.method(), "textDocument/references");
+    }
 
     #[test]
     fn a_language_with_no_server_is_free() {
@@ -652,7 +870,7 @@ while True:
         let mut ready = false;
         while std::time::Instant::now() < deadline && !ready {
             for event in server.poll() {
-                if matches!(event, crate::server::Event::Ready) {
+                if matches!(event, crate::server::Event::Ready { .. }) {
                     ready = true;
                 }
             }
