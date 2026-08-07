@@ -359,7 +359,7 @@ fn spawn_waiter(
 pub fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        let _ = crate::spawn::quiet("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

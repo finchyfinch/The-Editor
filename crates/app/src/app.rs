@@ -781,6 +781,22 @@ impl EditorApp {
                         ui.weak(format!("({})", diagnostics.len()));
                     });
 
+                    // A file that does not parse cannot be analysed further by
+                    // anything. Ruff reports the syntax error and stops;
+                    // Pyright does the same. Without saying so, a missing
+                    // import that goes unreported below a syntax error looks
+                    // like the linter failing rather than waiting.
+                    if has_syntax_error(&diagnostics) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.weak(
+                                "\u{2139} This file does not parse, so nothing can check it \
+                                 beyond its syntax. Fix the error above and the rest \
+                                 will follow.",
+                            );
+                        });
+                    }
+
                     for diagnostic in diagnostics {
                         ui.horizontal(|ui| {
                             ui.add_space(12.0);
@@ -2441,6 +2457,17 @@ fn read_clipboard() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Whether a file failed to parse, as opposed to merely having problems.
+///
+/// Keyed off the built-in check's reserved source, which is the one thing that
+/// definitely ran: a machine with no language server still gets the note, and a
+/// machine with three does not get it three times.
+fn has_syntax_error(diagnostics: &[editor_lsp::diagnostics::Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|d| d.source == editor_lsp::session::BUILTIN_SOURCE)
+}
+
 /// A parser error, as a diagnostic.
 ///
 /// Reported as an error rather than a warning because it is not a matter of
@@ -2818,6 +2845,42 @@ mod tests {
                 .all(|d| d.severity == editor_lsp::diagnostics::Severity::Error),
             "a file that does not parse is an error, not a suggestion"
         );
+    }
+
+    /// A file that does not parse gets the "nothing else can check this" note;
+    /// a file that merely has lint findings must not.
+    #[test]
+    fn the_unparseable_note_appears_only_when_the_parse_failed() {
+        let syntax = to_diagnostic(editor_syntax::errors::SyntaxError {
+            line: 0,
+            column: 0,
+            end_line: 0,
+            end_column: 4,
+            message: "Syntax error: `oops`".to_owned(),
+        });
+        let lint = editor_lsp::diagnostics::Diagnostic {
+            severity: editor_lsp::diagnostics::Severity::Warning,
+            line: 0,
+            column: 0,
+            end_line: 0,
+            end_column: 3,
+            message: "Undefined name `sys`".to_owned(),
+            code: Some("F821".to_owned()),
+            source: "Ruff".to_owned(),
+        };
+
+        assert!(has_syntax_error(&[syntax.clone(), lint.clone()]));
+        assert!(!has_syntax_error(&[lint]));
+        assert!(!has_syntax_error(&[]));
+
+        // Ruff also reports the parse failure. The note must not double up, so
+        // it keys off our own source rather than on anything the servers say.
+        let ruff_syntax = editor_lsp::diagnostics::Diagnostic {
+            message: "invalid-syntax: Expected `:`, found `=`".to_owned(),
+            source: "Ruff".to_owned(),
+            ..syntax.clone()
+        };
+        assert!(!has_syntax_error(&[ruff_syntax]));
     }
 
     #[test]

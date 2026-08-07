@@ -708,7 +708,7 @@ while True:
         } {
             if let Some(path) = registry::which(name, &[])
                 && !path.to_string_lossy().contains("WindowsApps")
-                && std::process::Command::new(&path)
+                && editor_proc::spawn::quiet(&path)
                     .arg("--version")
                     .output()
                     .is_ok_and(|o| o.status.success())

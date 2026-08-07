@@ -33,8 +33,23 @@ Entries are written as each milestone lands, not retroactively at release time.
   checking the file, and says so explicitly when only the built-in syntax check
   is running.
 
+- **The Problems panel says when a file cannot be checked any further.** A file
+  that does not parse stops every linter dead — Ruff reports the syntax error
+  and nothing else, and so does Pyright — so a missing import that goes
+  unreported below a syntax error looks like the linter failing rather than
+  waiting. The panel now says so under the file's name.
+
 ### Fixed
 
+- **A console window appeared behind the editor and stayed there.** A release
+  build is a GUI application with no console of its own, so Windows allocated
+  one for each language server it started; a long-lived server meant a black
+  window for the whole session. Every background spawn — language servers,
+  version probes, interpreter detection, `taskkill` — now goes through
+  `editor_proc::spawn::quiet`, which sets `CREATE_NO_WINDOW`. Reproduced and
+  confirmed fixed for both `ruff` and `basedpyright-langserver`. The run console
+  is unaffected: it uses a pseudo-terminal precisely so its output *is* visible,
+  inside the editor.
 - **An egui ID clash painted a warning banner over the tab bar.** The tab bar
   and the editor view are laid out one after another in the same panel, and both
   took egui's automatically generated scroll-area id — which is derived from how

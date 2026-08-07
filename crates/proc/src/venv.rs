@@ -124,7 +124,7 @@ fn version_key(version: &str) -> (u32, u32, u32) {
 
 /// Ask the Windows `py` launcher what it knows about.
 fn py_launcher_installs() -> Vec<PathBuf> {
-    let Ok(output) = std::process::Command::new("py").arg("-0p").output() else {
+    let Ok(output) = crate::spawn::quiet("py").arg("-0p").output() else {
         return Vec::new();
     };
     if !output.status.success() {

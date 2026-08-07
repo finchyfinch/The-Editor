@@ -875,6 +875,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "editor-core",
+ "editor-proc",
  "lsp-types",
  "serde",
  "serde_json",

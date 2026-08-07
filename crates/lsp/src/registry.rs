@@ -171,7 +171,7 @@ fn works(program: &Path, version_arg: Option<&str>) -> bool {
     let Some(arg) = version_arg else {
         return true;
     };
-    match std::process::Command::new(program)
+    match editor_proc::spawn::quiet(program)
         .arg(arg)
         .stdin(std::process::Stdio::null())
         .output()
@@ -432,7 +432,7 @@ mod tests {
             let Some(arg) = found.spec.version_arg else {
                 continue;
             };
-            let output = std::process::Command::new(&found.program)
+            let output = editor_proc::spawn::quiet(&found.program)
                 .arg(arg)
                 .output()
                 .unwrap_or_else(|e| panic!("{} could not run: {e}", found.program.display()));

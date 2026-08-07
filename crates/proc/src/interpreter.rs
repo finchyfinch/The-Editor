@@ -172,7 +172,7 @@ pub fn which(program: &str) -> Option<PathBuf> {
 /// # Errors
 /// If the interpreter cannot be executed or does not answer.
 pub fn version_of(interpreter: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(interpreter)
+    let output = crate::spawn::quiet(interpreter)
         .args([
             "-c",
             "import sys; print('.'.join(map(str, sys.version_info[:3])))",

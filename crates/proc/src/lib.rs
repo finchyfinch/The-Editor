@@ -17,4 +17,5 @@ pub mod interpreter;
 pub mod links;
 pub mod pty;
 pub mod run_config;
+pub mod spawn;
 pub mod venv;

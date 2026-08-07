@@ -14,7 +14,7 @@
 
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -110,7 +110,10 @@ impl Server {
     }
 
     fn spawn(&mut self) -> Result<()> {
-        let mut child = Command::new(&self.program)
+        // `quiet`, not `Command::new`: a release build has no console of its
+        // own, so Windows would allocate one for the server and leave it on
+        // screen behind the editor for as long as the server runs.
+        let mut child = editor_proc::spawn::quiet(&self.program)
             .args(self.spec.args)
             .current_dir(&self.root)
             .stdin(Stdio::piped())
