@@ -31,10 +31,8 @@ tracing-subscriber.workspace = true
 arboard = "3.6.1"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
-
-[dev-dependencies]
-# Only to build a rope for the syntax-check tests; the application itself
-# reaches ropes through `editor_core::Document`.
+# For parsing files the project-wide definition search reads off disk, which
+# have no `Document` behind them.
 ropey.workspace = true
 
 [lints]

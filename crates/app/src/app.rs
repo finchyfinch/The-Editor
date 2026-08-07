@@ -53,6 +53,16 @@ pub(crate) const BUILD: BuildInfo = BuildInfo {
 /// How long a transient message stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
 
+/// How many definitions the project-wide fallback collects before stopping.
+///
+/// More than a handful means the name is common enough that a text search
+/// cannot tell which one was meant, and the list stops being an answer.
+const MAX_PROJECT_DEFINITIONS: usize = 20;
+
+/// Largest file the fallback will read. Anything bigger is generated, vendored
+/// or data, and parsing it to answer one question is not worth the pause.
+const MAX_SEARCHED_BYTES: usize = 2 * 1024 * 1024;
+
 /// How long typing has to pause before the built-in syntax check runs.
 ///
 /// Half a written line is not valid code, so checking on every keystroke would
@@ -1245,8 +1255,20 @@ impl EditorApp {
         };
 
         if ranges.is_empty() {
+            // Nothing in this file. For a definition that is the normal case —
+            // the function is in another module — so the project is searched
+            // before giving up. Uses are left at this file: a name used in
+            // fifty places across a project is a list nobody wants from a
+            // search that cannot tell one `parse` from another.
+            if query == Query::Definition {
+                let language = entry.language;
+                let name = symbol.name.clone();
+                if self.find_definition_in_project(&name, language) {
+                    return;
+                }
+            }
             self.info(format!(
-                "No {} of `{}` in this file (no language server, so other files were not searched)",
+                "No {} of `{}` found (no language server, so this is a search of the                  project's text rather than an answer about the code)",
                 query.noun(),
                 symbol.name
             ));
@@ -1267,6 +1289,70 @@ impl EditorApp {
             .collect();
 
         self.land_on(query, symbol.name, locations, true);
+    }
+
+    /// Search the open project for a definition of `name`.
+    ///
+    /// The fallback for Go to Definition when no server can answer. Only files
+    /// of the same language are considered, and each is skimmed for the name as
+    /// plain text before being parsed — reading a file is cheap, parsing it is
+    /// not, and in any real project almost every file fails the skim.
+    ///
+    /// Returns true if it jumped somewhere.
+    fn find_definition_in_project(&mut self, name: &str, language: LanguageId) -> bool {
+        let Some(root) = self.tree.root().map(Path::to_path_buf) else {
+            return false;
+        };
+
+        let mut found = Vec::new();
+        for relative in editor_search::files::list(&root).files {
+            if found.len() >= MAX_PROJECT_DEFINITIONS {
+                break;
+            }
+            let path = root.join(&relative);
+            let same_language = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| LanguageId::from_extension(e) == language);
+            if !same_language {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // The skim. A definition of `parse` cannot exist in a file that does
+            // not contain the word at all.
+            if source.len() > MAX_SEARCHED_BYTES || !source.contains(name) {
+                continue;
+            }
+
+            let rope = ropey::Rope::from_str(&source);
+            let Some(highlighter) = Highlighter::new(language, &rope) else {
+                continue;
+            };
+            let Some(tree) = highlighter.tree() else {
+                continue;
+            };
+            for range in editor_syntax::symbols::definitions(tree, &rope, name) {
+                let line = rope.char_to_line(range.start);
+                let column = range.start - rope.line_to_char(line);
+                found.push(Target {
+                    path: Some(path.clone()),
+                    line,
+                    column,
+                });
+            }
+        }
+
+        if found.is_empty() {
+            return false;
+        }
+        let count = found.len();
+        self.go_to(&found[0]);
+        if count > 1 {
+            self.info(format!("{count} definitions of `{name}` in this project"));
+        }
+        true
     }
 
     /// Take a set of results and go to the first one.
@@ -2342,7 +2428,8 @@ impl EditorApp {
                                 || cmd.title.to_owned(),
                                 |sc| format!("{} ({sc})", cmd.title),
                             );
-                            if ui.button(toolbar_glyph(*id)).on_hover_text(tip).clicked() {
+                            let glyph = editor_widgets::icon::pick(ui, toolbar_glyphs(*id));
+                            if ui.button(glyph).on_hover_text(tip).clicked() {
                                 invoked = Some(*id);
                             }
                         }
@@ -3364,23 +3451,28 @@ fn menu_item(ui: &mut egui::Ui, id: CommandId) -> egui::Response {
     ui.add(button)
 }
 
-fn toolbar_glyph(id: CommandId) -> &'static str {
+/// Candidate glyphs for a toolbar button, best first, plain ASCII last.
+///
+/// A list rather than one character because the bundled fonts do not cover
+/// everything and a missing glyph is drawn as a box — silently, and identically
+/// for every button that misses. See `editor_widgets::icon`.
+fn toolbar_glyphs(id: CommandId) -> &'static [&'static str] {
     // Text glyphs until the icon set lands in M9. They are unambiguous with
     // the tooltip, which every button has.
     match id {
-        CommandId::NewFile => "\u{2795}",
-        CommandId::OpenFile => "\u{1f4c2}",
-        CommandId::Save => "\u{1f4be}",
-        CommandId::SaveAll => "\u{1f5c3}",
-        CommandId::Undo => "\u{21b6}",
-        CommandId::Redo => "\u{21b7}",
-        CommandId::Find => "\u{1f50d}",
-        CommandId::Run => "\u{25b6}",
-        CommandId::RunStop => "\u{25a0}",
-        CommandId::ToggleExplorer => "\u{2630}",
-        CommandId::CommandPalette => "\u{2318}",
-        CommandId::OpenSettings | CommandId::OpenSettingsFile => "\u{2699}",
-        _ => "?",
+        CommandId::NewFile => &["\u{2795}", "+"],
+        CommandId::OpenFile => &["\u{1f4c2}", "\u{25b1}", "O"],
+        CommandId::Save => &["\u{1f4be}", "\u{25bd}", "S"],
+        CommandId::SaveAll => &["\u{1f5c3}", "\u{25bc}", "A"],
+        CommandId::Undo => &["\u{21b6}", "\u{25c0}", "<"],
+        CommandId::Redo => &["\u{21b7}", "\u{25b6}", ">"],
+        CommandId::Find => &["\u{1f50d}", "\u{25cb}", "F"],
+        CommandId::Run => &["\u{25b6}", ">"],
+        CommandId::RunStop => &["\u{25a0}", "#"],
+        CommandId::ToggleExplorer => &["\u{2630}", "\u{25a4}", "E"],
+        CommandId::CommandPalette => &["\u{2318}", "\u{25c8}", "P"],
+        CommandId::OpenSettings | CommandId::OpenSettingsFile => &["\u{2699}", "\u{25cf}", "S"],
+        _ => &["?"],
     }
 }
 
@@ -3621,10 +3713,15 @@ mod tests {
         }
         for group in TOOLBAR {
             for id in *group {
-                assert_ne!(
-                    toolbar_glyph(*id),
-                    "?",
-                    "{id:?} is on the toolbar but has no glyph"
+                let glyphs = toolbar_glyphs(*id);
+                assert_ne!(glyphs, ["?"], "{id:?} is on the toolbar but has no glyph");
+                assert!(
+                    glyphs.len() >= 2 || glyphs[0].is_ascii(),
+                    "{id:?} has a single non-ASCII glyph and so no fallback if the                      font cannot draw it"
+                );
+                assert!(
+                    glyphs.last().is_some_and(|g| g.is_ascii()),
+                    "{id:?} ends in a glyph that could itself be missing"
                 );
             }
         }

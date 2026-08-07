@@ -90,6 +90,9 @@ pub struct EditorView {
     diagnostics: Vec<Underline>,
     /// Set by the context menu, taken by the application next frame.
     context_action: Option<ContextAction>,
+    /// When the wheel or trackpad was last used, so the smooth-scroll
+    /// animation can be kept fed with frames while it runs.
+    last_scroll: Option<std::time::Instant>,
     /// Where the caret was painted last frame, in screen coordinates.
     ///
     /// Kept so the completion popup can be anchored under the caret. Only the
@@ -277,6 +280,16 @@ impl EditorView {
         };
 
         let mut changed = false;
+
+        // Noted before the scroll area runs, because it consumes the delta as
+        // it applies it and there is nothing left to see afterwards.
+        if ui.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::MouseWheel { .. }))
+        }) {
+            self.last_scroll = Some(std::time::Instant::now());
+        }
 
         // Salted, so it cannot collide with the tab bar's scroll area above it
         // in the same panel. See the note in `tab_bar`.
@@ -1463,16 +1476,40 @@ impl EditorView {
         }
 
         self.caret_screen_rect = caret_rect;
-        if let Some(caret) = caret_rect {
-            if response.has_focus() && self.blink_on() {
-                painter.rect_filled(caret, 0.0, visuals.strong_text_color());
-            }
-            if std::mem::take(&mut self.scroll_to_caret) {
-                ui.scroll_to_rect(caret.expand2(egui::vec2(0.0, row_height * 2.0)), None);
-            }
+        if let Some(caret) = caret_rect
+            && response.has_focus()
+            && self.blink_on()
+        {
+            painter.rect_filled(caret, 0.0, visuals.strong_text_color());
         }
 
-        if response.has_focus() {
+        if std::mem::take(&mut self.scroll_to_caret) {
+            // Derived from the line number rather than taken from `caret_rect`,
+            // which only exists when the caret was painted -- that is, only
+            // when it is *already* on screen. Keying the scroll off it meant
+            // the one case that needs scrolling was the one case that could not
+            // ask for it, so jumping to a search match or a definition outside
+            // the visible range moved the caret and left the view behind.
+            let y = rect.top() + caret_line as f32 * row_height;
+            let x = caret_rect.map_or(text_left, |r| r.left());
+            let target = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1.5, row_height));
+            // A couple of rows of context either side, so the target does not
+            // land flush against the top or bottom edge.
+            ui.scroll_to_rect(target.expand2(egui::vec2(0.0, row_height * 2.0)), None);
+        }
+
+        // Smooth scrolling is animated by egui over several frames. Nothing
+        // else wakes the frame loop between trackpad events, so without this
+        // the view only advances when the caret blink timer fires -- which is
+        // what made two-finger scrolling arrive in lurches with a pause
+        // between each. Requested only while the wheel is actually turning, so
+        // an idle editor still costs nothing.
+        let scrolling = self
+            .last_scroll
+            .is_some_and(|t| t.elapsed() < SCROLL_ANIMATION);
+        if scrolling {
+            ui.ctx().request_repaint();
+        } else if response.has_focus() {
             // Keep the blink animating without spinning at the full frame rate.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(120));
@@ -1669,6 +1706,13 @@ pub enum ContextAction {
     FindUses,
     Paste,
 }
+
+/// How long to keep asking for frames after the last wheel event.
+///
+/// egui eases a scroll in over several frames; the tail of that easing needs
+/// frames too, and the wheel events have stopped by then. Long enough to cover
+/// the easing, short enough that an editor left alone goes quiet.
+const SCROLL_ANIMATION: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The character range of whole lines `first..=last`, including the trailing
 /// newline of the last one where there is one.

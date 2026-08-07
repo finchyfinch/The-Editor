@@ -194,7 +194,7 @@ impl FindBar {
                     ui.separator();
 
                     if ui
-                        .small_button("\u{2191}")
+                        .small_button(crate::icon::pick(ui, &["\u{2191}", "\u{25b2}", "^"]))
                         .on_hover_text("Previous (Shift+Enter)")
                         .clicked()
                         && let Some(range) = self.step(caret, -1)
@@ -202,7 +202,7 @@ impl FindBar {
                         action = Action::Reveal(range);
                     }
                     if ui
-                        .small_button("\u{2193}")
+                        .small_button(crate::icon::pick(ui, &["\u{2193}", "\u{25bc}", "v"]))
                         .on_hover_text("Next (Enter)")
                         .clicked()
                         && let Some(range) = self.step(caret, 1)
@@ -226,7 +226,7 @@ impl FindBar {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("\u{00d7}")
+                            .small_button(crate::icon::pick(ui, &["\u{00d7}", "x"]))
                             .on_hover_text("Close (Esc)")
                             .clicked()
                         {

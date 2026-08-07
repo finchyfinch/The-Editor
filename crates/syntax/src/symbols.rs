@@ -249,9 +249,32 @@ fn defines(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    if !introduces_a_name(parent.kind()) {
+        return false;
+    }
     parent
         .child_by_field_name("name")
         .is_some_and(|named| named.id() == node.id())
+}
+
+/// Whether a node of this kind is one that *introduces* a name.
+///
+/// The `name` field alone is not enough. Rust's `scoped_identifier` has one
+/// too, so `word::next_boundary(x)` -- a call -- was reported as a definition
+/// of `next_boundary`, and a project-wide search returned every call site
+/// alongside the real declaration. Python's `attribute` and Rust's
+/// `field_expression` are the same trap.
+///
+/// Matched on the suffix rather than a list of exact kinds, so this still
+/// covers a grammar nobody has added yet: every one of them names its
+/// declarations `..._definition`, `..._item` or `..._declaration`.
+fn introduces_a_name(kind: &str) -> bool {
+    kind.ends_with("_definition")
+        || kind.ends_with("_item")
+        || kind.ends_with("_declaration")
+        || kind.ends_with("_specifier")
+        || kind.ends_with("_parameter")
+        || kind == "parameter"
 }
 
 fn byte_range_to_chars(text: &Rope, start: usize, end: usize) -> Range<usize> {
@@ -500,6 +523,42 @@ yy = 2
             assert!(names.contains(&"parse".to_owned()));
             // `again` only appears in `// parse again`.
             assert!(!names.contains(&"again".to_owned()));
+        });
+    }
+
+    /// The bug a project-wide search turned up: `word::next_boundary(x)` was
+    /// reported as *defining* `next_boundary`, because Rust's
+    /// `scoped_identifier` also has a `name` field. Every call site came back
+    /// as a definition.
+    #[test]
+    fn a_qualified_call_is_not_a_definition() {
+        let source = "fn caller() {
+    let n = word::next_boundary(text, 0);
+    let m = other::next_boundary(text, 1);
+}
+";
+        with_tree(LanguageId::Rust, source, |tree, text| {
+            assert!(
+                definitions(tree, text, "next_boundary").is_empty(),
+                "a call through a path is not a declaration"
+            );
+            assert_eq!(
+                occurrences(tree, text, "next_boundary").len(),
+                2,
+                "they are still uses"
+            );
+        });
+    }
+
+    #[test]
+    fn an_attribute_access_is_not_a_definition() {
+        // The same trap in Python: `self.parse` has a `name` field too.
+        let source = "class A:
+    def go(self):
+        return self.parse()
+";
+        with_tree(LanguageId::Python, source, |tree, text| {
+            assert!(definitions(tree, text, "parse").is_empty());
         });
     }
 

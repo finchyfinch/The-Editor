@@ -10,6 +10,12 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Go to Definition searches the project when no language server can answer.**
+  Previously it looked only in the open file, which for a function defined in
+  another module means never finding anything. Files of the same language are
+  skimmed for the name as plain text before being parsed, so in a real project
+  almost none of them are.
+
 - **Line manipulation**: Duplicate Line (Ctrl+Shift+D), Delete Line
   (Ctrl+Shift+K), Move Line Up/Down (Alt+Up/Down). Each acts on the whole block
   of lines the selection touches, keeps that block selected so the shortcut can
@@ -82,6 +88,26 @@ Entries are written as each milestone lands, not retroactively at release time.
   waiting. The panel now says so under the file's name.
 
 ### Fixed
+
+- **Jumping to a search match or a definition moved the caret but not the
+  view.** The scroll target was taken from the painted caret rectangle, which
+  only exists when the caret is *already* on screen — so the one case that
+  needed scrolling was the one case that could not ask for it. It is now derived
+  from the line number, whether or not the line is visible.
+- **A qualified call was reported as a definition.** Rust's `scoped_identifier`
+  has a `name` field, so `word::next_boundary(x)` looked exactly like a
+  declaration of `next_boundary`, and a search returned every call site
+  alongside the real one. Python's `attribute` was the same trap. A name now
+  counts as introduced only when its parent is a declaration node.
+- **Two-finger scrolling arrived in lurches.** egui eases a scroll in over
+  several frames, and nothing else was waking the frame loop between trackpad
+  events — so the view only advanced when the caret-blink timer fired, every
+  120 ms. Frames are now requested while a scroll is animating, and only then.
+- **Buttons showed empty boxes instead of icons.** The bundled fonts do not
+  cover everything, and which characters they miss is not guessable: `▶` and
+  `■` render, `↑` and `↓` do not. Every glyph in the interface is now chosen
+  through a helper that asks the font what it has and falls back, ending at
+  plain ASCII, so a missing glyph degrades instead of vanishing.
 
 - **Pyright was rejected as unusable and never started.** The check that a
   binary really works runs its version flag, and
