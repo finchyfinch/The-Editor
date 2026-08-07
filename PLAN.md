@@ -838,78 +838,59 @@ debugging, plugins, notebooks, remote editing, collaborative editing, AI assista
 
 ## 14. Status
 
+Audited against the code on 2026-08-07, not from memory. Every "still to do"
+below was checked by looking for the thing itself, because a status section
+that drifts from the source is worse than none.
+
 - [x] Name, author, licence, toolkit, linting policy and signing policy settled (§1).
-- [x] **M0 — Bootstrap.** Workspace + 8 crates, logging, panic hook with emergency-save scaffold,
-      blank `eframe` window, cargo aliases, git repo. See `docs/M0-NOTES.md`.
+- [x] **M0 — Bootstrap.** Workspace + 8 crates, logging, panic hook with emergency-save
+      scaffold, blank `eframe` window, cargo aliases, git repo. See `docs/M0-NOTES.md`.
 - [x] **Spike — virtualised rope rendering.** `cargo spike` runs it; findings in
       `docs/SPIKE-NOTES.md`.
-- [ ] **M1 — Shell & layout.** Mostly done; the remaining items are listed below.
-- [ ] **M2 — Editor core.** Core editing works: typing, selections, undo/redo
-      with coalescing, clipboard, caret motion, virtualised painting.
-- [ ] **M3 — Syntax highlighting.** Working for all nine languages, computed
-      per viewport, reparsing incrementally, with dark and light syntax themes
-      whose contrast is enforced by tests. Still to do: HTML injections so
-      embedded `<script>` and `<style>` are highlighted as JS and CSS, shebang
-      and manual language override, the user-editable TOML theme format, and
-      the fold/bracket queries that M4 builds on.
-- [ ] **M4 — Editing intelligence.** The indentation engine is done, including
-      the full Python rule set, along with auto-closing brackets, comment
-      toggling and block indent/dedent. Still to do: `.editorconfig` support,
-      trim-trailing-whitespace and final-newline on save, re-indent on paste,
-      bracket-match highlighting, and code folding.
-- [ ] **M5 — Search.** In-file find and replace is done: literal and regex,
-      case and whole-word options, match highlighting, wrapping navigation, and
-      Replace All as one undo step. Still to do: project-wide search and replace
-      on the ripgrep engine, and go-to-file / go-to-symbol.
-- [ ] **M6 — Language servers.** The client works: transport, handshake,
-      document sync, diagnostics with a Problems panel, several servers per
-      language, crash recovery, and a degradation path that costs nothing when
-      no server is installed. Still to do: the completion popup, hover,
-      go-to-definition, find-references, rename, code actions, and
-      format-on-save — all of which build on the request machinery now in
-      place.
-- [ ] **M7 — Run & console.** Running Python and Rust works, under a PTY, with
-      clickable error links, stdin, stop and restart. The venv creation dialog
-      (§3.8a) is done, along with interpreter discovery beyond `PATH`. Still to
-      do: Install Packages and Show Installed Packages, run configurations in
-      `.ide/run.toml`, and the Problems panel.
 
-**Sequencing change.** M2's editing widget was brought forward ahead of the rest
-of M1. An IDE you cannot type into is impossible to evaluate, and the M1
-leftovers (session restore, tab drag-reorder, filesystem watching) are polish by
-comparison. The **New File dialog** — name, language, boilerplate template
-(§7) — moves from M8 to immediately after M2 for the same reason: a "new file"
-command that cannot name the file or pick its language is only half a feature.
+Roughly 22,500 lines of Rust and 453 tests. Nothing has ever been built or run on
+Linux or macOS, which remains the single largest piece of unknown work.
 
-**M1 landed so far:** command registry driving the menus, toolbar, keyboard and
-palette from one source; fuzzy command palette; dark/light/follow-system theme
-with contrast enforced by tests; settings persistence that preserves unknown
-keys and comments; document model with encoding and line-ending preservation and
-atomic saves; file tree with lazy expansion; tab strip with close/dirty/preview
-behaviour; status bar; About and generated Keyboard Shortcuts windows; toast
-messages for errors.
+### Where each milestone stands
 
-**M2 landed so far:** the real editor widget — virtualised painting on the
-technique the spike validated, typing, selection by click/drag/double-click,
-caret motion with a sticky goal column, smart backspace to the tab stop,
-auto-indent carried from the previous line, cut/copy/paste, select all, and
-undo/redo with typing coalesced into single steps.
+| # | Milestone | State | What is missing |
+|---|---|---|---|
+| M1 | Shell & layout | Substantially done | Tab drag-reorder and overflow dropdown; Ctrl+Tab most-recently-used cycling; go-to-file (Ctrl+P); native macOS menu bar via `muda` |
+| M2 | Editor core | Core done | Multi-cursor and column selection; word-wise motion and deletion (Ctrl+arrow, Ctrl+Backspace); line duplicate / move / delete; external-change detection; crash-recovery autosave; the §2.4 performance benchmarks |
+| M3 | Syntax highlighting | Done for 9 languages | HTML injections (embedded `<script>`/`<style>`); shebang and manual language override; the user-editable TOML theme format |
+| M4 | Editing intelligence | Indent engine done | `.editorconfig`; trim-trailing-whitespace and final-newline on save; re-indent on paste; bracket-match highlighting; code folding |
+| M5 | Search | In-file done | Project-wide search and replace on the ripgrep engine — the crate holds only the query engine so far; go-to-symbol |
+| M6 | Language servers | Client done | Completion popup, hover, go-to-definition, find-references, rename, code actions, format-on-save. The request/response machinery exists; none of these call it yet |
+| M7 | Run & console | Running done | Install Packages / Show Installed Packages; run configurations in `.ide/run.toml` |
+| M8 | Settings, themes, New File | **Barely started** | There is no settings *form* — Tools → Open settings.toml opens the file in a tab and that is all. Also missing: the keymap file and conflict detection (only its path exists), user themes, and New Project |
+| M9 | Polish & docs | Partly | About, Keyboard Shortcuts and Check Toolchains exist. Missing: user manual, third-party licence page, accessibility pass, icons and app icon, first-run experience, startup perf pass |
+| M10 | Release 1.0.0 | Not started | Packaging for all three platforms, checksums, release notes |
 
-**M1 still to do:** tab drag-reorder and the overflow dropdown; Ctrl+Tab
-most-recently-used cycling; go-to-file (Ctrl+P); native macOS menu bar via
-`muda`; and a build/run pass on Linux and macOS. The filesystem watcher,
-session persistence and the file-tree context menu are done.
+### Landed beyond the plan
 
-**Also landed:** the New File dialog with all its templates (pulled forward from
-M8), and the Save / Don't Save / Cancel guard on closing a dirty tab, Close
-Others, Close All and quitting.
+- **Built-in syntax checking** from the tree-sitter tree, so broken code is
+  flagged with no language server installed. Not in the original plan; the
+  degradation ladder in §3.6 said the IDE must stay usable without servers, and
+  showing nothing at all was a poor reading of that.
+- **Help → Check Toolchains** with per-tool install commands (§3.6 referred to
+  it from M0; it did not exist until now).
+- **The New File dialog** and all its templates, pulled forward from M8.
+- The Save / Don't Save / Cancel guard on closing a dirty tab, Close Others,
+  Close All and quitting.
+- `editor_proc::spawn::quiet`, so background children get no console window on
+  Windows.
 
-**M2 still to do:** multi-cursor and column selection; word-wise motion and
-deletion (Ctrl+arrow, Ctrl+Backspace); line manipulation (duplicate, move
-up/down, delete); external-change detection; crash-recovery autosave; and the
-performance benchmarks that assert the §2.4 budgets.
+### Sequencing changes made along the way
 
-Still outstanding, none of it blocking:
+M2's editing widget was brought forward ahead of the rest of M1: an IDE you
+cannot type into is impossible to evaluate. The New File dialog moved from M8 to
+just after M2 for the same reason — a "new file" command that cannot name the
+file or pick its language is only half a feature.
+
+### Outstanding logistics
+
 - Set up the bare backup remote (`git remote add origin <path-to-nas>/the-editor.git`).
-- Decide the distribution channel for releases (a plain web page with checksums is enough).
-```
+- Decide the distribution channel for releases (a plain web page with checksums
+  is enough).
+- No command-line file argument: `the-editor foo.py` opens an empty window, so
+  "Open with…" and double-clicking a file in Explorer do not work.
