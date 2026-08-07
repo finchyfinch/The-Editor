@@ -172,6 +172,13 @@ pub(crate) struct EditorApp {
     /// again by a second close request.
     session_saved: bool,
 
+    /// Recently opened files, newest first. Persisted in the session file.
+    recent: Vec<PathBuf>,
+    /// A recent file the user picked from a menu, opened after the menu closes.
+    pending_recent: Option<PathBuf>,
+    /// A file or folder awaiting a yes/no before it is moved to the trash.
+    pending_delete: Option<PathBuf>,
+
     lsp: editor_lsp::session::Lsp,
     /// Which bottom-dock tab is showing.
     dock: DockTab,
@@ -234,6 +241,9 @@ impl EditorApp {
             watcher: None,
             restore: settings.restore_session().then(|| session.clone()),
             session_saved: false,
+            recent: Vec::new(),
+            pending_recent: None,
+            pending_delete: None,
             lsp: editor_lsp::session::Lsp::default(),
             dock: DockTab::default(),
             synced: std::collections::HashMap::new(),
@@ -330,6 +340,9 @@ impl EditorApp {
                 return;
             }
         };
+        // Only files that actually opened go on the recent list. Offering one
+        // that failed a moment ago is a trap.
+        Session::push_recent(&mut self.recent, path);
 
         if doc.is_large() {
             self.info(format!(
@@ -657,6 +670,11 @@ impl EditorApp {
             }
         }
 
+        // Restored first, so that reopening the previous tabs below pushes
+        // them to the front of a list that already has the older history in it
+        // rather than replacing it.
+        self.recent.clone_from(&session.recent_files);
+
         if let Some(folder) = &session.folder {
             self.open_folder(folder.clone());
         }
@@ -695,6 +713,7 @@ impl EditorApp {
         });
 
         Session {
+            recent_files: self.recent.clone(),
             folder: self.tree.root().map(Path::to_path_buf),
             open_files: self
                 .docs
@@ -1133,7 +1152,9 @@ impl EditorApp {
             }
 
             Action::Rename { from, to } => self.rename_path(&from, &to),
-            Action::Delete(path) => self.delete_path(&path),
+            // Recoverable, but still a surprise if it was a mis-click on a
+            // folder with a hundred files in it. Ask first.
+            Action::Delete(path) => self.pending_delete = Some(path),
 
             Action::Reveal(path) => {
                 if let Err(e) = reveal_in_file_manager(&path) {
@@ -1192,6 +1213,69 @@ impl EditorApp {
     }
 
     /// Move a path to the trash, closing any tab that showed it.
+    /// Confirm before moving something to the trash.
+    ///
+    /// The delete is recoverable — it goes to the recycle bin, not oblivion —
+    /// but a mis-click on a folder still means fishing a hundred files back out
+    /// of it, and the file tree is a place where a click lands one row from
+    /// where you meant. Escape cancels, which is the safe answer.
+    fn delete_prompt(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.pending_delete.clone() else {
+            return;
+        };
+
+        let is_dir = path.is_dir();
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let mut decision: Option<bool> = None;
+
+        egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(if is_dir {
+                "Delete folder?"
+            } else {
+                "Delete file?"
+            });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Move");
+                ui.strong(&name);
+                ui.label("to the recycle bin?");
+            });
+            if is_dir {
+                ui.add_space(4.0);
+                ui.label("Everything inside it goes too.");
+            }
+            ui.add_space(4.0);
+            ui.weak(path.display().to_string());
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    decision = Some(false);
+                }
+                if ui.button("Delete").clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+
+        match decision {
+            None => {}
+            Some(false) => self.pending_delete = None,
+            Some(true) => {
+                self.pending_delete = None;
+                self.delete_path(&path);
+            }
+        }
+    }
+
     fn delete_path(&mut self, path: &Path) {
         if let Err(e) = editor_widgets::file_tree::move_to_trash(path) {
             self.error(format!("Could not delete {}: {e}", path.display()));
@@ -1647,6 +1731,11 @@ impl EditorApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) -> Option<CommandId> {
         let mut invoked = None;
+        // Cloned so the closure below does not borrow `self` while the menu is
+        // being drawn. Fifteen paths is nothing.
+        let recent = self.recent.clone();
+        let mut picked_recent = None;
+        let mut clear_recent = false;
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -1663,6 +1752,13 @@ impl EditorApp {
                                         ui.close();
                                     }
                                 }
+                                MenuEntry::Recent => {
+                                    if let Some(path) = recent_menu(ui, &recent, &mut clear_recent)
+                                    {
+                                        picked_recent = Some(path);
+                                        ui.close();
+                                    }
+                                }
                             }
                         }
                     });
@@ -1670,6 +1766,12 @@ impl EditorApp {
             });
         });
 
+        if clear_recent {
+            self.recent.clear();
+        }
+        if picked_recent.is_some() {
+            self.pending_recent = picked_recent;
+        }
         invoked
     }
 
@@ -1832,7 +1934,9 @@ impl EditorApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             if self.docs.is_empty() {
-                self.welcome(ui);
+                if let Some(path) = self.welcome(ui) {
+                    self.pending_recent = Some(path);
+                }
                 return;
             }
 
@@ -1898,9 +2002,15 @@ impl EditorApp {
         tab_action
     }
 
-    fn welcome(&self, ui: &mut egui::Ui) {
+    /// The empty state. Returns a recent file if one was clicked.
+    ///
+    /// The recent list is repeated here as well as in the menu because this is
+    /// the screen you are looking at when you want it: an editor opened with
+    /// nothing in it is almost always about to reopen something.
+    fn welcome(&self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        let mut picked = None;
         ui.vertical_centered(|ui| {
-            ui.add_space(80.0);
+            ui.add_space(60.0);
             ui.heading("The Editor");
             ui.label(format!("Version {}", BUILD.version));
             ui.add_space(24.0);
@@ -1921,7 +2031,33 @@ impl EditorApp {
                         ui.end_row();
                     }
                 });
+
+            if self.recent.is_empty() {
+                return;
+            }
+            ui.add_space(28.0);
+            ui.weak("Recent");
+            ui.add_space(4.0);
+            for path in self.recent.iter().take(8) {
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                let response = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(name).color(ui.visuals().hyperlink_color),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(path.display().to_string())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if response.clicked() {
+                    picked = Some(path.clone());
+                }
+            }
         });
+        picked
     }
 
     fn toasts_ui(&mut self, ctx: &egui::Context) {
@@ -2213,6 +2349,7 @@ impl eframe::App for EditorApp {
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
         let modal_open = self.settings_form.is_open()
+            || self.pending_delete.is_some()
             || self.palette.is_open()
             || self.new_file.is_open()
             || self.venv_dialog.is_open()
@@ -2376,7 +2513,20 @@ impl eframe::App for EditorApp {
         self.toolchains_window(&ctx);
         self.settings_form_ui(&ctx);
         self.unsaved_prompt(&ctx);
+        self.delete_prompt(&ctx);
         self.toasts_ui(&ctx);
+
+        // Opening happens after the menu closes, so the tree and tab bar are
+        // not mutated while they are being drawn.
+        if let Some(path) = self.pending_recent.take() {
+            if path.is_file() {
+                self.open_path(&path, false);
+            } else {
+                // Dropped rather than left to fail again next time.
+                self.recent.retain(|p| *p != path);
+                self.error(format!("{} no longer exists", path.display()));
+            }
+        }
 
         if let Some(id) = invoked {
             tracing::debug!(?id, "command");
@@ -2505,6 +2655,67 @@ fn read_clipboard() -> Result<String, String> {
     arboard::Clipboard::new()
         .and_then(|mut c| c.get_text())
         .map_err(|e| e.to_string())
+}
+
+/// The Open Recent submenu. Returns the file the user picked.
+///
+/// Entries are labelled by file name with the containing directory beside them,
+/// because a list of fifteen full paths is unreadable and a list of fifteen bare
+/// file names cannot distinguish two `main.py`s.
+fn recent_menu(
+    ui: &mut egui::Ui,
+    recent: &[PathBuf],
+    clear: &mut bool,
+) -> Option<std::path::PathBuf> {
+    let mut picked = None;
+    ui.menu_button("Open Recent", |ui| {
+        if recent.is_empty() {
+            ui.weak("Nothing yet");
+            return;
+        }
+        for path in recent {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let parent = path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+
+            let response = ui.horizontal(|ui| {
+                let clicked = ui.selectable_label(false, &name).clicked();
+                ui.weak(shorten_middle(&parent, 44));
+                clicked
+            });
+            if response.inner {
+                picked = Some(path.clone());
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("Clear Recent Files").clicked() {
+            *clear = true;
+            ui.close();
+        }
+    });
+    picked
+}
+
+/// Shorten a path for display by eliding its middle, keeping both ends.
+///
+/// The ends are what identify a path — the drive or project at one end, the
+/// containing folder at the other — so truncating the tail hides the useful
+/// half.
+fn shorten_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_owned();
+    }
+    let keep = max.saturating_sub(3) / 2;
+    let head: String = chars.iter().take(keep).collect();
+    let tail: String = chars.iter().skip(chars.len() - keep).collect();
+    format!("{head}\u{2026}{tail}")
 }
 
 /// Whether a file failed to parse, as opposed to merely having problems.
@@ -2672,6 +2883,9 @@ fn open_in_file_manager(path: &Path) -> std::io::Result<()> {
 enum MenuEntry {
     Item(CommandId),
     Separator,
+    /// The Open Recent submenu, whose contents are data rather than commands
+    /// and so cannot come from the registry.
+    Recent,
 }
 
 /// Menu structure. The titles and shortcuts come from the registry; this only
@@ -2684,6 +2898,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::NewScratch),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::OpenFile),
+            MenuEntry::Recent,
             MenuEntry::Item(CommandId::OpenFolder),
             MenuEntry::Item(CommandId::CloseFolder),
             MenuEntry::Separator,
@@ -2692,7 +2907,6 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::SaveAll),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::CloseTab),
-            MenuEntry::Item(CommandId::OpenSettingsFile),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::Exit),
         ],
@@ -3016,13 +3230,68 @@ mod tests {
     }
 
     #[test]
+    fn a_long_path_is_elided_in_its_middle_not_its_tail() {
+        // Both ends identify a path; truncating the tail throws away the
+        // containing folder, which is the half that distinguishes two files
+        // with the same name.
+        let long = "C:/projects/some/deeply/nested/place/that/goes/on/src";
+        let short = shorten_middle(long, 24);
+        assert!(short.chars().count() <= 24, "got {short:?}");
+        assert!(short.starts_with("C:/pro"), "the head is kept: {short:?}");
+        assert!(short.ends_with("src"), "the tail is kept: {short:?}");
+        assert!(short.contains('\u{2026}'));
+    }
+
+    #[test]
+    fn a_short_path_is_left_alone() {
+        assert_eq!(shorten_middle("C:/tmp", 24), "C:/tmp");
+    }
+
+    #[test]
+    fn eliding_does_not_split_a_multi_byte_character() {
+        // Char-based, not byte-based: slicing a path with an accent in it at a
+        // byte offset panics.
+        let path = "C:/Users/José/Documentos/proyectos/análisis/código/src";
+        let short = shorten_middle(path, 20);
+        assert!(short.chars().count() <= 20);
+    }
+
+    #[test]
+    fn no_command_appears_in_two_menus() {
+        // Settings moved to Tools while the file entry was still in File, so
+        // "Open settings.toml" was listed twice with no way to notice.
+        let mut seen = std::collections::HashMap::new();
+        for (menu, entries) in MENUS {
+            for entry in *entries {
+                if let MenuEntry::Item(id) = entry
+                    && let Some(first) = seen.insert(*id, *menu)
+                {
+                    panic!("{id:?} is in both the {first} and {menu} menus");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn open_recent_is_in_the_file_menu() {
+        let file_menu = MENUS
+            .iter()
+            .find(|(name, _)| *name == "File")
+            .expect("a File menu");
+        assert!(
+            file_menu.1.iter().any(|e| matches!(e, MenuEntry::Recent)),
+            "Open Recent is not reachable"
+        );
+    }
+
+    #[test]
     fn every_theme_preference_has_a_command_and_a_menu_entry() {
         let in_menu: Vec<CommandId> = MENUS
             .iter()
             .flat_map(|(_, entries)| entries.iter())
             .filter_map(|e| match e {
                 MenuEntry::Item(id) => Some(*id),
-                MenuEntry::Separator => None,
+                MenuEntry::Separator | MenuEntry::Recent => None,
             })
             .collect();
 

@@ -84,7 +84,19 @@ pub struct Session {
     pub active: Option<usize>,
     pub window: Option<WindowGeometry>,
     pub show_output: bool,
+    /// Files opened recently, most recent first, for File -> Open Recent.
+    ///
+    /// Kept here rather than in `settings.toml` because it is history, not
+    /// configuration: it changes constantly, nobody hand-edits it, and losing
+    /// it costs nothing.
+    pub recent_files: Vec<PathBuf>,
 }
+
+/// How many entries the recent list keeps.
+///
+/// Long enough to reach back over a working session, short enough that the
+/// menu does not need scrolling.
+pub const MAX_RECENT: usize = 15;
 
 impl Session {
     /// Read a session file. A missing, unreadable or malformed file yields an
@@ -160,7 +172,31 @@ impl Session {
                 .get("show_output")
                 .and_then(Item::as_bool)
                 .unwrap_or(false),
+            // Entries whose file has since gone are dropped on load rather than
+            // shown and then failing to open.
+            recent_files: doc
+                .get("recent_files")
+                .and_then(Item::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(PathBuf::from))
+                        .filter(|p| p.is_file())
+                        .take(MAX_RECENT)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
+    }
+
+    /// Record that a file was opened.
+    ///
+    /// Moves it to the front if it is already listed rather than adding a
+    /// second entry — a recent list with the same file three times in it is a
+    /// log, not a shortcut.
+    pub fn push_recent(recent: &mut Vec<PathBuf>, path: &Path) {
+        recent.retain(|p| p != path);
+        recent.insert(0, path.to_path_buf());
+        recent.truncate(MAX_RECENT);
     }
 
     /// Write the session out.
@@ -207,6 +243,14 @@ impl Session {
         }
         if !files.is_empty() {
             doc["files"] = Item::ArrayOfTables(files);
+        }
+
+        if !self.recent_files.is_empty() {
+            let mut recent = toml_edit::Array::new();
+            for path in self.recent_files.iter().take(MAX_RECENT) {
+                recent.push(path.display().to_string());
+            }
+            doc["recent_files"] = value(recent);
         }
 
         doc.to_string()
@@ -456,6 +500,77 @@ mod tests {
             ..geometry()
         };
         assert!(partly_left.is_on_screen(screen.0, screen.1));
+    }
+
+    #[test]
+    fn opening_a_file_again_moves_it_to_the_front_rather_than_duplicating_it() {
+        let mut recent = Vec::new();
+        Session::push_recent(&mut recent, Path::new("/a.py"));
+        Session::push_recent(&mut recent, Path::new("/b.py"));
+        Session::push_recent(&mut recent, Path::new("/a.py"));
+        assert_eq!(
+            recent,
+            [PathBuf::from("/a.py"), PathBuf::from("/b.py")],
+            "the same file must not appear twice"
+        );
+    }
+
+    #[test]
+    fn the_recent_list_is_capped() {
+        let mut recent = Vec::new();
+        for i in 0..(MAX_RECENT + 10) {
+            Session::push_recent(&mut recent, &PathBuf::from(format!("/f{i}.py")));
+        }
+        assert_eq!(recent.len(), MAX_RECENT);
+        assert_eq!(
+            recent[0],
+            PathBuf::from(format!("/f{}.py", MAX_RECENT + 9)),
+            "the newest is first"
+        );
+    }
+
+    #[test]
+    fn recent_files_survive_a_round_trip_through_toml() {
+        // Asserting only that the output parses is not enough. A bare key
+        // written after a `[window]` header parses perfectly well and belongs
+        // to that table, so the list would be silently lost on the way back in.
+        // This reads the value back at the top level, where it has to be.
+        // The test binary itself: a path that certainly exists and is
+        // absolute, so the `is_file` filter on load does not drop it the way it
+        // would drop `file!()`, which is relative to the workspace root.
+        let this_file = std::env::current_exe().expect("current exe");
+        let session = Session {
+            recent_files: vec![this_file.clone()],
+            window: Some(geometry()),
+            ..Session::default()
+        };
+
+        let text = session.to_toml();
+        let doc: DocumentMut = text.parse().expect("valid TOML");
+        assert!(
+            doc.get("recent_files").and_then(Item::as_array).is_some(),
+            "recent_files is not a top-level array:
+{text}"
+        );
+
+        let back = Session::from_doc(&doc);
+        assert_eq!(
+            back.recent_files,
+            vec![this_file],
+            "the list did not survive the round trip"
+        );
+        assert!(back.window.is_some(), "the window table survived too");
+    }
+
+    #[test]
+    fn recent_entries_whose_file_has_gone_are_dropped_on_load() {
+        // A menu that offers a file which then fails to open is worse than a
+        // shorter menu. The existing `files` list already works this way.
+        let doc: DocumentMut = "recent_files = [\"/definitely/not/here.py\"]"
+            .parse()
+            .expect("parse");
+        let session = Session::from_doc(&doc);
+        assert!(session.recent_files.is_empty());
     }
 
     #[test]
