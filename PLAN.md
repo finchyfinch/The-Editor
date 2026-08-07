@@ -856,17 +856,22 @@ Linux or macOS, which remains the single largest piece of unknown work.
 | # | Milestone | State | What is missing |
 |---|---|---|---|
 | M1 | Shell & layout | Substantially done | Tab drag-reorder and overflow dropdown; Ctrl+Tab most-recently-used cycling; go-to-file (Ctrl+P); native macOS menu bar via `muda` |
-| M2 | Editor core | Core done | Multi-cursor and column selection; word-wise motion and deletion (Ctrl+arrow, Ctrl+Backspace); line duplicate / move / delete; external-change detection; crash-recovery autosave; the §2.4 performance benchmarks |
+| M2 | Editor core | Core done | Multi-cursor and column selection; line duplicate / move / delete; external-change detection; crash-recovery autosave; the §2.4 performance benchmarks |
 | M3 | Syntax highlighting | Done for 9 languages | HTML injections (embedded `<script>`/`<style>`); shebang and manual language override; the user-editable TOML theme format |
 | M4 | Editing intelligence | Indent engine done | `.editorconfig`; trim-trailing-whitespace and final-newline on save; re-indent on paste; bracket-match highlighting; code folding |
 | M5 | Search | In-file done | Project-wide search and replace on the ripgrep engine — the crate holds only the query engine so far; go-to-symbol |
-| M6 | Language servers | Client done | Completion popup, hover, go-to-definition, find-references, rename, code actions, format-on-save. The request/response machinery exists; none of these call it yet |
+| M6 | Language servers | Client done | Completion popup, hover, rename, code actions, format-on-save. Go to Definition and Find Uses are done, with a parse-tree fallback for when no server can answer |
 | M7 | Run & console | Running done | Install Packages / Show Installed Packages; run configurations in `.ide/run.toml` |
-| M8 | Settings, themes, New File | **Barely started** | There is no settings *form* — Tools → Open settings.toml opens the file in a tab and that is all. Also missing: the keymap file and conflict detection (only its path exists), user themes, and New Project |
+| M8 | Settings, themes, New File | Form done | The keymap file and conflict detection (only its path exists), user themes, and New Project. `editor.word_wrap` and `ui.syntax_theme` are read from the file and ignored by everything else, so the form does not offer them |
 | M9 | Polish & docs | Partly | About, Keyboard Shortcuts and Check Toolchains exist. Missing: user manual, third-party licence page, accessibility pass, icons and app icon, first-run experience, startup perf pass |
 | M10 | Release 1.0.0 | Not started | Packaging for all three platforms, checksums, release notes |
 
 ### Landed beyond the plan
+
+- **A recent files list** (File → Open Recent, and on the welcome screen), and a
+  confirmation before deleting from the file tree.
+- **Go to Definition / Find Uses with a parse-tree fallback**, so both work with
+  no language server installed — within the open file, and saying so.
 
 - **Built-in syntax checking** from the tree-sitter tree, so broken code is
   flagged with no language server installed. Not in the original plan; the
@@ -894,3 +899,9 @@ file or pick its language is only half a feature.
   is enough).
 - No command-line file argument: `the-editor foo.py` opens an empty window, so
   "Open with…" and double-clicking a file in Explorer do not work.
+- Ruff's language server exits once on startup and is restarted by the recovery
+  path. Harmless, but it should not be happening.
+- Shift+F12 (Find Uses) could not be confirmed working from a synthetic
+  keystroke, though plain F12, F8 and Shift+F8 all were, and the command itself
+  works from the menu. Windows reserves F12 for debuggers; worth checking by
+  hand.

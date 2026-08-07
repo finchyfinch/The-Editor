@@ -75,3 +75,10 @@ opt-level = 2
 
 [profile.dev]
 opt-level = 1
+# Line tables only, not full debug info. Panic backtraces still name the file
+# and line, which is the only debug information this project actually consumes
+# — logs and the panic hook, not a stepping debugger. Full info costs about an
+# order of magnitude more on Windows: a single `the_editor.pdb` reached 228 MB,
+# and `target/debug/deps` held 2.3 GB of them. Raise this to `2` (or `true`)
+# temporarily if you ever need to attach a debugger and step through.
+debug = 1
