@@ -860,7 +860,7 @@ Linux or macOS, which remains the single largest piece of unknown work.
 | M3 | Syntax highlighting | Done for 9 languages | HTML injections (embedded `<script>`/`<style>`); shebang and manual language override; the user-editable TOML theme format |
 | M4 | Editing intelligence | Indent engine done | `.editorconfig`; trim-trailing-whitespace and final-newline on save; re-indent on paste; bracket-match highlighting; code folding |
 | M5 | Search | In-file done | Project-wide search and replace on the ripgrep engine — the crate holds only the query engine so far; go-to-symbol |
-| M6 | Language servers | Mostly done | Hover, rename, code actions, format-on-save. Diagnostics, Go to Definition, Find Uses and the completion popup are done; the first three have a parse-tree fallback for when no server can answer, completion does not |
+| M6 | Language servers | Mostly done | Hover, rename, code actions, format-on-save. Diagnostics, Go to Definition, Find Uses and the completion popup are done; all four have a parse-tree fallback for when no server can answer |
 | M7 | Run & console | Running done | Install Packages / Show Installed Packages; run configurations in `.ide/run.toml` |
 | M8 | Settings, themes, New File | Form done | The keymap file and conflict detection (only its path exists), user themes, and New Project. `editor.word_wrap` and `ui.syntax_theme` are read from the file and ignored by everything else, so the form does not offer them |
 | M9 | Polish & docs | Partly | About, Keyboard Shortcuts and Check Toolchains exist. Missing: user manual, third-party licence page, accessibility pass, icons and app icon, first-run experience, startup perf pass |
@@ -901,6 +901,10 @@ file or pick its language is only half a feature.
   "Open with…" and double-clicking a file in Explorer do not work.
 - Ruff's language server exits once on startup and is restarted by the recovery
   path. Harmless, but it should not be happening.
+- A wgpu renderer panic ("Failed to create staging buffer for index data") took
+  the whole editor down once, on a machine started with a stripped `PATH` —
+  probably a software-renderer fallback. Not reproducible with a normal
+  environment, but a renderer panic should not be fatal.
 - Shift+F12 (Find Uses) could not be confirmed working from a synthetic
   keystroke, though plain F12, F8 and Shift+F8 all were, and the command itself
   works from the menu. Windows reserves F12 for debuggers; worth checking by

@@ -10,6 +10,15 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Ctrl+Space forces the completion popup**, below the two-character floor
+  that keeps it from appearing unbidden over a single letter.
+- **Completion works with no language server**, from the parse tree: every
+  distinct name already written in the file, labelled by what defines it and
+  marked "in this file" so it cannot pass for a real completion. Not offered
+  after a `.` — the members of an object have nothing to do with the names that
+  happen to appear elsewhere in the file, and a list of them there would be
+  actively misleading.
+
 - **Completion popup.** Suggestions from the language server appear under the
   caret after two characters of a name, or immediately after a `.`. Up/Down to
   choose, Enter or Tab to accept, Escape to dismiss, or click. Accepting is one

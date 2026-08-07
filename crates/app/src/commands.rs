@@ -41,6 +41,7 @@ pub(crate) enum CommandId {
     Replace,
     FindNext,
     FindPrevious,
+    TriggerCompletion,
     GoToDefinition,
     FindUses,
     NextUse,
@@ -101,6 +102,7 @@ impl CommandId {
         Self::Replace,
         Self::FindNext,
         Self::FindPrevious,
+        Self::TriggerCompletion,
         Self::GoToDefinition,
         Self::FindUses,
         Self::NextUse,
@@ -254,6 +256,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Edit",
         "Find Previous",
         Some(shift(Key::F3)),
+    ),
+    cmd(
+        CommandId::TriggerCompletion,
+        "Edit",
+        "Suggest Completions",
+        ctrl(Key::Space),
     ),
     // F12 and Shift+F12 are what every IDE uses for these. F8/Shift+F8 walks
     // the results, matching Find Next/Previous one row above.

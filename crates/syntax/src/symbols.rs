@@ -142,6 +142,107 @@ pub fn definitions(tree: &Tree, text: &Rope, name: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
+/// What a locally-defined name turned out to be.
+///
+/// A semantic kind rather than the protocol's numbers, so this crate stays
+/// unaware of LSP; the application maps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Function,
+    Class,
+    Module,
+    /// Defined here, but not as any of the above — a parameter, a loop
+    /// variable, a `let`.
+    Binding,
+    /// Used here and defined somewhere this cannot see.
+    Unknown,
+}
+
+/// A name that appears in this file, and what it looks like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+}
+
+/// Every distinct identifier in the file, for completion with no language
+/// server running.
+///
+/// This is a word list with a little structure, not an understanding of the
+/// code: it has no idea what is in scope where, and cannot see a single name
+/// from another file or from the standard library. It is offered because a name
+/// already written somewhere in the file you are editing is very often the one
+/// you are typing, and because the alternative with no server is nothing at
+/// all.
+///
+/// `skip` is the caret's own word, which would otherwise be offered back as a
+/// suggestion for itself.
+#[must_use]
+pub fn identifiers(tree: &Tree, text: &Rope, skip: Option<Range<usize>>) -> Vec<LocalSymbol> {
+    let mut found: Vec<LocalSymbol> = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    let mut stack = vec![tree.root_node()];
+
+    while let Some(node) = stack.pop() {
+        if is_identifier(node.kind()) {
+            let range = byte_range_to_chars(text, node.start_byte(), node.end_byte());
+            let overlaps_caret = skip.as_ref().is_some_and(|s| *s == range);
+            if !overlaps_caret {
+                let name: String = text.slice(range.clone()).chars().collect();
+                // A single character is never worth suggesting: it is shorter
+                // to type than to choose.
+                if name.chars().count() > 1 {
+                    let kind = kind_of(node);
+                    match found.iter_mut().find(|s| s.name == name) {
+                        // A later sighting that knows more wins: the same name
+                        // is usually a use before it is a definition.
+                        Some(existing) if existing.kind == SymbolKind::Unknown => {
+                            existing.kind = kind;
+                        }
+                        Some(_) => {}
+                        None => found.push(LocalSymbol { name, kind }),
+                    }
+                }
+            }
+        }
+        cursor.reset(node);
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Definitions first, then alphabetical, so the list is stable between
+    // keystrokes and the things declared in this file lead it.
+    found.sort_by(|a, b| {
+        let rank = |k: SymbolKind| u8::from(k == SymbolKind::Unknown);
+        rank(a.kind).cmp(&rank(b.kind)).then(a.name.cmp(&b.name))
+    });
+    found
+}
+
+/// What kind of thing this identifier names, from the node that defines it.
+fn kind_of(node: Node<'_>) -> SymbolKind {
+    if !defines(node) {
+        return SymbolKind::Unknown;
+    }
+    let Some(parent) = node.parent() else {
+        return SymbolKind::Unknown;
+    };
+    match parent.kind() {
+        "function_definition" | "function_item" | "function_signature_item" => SymbolKind::Function,
+        "class_definition" | "struct_item" | "enum_item" | "trait_item" | "union_item" => {
+            SymbolKind::Class
+        }
+        "mod_item" => SymbolKind::Module,
+        _ => SymbolKind::Binding,
+    }
+}
+
 /// True if this identifier is the `name` field of its parent — that is, the
 /// place the name is introduced rather than referred to.
 fn defines(node: Node<'_>) -> bool {
@@ -290,6 +391,117 @@ fn main() {
     println!(\"{n}\");
 }
 ";
+
+    #[test]
+    fn every_distinct_identifier_is_offered_once() {
+        with_tree(LanguageId::Python, PY, |tree, text| {
+            let found = identifiers(tree, text, None);
+            let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+            assert!(names.contains(&"parse"));
+            assert!(names.contains(&"Reader"));
+            assert!(names.contains(&"result"));
+            // `parse` appears three times in the source and must be listed once.
+            assert_eq!(
+                names.iter().filter(|n| **n == "parse").count(),
+                1,
+                "a name repeated in the list is a name you scroll past twice"
+            );
+        });
+    }
+
+    #[test]
+    fn a_name_defined_here_is_labelled_by_what_defines_it() {
+        with_tree(LanguageId::Python, PY, |tree, text| {
+            let found = identifiers(tree, text, None);
+            let kind = |name: &str| found.iter().find(|s| s.name == name).map(|s| s.kind);
+            assert_eq!(kind("parse"), Some(SymbolKind::Function));
+            assert_eq!(kind("Reader"), Some(SymbolKind::Class));
+            assert_eq!(kind("read"), Some(SymbolKind::Function));
+        });
+    }
+
+    #[test]
+    fn a_definition_is_recognised_even_when_the_use_is_seen_first() {
+        // The walk order is not source order, and a name is usually used before
+        // it is defined in the traversal. Whichever sighting knows more wins.
+        let source = "result = parse(1)
+
+
+def parse(x):
+    return x
+";
+        with_tree(LanguageId::Python, source, |tree, text| {
+            let found = identifiers(tree, text, None);
+            let parse = found.iter().find(|s| s.name == "parse").expect("parse");
+            assert_eq!(parse.kind, SymbolKind::Function);
+        });
+    }
+
+    #[test]
+    fn definitions_lead_the_list() {
+        with_tree(LanguageId::Python, PY, |tree, text| {
+            let found = identifiers(tree, text, None);
+            let first_unknown = found.iter().position(|s| s.kind == SymbolKind::Unknown);
+            let last_known = found.iter().rposition(|s| s.kind != SymbolKind::Unknown);
+            if let (Some(first), Some(last)) = (first_unknown, last_known) {
+                assert!(last < first, "names defined here must come first");
+            }
+        });
+    }
+
+    #[test]
+    fn the_word_being_typed_is_not_offered_back_to_itself() {
+        // Without this, typing `par` suggests `par`.
+        with_tree(LanguageId::Python, PY, |tree, text| {
+            let caret = identifier_at(tree, text, 6).expect("an identifier");
+            let with_skip = identifiers(tree, text, Some(caret.range.clone()));
+            // `parse` appears elsewhere too, so it is still listed once; the
+            // point is that the caret's own occurrence did not add a second.
+            assert_eq!(with_skip.iter().filter(|s| s.name == "parse").count(), 1);
+        });
+    }
+
+    #[test]
+    fn a_lone_letter_is_not_worth_suggesting() {
+        // Choosing from a list is slower than typing one character.
+        with_tree(
+            LanguageId::Python,
+            "x = 1
+yy = 2
+",
+            |tree, text| {
+                let names: Vec<String> = identifiers(tree, text, None)
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+                assert!(!names.contains(&"x".to_owned()));
+                assert!(names.contains(&"yy".to_owned()));
+            },
+        );
+    }
+
+    #[test]
+    fn rust_kinds_come_out_of_the_same_walk() {
+        with_tree(LanguageId::Rust, RS, |tree, text| {
+            let found = identifiers(tree, text, None);
+            let kind = |name: &str| found.iter().find(|s| s.name == name).map(|s| s.kind);
+            assert_eq!(kind("parse"), Some(SymbolKind::Function));
+            assert_eq!(kind("Reader"), Some(SymbolKind::Class));
+        });
+    }
+
+    #[test]
+    fn names_in_strings_and_comments_are_not_offered() {
+        with_tree(LanguageId::Rust, RS, |tree, text| {
+            let names: Vec<String> = identifiers(tree, text, None)
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            assert!(names.contains(&"parse".to_owned()));
+            // `again` only appears in `// parse again`.
+            assert!(!names.contains(&"again".to_owned()));
+        });
+    }
 
     #[test]
     fn rust_functions_and_structs_are_found_by_the_same_rule() {

@@ -1017,6 +1017,74 @@ impl EditorApp {
 
         if self.lsp.complete(&path, line, column) {
             self.completion.requested(start, prefix);
+            return;
+        }
+        self.complete_locally(start, prefix);
+    }
+
+    /// Suggest names already written in this file.
+    ///
+    /// What is available with no language server: a word list from the parse
+    /// tree, marked with what defines each name. It cannot see another file, an
+    /// import, or anything in the standard library, so the detail column says
+    /// where the suggestion came from rather than letting it pass for a real
+    /// completion.
+    ///
+    /// Not offered after a `.`: the members of an object have nothing to do
+    /// with the names that happen to appear elsewhere in the file, and a list
+    /// of them there would be actively misleading.
+    fn complete_locally(&mut self, start: usize, prefix: &str) {
+        if prefix.is_empty() {
+            return;
+        }
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            return;
+        };
+        let Some(tree) = entry.highlighter.as_ref().and_then(Highlighter::tree) else {
+            return;
+        };
+
+        let caret_word = editor_syntax::symbols::identifier_at(
+            tree,
+            entry.doc.text(),
+            entry.view.selection.head,
+        )
+        .map(|s| s.range);
+
+        let items: Vec<editor_lsp::session::Completion> =
+            editor_syntax::symbols::identifiers(tree, entry.doc.text(), caret_word)
+                .into_iter()
+                .map(|symbol| editor_lsp::session::Completion {
+                    kind: Some(lsp_kind(symbol.kind)),
+                    detail: Some("in this file".to_owned()),
+                    // No `sortText`: the walk already put definitions first,
+                    // and the popup sorts by it when present.
+                    sort_text: None,
+                    insert: symbol.name.clone(),
+                    label: symbol.name,
+                })
+                .collect();
+
+        if items.is_empty() {
+            return;
+        }
+        self.completion.requested(start, prefix);
+        self.completion.answered(items, prefix);
+    }
+
+    /// Ctrl+Space: ask now, whatever the prefix length.
+    ///
+    /// The two-character floor exists so the popup does not appear unbidden
+    /// over a single letter. Asking for it explicitly is a different matter.
+    fn trigger_completion(&mut self) {
+        let Some((start, prefix)) = self.completion_prefix() else {
+            self.info("Put the caret in or after a name first");
+            return;
+        };
+        self.completion.close();
+        self.request_completions(start, &prefix);
+        if !self.completion.is_open() && !self.completion.is_waiting() {
+            self.info("No suggestions here");
         }
     }
 
@@ -2095,6 +2163,7 @@ impl EditorApp {
                 self.persist_settings();
             }
 
+            CommandId::TriggerCompletion => self.trigger_completion(),
             CommandId::GoToDefinition => {
                 self.ask_about_symbol(editor_lsp::session::Query::Definition);
             }
@@ -3200,6 +3269,21 @@ fn has_syntax_error(diagnostics: &[editor_lsp::diagnostics::Diagnostic]) -> bool
         .any(|d| d.source == editor_lsp::session::BUILTIN_SOURCE)
 }
 
+/// Map a parse-tree symbol kind onto the protocol's numbering.
+///
+/// Done here rather than in `editor-syntax`, which has no business knowing
+/// about LSP; the popup's glyphs are keyed off the protocol's numbers because
+/// that is what a real server sends.
+fn lsp_kind(kind: editor_syntax::symbols::SymbolKind) -> u8 {
+    use editor_syntax::symbols::SymbolKind;
+    match kind {
+        SymbolKind::Function => 3,
+        SymbolKind::Class => 7,
+        SymbolKind::Module => 9,
+        SymbolKind::Binding | SymbolKind::Unknown => 6,
+    }
+}
+
 /// A parser error, as a diagnostic.
 ///
 /// Reported as an error rather than a warning because it is not a matter of
@@ -3403,6 +3487,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::FindNext),
             MenuEntry::Item(CommandId::FindPrevious),
             MenuEntry::Separator,
+            MenuEntry::Item(CommandId::TriggerCompletion),
             MenuEntry::Item(CommandId::GoToDefinition),
             MenuEntry::Item(CommandId::FindUses),
             MenuEntry::Item(CommandId::NextUse),
@@ -3708,6 +3793,34 @@ mod tests {
     /// Servers do not answer in document order. pyright returned the uses of
     /// one function as helpers.py:4, main.py:9, main.py:7 — so pressing F8
     /// walked *up* the file, which reads as the feature being broken.
+    #[test]
+    fn every_local_symbol_kind_maps_to_a_glyph_the_popup_knows() {
+        use editor_syntax::symbols::SymbolKind;
+        // The popup keys its glyphs off the protocol's numbers, because that is
+        // what a real server sends; a fallback item carrying a number the popup
+        // does not recognise would render as a bare dot beside real ones.
+        for kind in [
+            SymbolKind::Function,
+            SymbolKind::Class,
+            SymbolKind::Module,
+            SymbolKind::Binding,
+            SymbolKind::Unknown,
+        ] {
+            let item = editor_lsp::session::Completion {
+                label: "x".to_owned(),
+                insert: "x".to_owned(),
+                detail: None,
+                kind: Some(lsp_kind(kind)),
+                sort_text: None,
+            };
+            assert_ne!(
+                item.glyph(),
+                "\u{b7}",
+                "{kind:?} falls through to the unknown glyph"
+            );
+        }
+    }
+
     #[test]
     fn results_are_sorted_into_document_order_and_deduped() {
         let a = PathBuf::from("/p/a.py");
