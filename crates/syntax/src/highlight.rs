@@ -176,6 +176,22 @@ impl Highlighter {
         }
     }
 
+    /// Where the parser lost the thread, from the tree it already holds.
+    ///
+    /// This is what makes broken code visible with no language server
+    /// installed. The line-based INI fallback has no tree and reports nothing.
+    #[must_use]
+    pub fn errors(&self, text: &Rope) -> Vec<crate::errors::SyntaxError> {
+        match self {
+            Self::Tree(t) => t
+                .tree
+                .as_ref()
+                .map(|tree| crate::errors::from_tree(tree, text))
+                .unwrap_or_default(),
+            Self::Ini => Vec::new(),
+        }
+    }
+
     /// Styled runs covering `byte_range`, in ascending order and non-
     /// overlapping. Bytes with no capture are omitted; the caller paints those
     /// in the theme's default colour.

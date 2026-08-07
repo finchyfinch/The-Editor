@@ -5,6 +5,7 @@
 //! visible viewport only; parse trees are updated incrementally via
 //! `Tree::edit` on every transaction. See PLAN.md §3.5.
 
+pub mod errors;
 pub mod highlight;
 pub mod indent;
 pub mod templates;

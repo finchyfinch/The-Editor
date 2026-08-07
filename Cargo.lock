@@ -3532,6 +3532,7 @@ dependencies = [
  "notify-debouncer-full",
  "nucleo-matcher",
  "rfd",
+ "ropey",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

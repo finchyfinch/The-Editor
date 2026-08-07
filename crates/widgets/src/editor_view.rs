@@ -254,7 +254,10 @@ impl EditorView {
 
         let mut changed = false;
 
+        // Salted, so it cannot collide with the tab bar's scroll area above it
+        // in the same panel. See the note in `tab_bar`.
         egui::ScrollArea::both()
+            .id_salt("editor_view")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Claim the whole document; the scroll area decides what of it

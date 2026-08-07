@@ -20,6 +20,14 @@ use crate::diagnostics::{Diagnostic, Store};
 use crate::registry::{self, ServerSpec};
 use crate::server::{self, Event, Server};
 
+/// The source id for diagnostics The Editor produced itself, rather than
+/// received from a server.
+///
+/// A reserved id rather than a server's, so [`Store::clear_server`] on a
+/// crashed server never takes these with it and the two never overwrite each
+/// other.
+pub const BUILTIN_SOURCE: &str = "syntax";
+
 /// What happened that the application should react to.
 #[derive(Debug, Clone)]
 pub enum Notice {
@@ -83,6 +91,20 @@ impl Lsp {
     #[must_use]
     pub fn diagnostics(&self) -> &Store {
         &self.diagnostics
+    }
+
+    /// Publish diagnostics The Editor produced itself.
+    ///
+    /// Everything a language server offers is optional — PLAN.md §3.6 — so The
+    /// Editor has to be able to say something about broken code with nothing
+    /// installed. Those findings go through the same store as a server's, under
+    /// a reserved source id, so they merge with real diagnostics instead of
+    /// replacing them and are cleared on the same paths.
+    ///
+    /// An empty list means "no complaints", exactly as a `publishDiagnostics`
+    /// with an empty array does.
+    pub fn set_builtin(&mut self, path: &Path, diagnostics: Vec<Diagnostic>) {
+        self.diagnostics.set(path, BUILTIN_SOURCE, diagnostics);
     }
 
     /// Servers currently running, for the status bar and the toolchain check.

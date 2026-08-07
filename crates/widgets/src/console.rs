@@ -94,6 +94,7 @@ impl Console {
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
 
         let scroll = egui::ScrollArea::both()
+            .id_salt("console")
             .auto_shrink([false, false])
             .stick_to_bottom(self.follow_output)
             .show_rows(ui, row_height, output.line_count(), |ui, rows| {

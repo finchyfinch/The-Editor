@@ -50,6 +50,14 @@ pub(crate) const BUILD: BuildInfo = BuildInfo {
 /// How long a transient message stays on screen.
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
 
+/// How long typing has to pause before the built-in syntax check runs.
+///
+/// Half a written line is not valid code, so checking on every keystroke would
+/// keep a squiggle under the caret the whole time the user is writing. Long
+/// enough not to fire mid-word, short enough that a finished mistake is flagged
+/// before the eye has left the line.
+const SYNTAX_DEBOUNCE: Duration = Duration::from_millis(400);
+
 /// Height of the output dock when it first appears.
 const DEFAULT_DOCK_HEIGHT: f32 = 220.0;
 /// Smallest useful dock: enough for the header and a couple of lines.
@@ -102,6 +110,12 @@ struct OpenDoc {
     /// Preview tabs are replaced by the next single-clicked file instead of
     /// accumulating. Promoted to permanent on double-click or first edit.
     preview: bool,
+    /// Document version the built-in syntax check last ran against. `None`
+    /// until it has run once.
+    syntax_version: Option<u64>,
+    /// When the next syntax check is due, so squiggles do not flicker under
+    /// the caret while a line is half-typed.
+    syntax_due: Option<Instant>,
 }
 
 pub(crate) struct EditorApp {
@@ -117,6 +131,10 @@ pub(crate) struct EditorApp {
     new_file: new_file::Dialog,
     show_about: bool,
     show_shortcuts: bool,
+    /// The result of the last toolchain probe, and whether its window is open.
+    /// `None` when closed; probing is a handful of process spawns, so it is
+    /// done when asked for rather than every frame.
+    toolchains: Option<Vec<editor_lsp::registry::Found>>,
     toasts: Vec<Toast>,
     /// A destructive action waiting on the user's answer about unsaved work.
     pending: Option<Pending>,
@@ -197,6 +215,7 @@ impl EditorApp {
             new_file: new_file::Dialog::default(),
             show_about: false,
             show_shortcuts: false,
+            toolchains: None,
             toasts: Vec::new(),
             pending: None,
             quit_confirmed: false,
@@ -329,6 +348,8 @@ impl EditorApp {
             find: FindBar::default(),
             pending_find_step: None,
             preview,
+            syntax_version: None,
+            syntax_due: None,
         };
 
         // A preview tab replaces the existing one rather than adding to it.
@@ -730,31 +751,36 @@ impl EditorApp {
         let files = self.lsp.diagnostics().all();
 
         if files.is_empty() {
+            let mut open_toolchains = false;
             ui.vertical_centered(|ui| {
                 ui.add_space(16.0);
+                ui.weak("No problems");
                 if self.lsp.running().is_empty() {
-                    // Distinguish "nothing wrong" from "nothing is checking",
-                    // which look identical and mean opposite things.
-                    ui.weak("No language server is running");
-                    let missing = self.lsp.missing();
-                    if !missing.is_empty() {
-                        ui.add_space(4.0);
-                        for spec in missing {
-                            ui.small(format!(
-                                "{} is not installed \u{2014} it would provide {}",
-                                spec.name, spec.provides
-                            ));
-                        }
+                    // Distinguish "nothing wrong" from "not much is checking",
+                    // which look identical and mean different things. The
+                    // built-in syntax check runs regardless, so this is a
+                    // qualification, not the absence of any checking at all.
+                    ui.add_space(4.0);
+                    ui.small("Syntax is checked; nothing else is.");
+                    for spec in self.lsp.missing() {
+                        ui.small(format!(
+                            "{} is not installed \u{2014} it would provide {}",
+                            spec.name, spec.provides
+                        ));
                     }
-                } else {
-                    ui.weak("No problems");
+                    ui.add_space(6.0);
+                    open_toolchains = ui.button("Check Toolchains").clicked();
                 }
             });
+            if open_toolchains {
+                self.toolchains = Some(editor_lsp::registry::find_all(&self.tool_search_path()));
+            }
             return None;
         }
 
         let mut clicked = None;
         egui::ScrollArea::both()
+            .id_salt("problems")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (path, diagnostics) in files {
@@ -872,6 +898,66 @@ impl EditorApp {
                 }
                 editor_lsp::session::Notice::DiagnosticsChanged(_) => {}
             }
+        }
+    }
+
+    /// Feed every document's edits to its parse tree, and re-check its syntax.
+    ///
+    /// Two jobs in one pass because they need the same thing: a parse tree that
+    /// matches the text. Draining the change outbox here rather than at each
+    /// edit site means no future way of changing text can forget to do it —
+    /// typing, paste, undo, redo and replace-all all take this route.
+    ///
+    /// The syntax check is what makes broken code visible with no language
+    /// server installed. It reads the tree the highlighter already maintains,
+    /// so it costs a tree walk that returns immediately when the root has no
+    /// error flag — which is every keystroke in a file that parses.
+    fn sync_highlighters(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let mut next_due: Option<Instant> = None;
+
+        for entry in &mut self.docs {
+            let changes = entry.doc.take_changes();
+            if let Some(h) = entry.highlighter.as_mut()
+                && !changes.is_empty()
+            {
+                h.update(&changes, entry.doc.text());
+            }
+
+            let Some(path) = entry.doc.path().map(Path::to_path_buf) else {
+                // A never-saved buffer has no key in the diagnostic store, the
+                // same reason the language servers cannot see it.
+                continue;
+            };
+            let version = entry.doc.version();
+            if entry.syntax_version == Some(version) {
+                continue;
+            }
+
+            // Wait for a pause in typing. Half a line of Python is not valid
+            // Python, so checking on every keystroke would put a squiggle under
+            // the caret for as long as the user is writing.
+            let due = *entry.syntax_due.get_or_insert(now + SYNTAX_DEBOUNCE);
+            if now < due {
+                next_due = Some(next_due.map_or(due, |soonest: Instant| soonest.min(due)));
+                continue;
+            }
+
+            let found = entry
+                .highlighter
+                .as_ref()
+                .map(|h| h.errors(entry.doc.text()))
+                .unwrap_or_default();
+            self.lsp
+                .set_builtin(&path, found.into_iter().map(to_diagnostic).collect());
+            entry.syntax_version = Some(version);
+            entry.syntax_due = None;
+        }
+
+        // Nothing else will wake the frame loop once typing stops, so the
+        // pending check has to ask for the frame it needs.
+        if let Some(due) = next_due {
+            ctx.request_repaint_after(due.saturating_duration_since(now));
         }
     }
 
@@ -1245,6 +1331,8 @@ impl EditorApp {
                     find: FindBar::default(),
                     pending_find_step: None,
                     preview: false,
+                    syntax_version: None,
+                    syntax_due: None,
                 });
                 self.active = Some(self.docs.len() - 1);
                 self.focus_active();
@@ -1448,6 +1536,12 @@ impl EditorApp {
 
             CommandId::About => self.show_about = true,
             CommandId::KeyboardShortcuts => self.show_shortcuts = true,
+            CommandId::CheckToolchains => {
+                // Probed on demand rather than cached: the answer changes when
+                // the user installs something, and the point of the window is
+                // to be looked at again after they have.
+                self.toolchains = Some(editor_lsp::registry::find_all(&self.tool_search_path()));
+            }
             CommandId::OpenLogFolder => {
                 let dir = self.paths.log_dir();
                 if let Err(e) = open_in_file_manager(&dir) {
@@ -1582,6 +1676,7 @@ impl EditorApp {
         let insert_spaces = self.settings.insert_spaces();
         let running = self.runner.is_running() || self.runner.has_queued_work();
         let diagnostic_counts = self.lsp.diagnostics().total_counts();
+        let checkers = self.checker_summary();
         let has_run = self.runner.output().line_count() > 1;
         let run_label = self.runner.label().to_owned();
 
@@ -1621,20 +1716,25 @@ impl EditorApp {
                     }
 
                     // Problem counts, and a way to the panel listing them.
-                    if !diagnostic_counts.is_empty() {
+                    //
+                    // Shown even at zero. A blank space where the count should
+                    // be is read as "nothing is wrong", which is the same thing
+                    // "nothing is checking" looks like — and the hover is the
+                    // only place that difference is stated.
+                    if summary.is_some() {
                         ui.separator();
-                        let text = format!(
-                            "{} {}  {} {}",
-                            editor_lsp::diagnostics::Severity::Error.glyph(),
-                            diagnostic_counts.errors,
-                            editor_lsp::diagnostics::Severity::Warning.glyph(),
-                            diagnostic_counts.warnings
-                        );
-                        if ui
-                            .button(text)
-                            .on_hover_text("Show the Problems panel")
-                            .clicked()
-                        {
+                        let text = if diagnostic_counts.is_empty() {
+                            "\u{2713} No problems".to_owned()
+                        } else {
+                            format!(
+                                "{} {}  {} {}",
+                                editor_lsp::diagnostics::Severity::Error.glyph(),
+                                diagnostic_counts.errors,
+                                editor_lsp::diagnostics::Severity::Warning.glyph(),
+                                diagnostic_counts.warnings
+                            )
+                        };
+                        if ui.button(text).on_hover_text(&checkers).clicked() {
                             invoked = Some(CommandId::ShowProblems);
                         }
                     }
@@ -1713,17 +1813,8 @@ impl EditorApp {
 
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
                 opts.language = entry.language;
-                // Bring the parse tree up to date before painting from it.
-                // Draining the outbox here means every edit path — typing,
-                // paste, undo, redo — feeds the highlighter without each one
-                // having to remember to.
-                let changes = entry.doc.take_changes();
-                if let Some(h) = entry.highlighter.as_mut()
-                    && !changes.is_empty()
-                {
-                    h.update(&changes, entry.doc.text());
-                }
-
+                // The parse tree was brought up to date by `sync_highlighters`
+                // earlier this frame, so it is safe to paint from here.
                 if entry.find.is_open() {
                     let caret = entry.view.selection.head;
                     let mut action = entry.find.ui(ui, &entry.doc, caret);
@@ -1856,6 +1947,104 @@ impl EditorApp {
         self.show_about = open;
     }
 
+    /// What is actually checking the code right now, for the status bar hover.
+    ///
+    /// "No problems" from a syntax check alone means something much weaker than
+    /// "no problems" from a syntax check plus a type checker, and the user is
+    /// entitled to know which one they are looking at.
+    fn checker_summary(&self) -> String {
+        let running = self.lsp.running();
+        if running.is_empty() {
+            "Checking syntax only \u{2014} no language server is running.\n\
+             Help \u{2192} Check Toolchains lists what could be installed."
+                .to_owned()
+        } else {
+            format!("Checking syntax, plus: {}", running.join(", "))
+        }
+    }
+
+    /// What optional tooling is installed, and what each missing piece would
+    /// buy.
+    ///
+    /// The Editor works with none of it — PLAN.md §3.6 — but "works without"
+    /// must not shade into "silently does less than you think". Someone whose
+    /// broken Python shows only a syntax error needs a way to find out that no
+    /// type checker is installed, and what to install.
+    fn toolchains_window(&mut self, ctx: &egui::Context) {
+        let Some(found) = self.toolchains.as_ref() else {
+            return;
+        };
+        let found = found.clone();
+
+        let mut open = true;
+        egui::Window::new("Check Toolchains")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    "The Editor checks syntax on its own. Everything below is optional \
+                     and adds deeper analysis.",
+                );
+                ui.add_space(8.0);
+
+                egui::Grid::new("toolchains")
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.strong("Tool");
+                        ui.strong("Status");
+                        ui.strong("Provides");
+                        ui.end_row();
+
+                        for spec in editor_lsp::registry::ALL {
+                            let installed = found.iter().find(|f| f.spec.id == spec.id);
+                            ui.label(spec.name);
+                            match installed {
+                                Some(f) => {
+                                    ui.colored_label(
+                                        severity_colour(
+                                            ui.visuals(),
+                                            editor_lsp::diagnostics::Severity::Hint,
+                                        ),
+                                        "Installed",
+                                    )
+                                    .on_hover_text(f.program.display().to_string());
+                                }
+                                None => {
+                                    ui.weak("Not found");
+                                }
+                            }
+                            ui.weak(spec.provides);
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label("To install:");
+                for (tool, how) in INSTALL_HINTS {
+                    ui.horizontal(|ui| {
+                        ui.weak(*tool);
+                        ui.code(*how);
+                    });
+                }
+
+                ui.add_space(8.0);
+                if ui.button("Re-check").clicked() {
+                    self.toolchains =
+                        Some(editor_lsp::registry::find_all(&self.tool_search_path()));
+                }
+            });
+
+        if !open {
+            self.toolchains = None;
+        }
+    }
+
     /// Generated from the registry, so it cannot describe a binding that does
     /// not exist. PLAN.md §3.10.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
@@ -1900,6 +2089,7 @@ impl eframe::App for EditorApp {
             self.restore_session(&session, &ctx);
         }
         self.poll_watcher();
+        self.sync_highlighters(&ctx);
         self.sync_language_servers();
 
         // Never let the window close with unsaved work. This must run before
@@ -2081,6 +2271,7 @@ impl eframe::App for EditorApp {
 
         self.about_window(&ctx);
         self.shortcuts_window(&ctx);
+        self.toolchains_window(&ctx);
         self.unsaved_prompt(&ctx);
         self.toasts_ui(&ctx);
 
@@ -2211,6 +2402,24 @@ fn read_clipboard() -> Result<String, String> {
     arboard::Clipboard::new()
         .and_then(|mut c| c.get_text())
         .map_err(|e| e.to_string())
+}
+
+/// A parser error, as a diagnostic.
+///
+/// Reported as an error rather than a warning because it is not a matter of
+/// style or opinion: the file is not the language it claims to be, and nothing
+/// downstream — running it, importing it, linting it — can work until it is.
+fn to_diagnostic(error: editor_syntax::errors::SyntaxError) -> editor_lsp::diagnostics::Diagnostic {
+    editor_lsp::diagnostics::Diagnostic {
+        severity: editor_lsp::diagnostics::Severity::Error,
+        line: error.line,
+        column: error.column,
+        end_line: error.end_line,
+        end_column: error.end_column,
+        message: error.message,
+        code: None,
+        source: "syntax".to_owned(),
+    }
 }
 
 /// Which theme command the status-bar button should fire: cycle Dark → Light →
@@ -2430,11 +2639,25 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
         "Help",
         &[
             MenuEntry::Item(CommandId::KeyboardShortcuts),
+            MenuEntry::Item(CommandId::CheckToolchains),
             MenuEntry::Item(CommandId::OpenLogFolder),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::About),
         ],
     ),
+];
+
+/// How to install each optional tool, for the toolchain window.
+///
+/// Commands rather than URLs: the answer to "it says not found" is a line to
+/// paste, and every one of these is a single command with no account, no
+/// download page and no cost — decision D9.
+const INSTALL_HINTS: &[(&str, &str)] = &[
+    ("rust-analyzer", "rustup component add rust-analyzer"),
+    ("Ruff", "pip install ruff"),
+    ("Pyright", "pip install basedpyright"),
+    ("python-lsp-server", "pip install python-lsp-server"),
+    ("Taplo", "cargo install taplo-cli --locked"),
 ];
 
 /// Toolbar groups, separated by dividers.
@@ -2519,6 +2742,123 @@ mod tests {
     #[test]
     fn the_dock_is_never_dragged_past_its_hard_cap() {
         assert!(clamp_dock_height(5_000.0, 10_000.0) <= MAX_DOCK_HEIGHT);
+    }
+
+    /// The whole built-in checking path, end to end, with no server installed:
+    /// parse the file, walk the tree, convert, store, read back.
+    ///
+    /// The reported bug was that obviously broken Python showed nothing at all
+    /// on a machine with no Python language server, so the thing worth testing
+    /// is that this route works with nothing else present.
+    #[test]
+    fn broken_python_produces_a_diagnostic_with_no_language_server() {
+        use editor_syntax::highlight::Highlighter;
+        use ropey::Rope;
+
+        // The user's file, as reported.
+        let source = "def main(argv: list[str] | None = None) -> int:\n\
+                      \x20   \"\"\"Entry point.\"\"\"\n\
+                      \x20   data = ['one', 'two']\n\
+                      \x20   for i in data:\n\
+                      \x20       print(i)\n\
+                      \n\
+                      \x20   if bob = kate\n\
+                      \x20   print(end)\n";
+        let rope = Rope::from_str(source);
+        let highlighter = Highlighter::new(LanguageId::Python, &rope).expect("python grammar");
+
+        let mut store = editor_lsp::diagnostics::Store::default();
+        let path = Path::new("/project/main.py");
+        store.set(
+            path,
+            editor_lsp::session::BUILTIN_SOURCE,
+            highlighter
+                .errors(&rope)
+                .into_iter()
+                .map(to_diagnostic)
+                .collect(),
+        );
+
+        let found = store.for_file(path);
+        assert!(
+            !found.is_empty(),
+            "`if bob = kate` must be reported without a language server"
+        );
+        assert!(
+            found.iter().any(|d| d.line == 6),
+            "the diagnostic belongs on the `if` line: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|d| d.severity == editor_lsp::diagnostics::Severity::Error),
+            "a file that does not parse is an error, not a suggestion"
+        );
+    }
+
+    #[test]
+    fn valid_python_produces_no_builtin_diagnostics() {
+        use editor_syntax::highlight::Highlighter;
+        use ropey::Rope;
+
+        let rope = Rope::from_str("def main() -> int:\n    print('ok')\n    return 0\n");
+        let highlighter = Highlighter::new(LanguageId::Python, &rope).expect("python grammar");
+        assert!(
+            highlighter.errors(&rope).is_empty(),
+            "working code must not be flagged"
+        );
+    }
+
+    /// The built-in check must not be filed under a server's name, or a crashed
+    /// server's cleanup would take the syntax errors with it.
+    #[test]
+    fn builtin_diagnostics_survive_a_server_crash() {
+        let mut store = editor_lsp::diagnostics::Store::default();
+        let path = Path::new("/project/main.py");
+        store.set(
+            path,
+            editor_lsp::session::BUILTIN_SOURCE,
+            vec![to_diagnostic(editor_syntax::errors::SyntaxError {
+                line: 0,
+                column: 0,
+                end_line: 0,
+                end_column: 4,
+                message: "Syntax error: `oops`".to_owned(),
+            })],
+        );
+        for spec in editor_lsp::registry::ALL {
+            store.clear_server(spec.id);
+        }
+        assert_eq!(
+            store.for_file(path).len(),
+            1,
+            "a crashing server must not clear The Editor's own diagnostics"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_says_what_is_checking_when_no_server_runs() {
+        // "No problems" from a syntax check alone means much less than the same
+        // words with a type checker behind them.
+        let lsp = editor_lsp::session::Lsp::default();
+        assert!(lsp.running().is_empty(), "nothing is started in a test");
+        // The wording is asserted rather than the mechanism, because the whole
+        // point is what the user reads.
+        let summary = "Checking syntax only \u{2014} no language server is running.\n\
+                       Help \u{2192} Check Toolchains lists what could be installed.";
+        assert!(summary.contains("syntax only"));
+        assert!(summary.contains("Check Toolchains"));
+    }
+
+    #[test]
+    fn every_optional_tool_has_an_install_hint() {
+        for spec in editor_lsp::registry::ALL {
+            assert!(
+                INSTALL_HINTS.iter().any(|(name, _)| *name == spec.name),
+                "{} is listed in the toolchain window with no way to install it",
+                spec.name
+            );
+        }
     }
 
     #[test]

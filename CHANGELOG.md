@@ -8,7 +8,38 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Added
+
+- **Built-in syntax checking, with nothing installed.** Every language server is
+  optional, but until now that meant a machine without one showed no diagnostics
+  at all — a Python file containing `if bob = kate` looked perfectly healthy.
+  The tree-sitter grammar that highlights a file is already parsing it on every
+  keystroke and its error recovery marks exactly where it stopped making sense,
+  so that is now reported: squiggle, gutter glyph, Problems panel entry and
+  status-bar count, for every language with a grammar. It runs 400 ms after
+  typing stops, so a half-written line is not flagged while it is being written.
+  This finds what is not the language; undefined names, wrong arguments and type
+  errors still need a language server.
+- **Help → Check Toolchains**, which the plan has referred to since M0 and which
+  did not exist. Lists every optional tool, whether it was found, where, what it
+  would provide, and the one command that installs it. Reachable from the
+  Problems panel too, which is where the question comes up.
+
+### Changed
+
+- **The status bar always shows the problem count**, including `✓ No problems`.
+  A blank space where a count should be reads as "nothing is wrong", which looks
+  identical to "nothing is checking". Its hover now names what is actually
+  checking the file, and says so explicitly when only the built-in syntax check
+  is running.
+
 ### Fixed
+
+- **An egui ID clash painted a warning banner over the tab bar.** The tab bar
+  and the editor view are laid out one after another in the same panel, and both
+  took egui's automatically generated scroll-area id — which is derived from how
+  many widgets the parent has already created, so they collided. Every
+  scroll area that shares a parent with another now carries an explicit salt.
 
 - **`[Finished]` appeared in the middle of a program's output.** The reader
   thread and the process waiter both send to one channel and nothing ordered

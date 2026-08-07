@@ -153,6 +153,7 @@ impl FileTree {
 
         let mut action = Action::None;
         egui::ScrollArea::both()
+            .id_salt("file_tree")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;

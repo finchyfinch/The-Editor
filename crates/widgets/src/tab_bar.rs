@@ -38,7 +38,12 @@ pub enum Action {
 pub fn ui(ui: &mut egui::Ui, tabs: &[TabInfo], active: Option<usize>) -> Action {
     let mut action = Action::None;
 
+    // An explicit salt, not egui's auto id. Auto ids are derived from how many
+    // widgets the parent has already created, so two scroll areas laid out one
+    // after another in the same panel collide — and the collision paints an
+    // "ID clash" banner across the interface rather than failing quietly.
     egui::ScrollArea::horizontal()
+        .id_salt("tab_bar")
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.horizontal(|ui| {
