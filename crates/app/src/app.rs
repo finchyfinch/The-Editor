@@ -29,6 +29,7 @@ use crate::commands::{self, CommandId};
 use crate::new_file;
 use crate::palette::Palette;
 use crate::runner::Runner;
+use crate::settings_window;
 use crate::venv_dialog;
 use crate::watcher::Watcher;
 
@@ -131,6 +132,7 @@ pub(crate) struct EditorApp {
     new_file: new_file::Dialog,
     show_about: bool,
     show_shortcuts: bool,
+    settings_form: settings_window::SettingsWindow,
     /// The result of the last toolchain probe, and whether its window is open.
     /// `None` when closed; probing is a handful of process spawns, so it is
     /// done when asked for rather than every frame.
@@ -215,6 +217,7 @@ impl EditorApp {
             new_file: new_file::Dialog::default(),
             show_about: false,
             show_shortcuts: false,
+            settings_form: settings_window::SettingsWindow::default(),
             toolchains: None,
             toasts: Vec::new(),
             pending: None,
@@ -1574,6 +1577,7 @@ impl EditorApp {
             }
 
             CommandId::CommandPalette => self.palette.open(),
+            CommandId::OpenSettings => self.settings_form.open(&self.settings),
             CommandId::OpenSettingsFile => {
                 let path = self.paths.settings_file();
                 self.open_path(&path, false);
@@ -2008,6 +2012,50 @@ impl EditorApp {
         }
     }
 
+    /// Draw the Settings window and act on what it asked for.
+    ///
+    /// The window mutates `self.settings` directly, so the only work here is
+    /// persisting the change and routing the two buttons that need the
+    /// application's help. Nothing needs to be re-applied: `sync_appearance`
+    /// already re-reads the theme, zoom and font size every frame, and the
+    /// editor options are read fresh each time the editor is drawn.
+    fn settings_form_ui(&mut self, ctx: &egui::Context) {
+        if !self.settings_form.is_open() {
+            return;
+        }
+
+        let detected = self.detected_interpreter();
+        let running = self.lsp.running();
+        let action = self
+            .settings_form
+            .ui(ctx, &mut self.settings, detected.as_deref(), &running);
+
+        match action {
+            settings_window::Action::None => {}
+            settings_window::Action::Changed => self.persist_settings(),
+            settings_window::Action::OpenFile => self.run_command(CommandId::OpenSettingsFile, ctx),
+            settings_window::Action::PickInterpreter => {
+                self.run_command(CommandId::SelectInterpreter, ctx);
+                // The picker writes the setting; refresh the field behind it so
+                // the window is not still showing the old path.
+                self.settings_form.open(&self.settings);
+            }
+            settings_window::Action::CheckToolchains => {
+                self.run_command(CommandId::CheckToolchains, ctx);
+            }
+        }
+    }
+
+    /// The interpreter that would actually be used, for display.
+    ///
+    /// The setting is only a preference: an empty one means "detect", and a
+    /// project virtual environment wins over both. Showing the setting alone
+    /// would tell the user nothing about what Run is going to do.
+    fn detected_interpreter(&self) -> Option<String> {
+        editor_proc::interpreter::resolve(&self.settings.python_interpreter(), self.tree.root())
+            .map(|i| format!("{} ({})", i.path.display(), i.label()))
+    }
+
     /// What optional tooling is installed, and what each missing piece would
     /// buy.
     ///
@@ -2164,7 +2212,8 @@ impl eframe::App for EditorApp {
         // so a shortcut is not swallowed by a menu that happens to be open —
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
-        let modal_open = self.palette.is_open()
+        let modal_open = self.settings_form.is_open()
+            || self.palette.is_open()
             || self.new_file.is_open()
             || self.venv_dialog.is_open()
             || self.pending.is_some();
@@ -2325,6 +2374,7 @@ impl eframe::App for EditorApp {
         self.about_window(&ctx);
         self.shortcuts_window(&ctx);
         self.toolchains_window(&ctx);
+        self.settings_form_ui(&ctx);
         self.unsaved_prompt(&ctx);
         self.toasts_ui(&ctx);
 
@@ -2520,7 +2570,7 @@ fn toolbar_glyph(id: CommandId) -> &'static str {
         CommandId::RunStop => "\u{25a0}",
         CommandId::ToggleExplorer => "\u{2630}",
         CommandId::CommandPalette => "\u{2318}",
-        CommandId::OpenSettingsFile => "\u{2699}",
+        CommandId::OpenSettings | CommandId::OpenSettingsFile => "\u{2699}",
         _ => "?",
     }
 }
@@ -2698,7 +2748,15 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::CreateVenv),
         ],
     ),
-    ("Tools", &[MenuEntry::Item(CommandId::CommandPalette)]),
+    (
+        "Tools",
+        &[
+            MenuEntry::Item(CommandId::CommandPalette),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::OpenSettings),
+            MenuEntry::Item(CommandId::OpenSettingsFile),
+        ],
+    ),
     (
         "Help",
         &[
@@ -2719,7 +2777,7 @@ const TOOLBAR: &[&[CommandId]] = &[
     &[CommandId::Find],
     &[CommandId::Run, CommandId::RunStop],
     &[CommandId::ToggleExplorer],
-    &[CommandId::CommandPalette, CommandId::OpenSettingsFile],
+    &[CommandId::CommandPalette, CommandId::OpenSettings],
 ];
 
 #[cfg(test)]

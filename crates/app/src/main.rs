@@ -13,6 +13,7 @@ mod new_file;
 mod palette;
 mod panic_hook;
 mod runner;
+mod settings_window;
 mod venv_dialog;
 mod watcher;
 

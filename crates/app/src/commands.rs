@@ -61,6 +61,7 @@ pub(crate) enum CommandId {
     ZoomReset,
     // Tools
     CommandPalette,
+    OpenSettings,
     OpenSettingsFile,
     // Help
     About,
@@ -113,6 +114,7 @@ impl CommandId {
         Self::ZoomOut,
         Self::ZoomReset,
         Self::CommandPalette,
+        Self::OpenSettings,
         Self::OpenSettingsFile,
         Self::About,
         Self::KeyboardShortcuts,
@@ -298,10 +300,19 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         ctrl_shift(Key::P),
     ),
     cmd(
+        CommandId::OpenSettings,
+        "Tools",
+        "Settings",
+        ctrl(Key::Comma),
+    ),
+    // The file keeps its place in the menu as the escape hatch, but loses the
+    // accelerator to the form: Ctrl+, is what people press expecting a settings
+    // window, not a text buffer.
+    cmd(
         CommandId::OpenSettingsFile,
         "Tools",
         "Open settings.toml",
-        ctrl(Key::Comma),
+        None,
     ),
     cmd(CommandId::About, "Help", "About The Editor", None),
     cmd(

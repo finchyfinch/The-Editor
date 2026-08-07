@@ -31,6 +31,7 @@ pub const DEFAULT_SETTINGS_TOML: &str = "\
 # \"dark\" (default), \"light\", or \"system\" to follow the operating system.
 theme = \"dark\"
 # Syntax colours for the code pane. \"follow\" keeps them in step with `theme`.
+# Not yet implemented: the code pane always follows `theme` for now.
 syntax_theme = \"follow\"
 # Size of interface text - menus, tabs, the file tree, the status bar.
 # The code pane has its own independent editor.font_size below.
@@ -45,6 +46,7 @@ restore_session = true
 font_size = 13.0
 tab_width = 4
 insert_spaces = true
+# Not yet implemented: long lines always scroll horizontally for now.
 word_wrap = false
 # Typing an opening bracket or quote also inserts its closer.
 auto_close_brackets = true
@@ -273,6 +275,10 @@ impl Settings {
             .unwrap_or(defaults::RESTORE_SESSION)
     }
 
+    pub fn set_restore_session(&mut self, restore: bool) {
+        self.set("ui", "restore_session", value(restore));
+    }
+
     #[must_use]
     pub fn font_size(&self) -> f32 {
         clamp_f32(
@@ -296,10 +302,22 @@ impl Settings {
             .clamp(lo, hi)
     }
 
+    /// Clamped on write as well as on read, so the settings form cannot store a
+    /// value the accessor would then quietly ignore.
+    pub fn set_tab_width(&mut self, width: usize) {
+        let (lo, hi) = defaults::TAB_WIDTH_RANGE;
+        let width = width.clamp(lo, hi);
+        self.set("editor", "tab_width", value(width as i64));
+    }
+
     #[must_use]
     pub fn insert_spaces(&self) -> bool {
         self.bool_at("editor", "insert_spaces")
             .unwrap_or(defaults::INSERT_SPACES)
+    }
+
+    pub fn set_insert_spaces(&mut self, spaces: bool) {
+        self.set("editor", "insert_spaces", value(spaces));
     }
 
     #[must_use]
@@ -325,6 +343,10 @@ impl Settings {
     pub fn auto_close_brackets(&self) -> bool {
         self.bool_at("editor", "auto_close_brackets")
             .unwrap_or(defaults::AUTO_CLOSE_BRACKETS)
+    }
+
+    pub fn set_auto_close_brackets(&mut self, close: bool) {
+        self.set("editor", "auto_close_brackets", value(close));
     }
 
     pub fn set_word_wrap(&mut self, wrap: bool) {
