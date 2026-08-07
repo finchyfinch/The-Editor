@@ -6,8 +6,8 @@
 //! their source.
 //!
 //! Everything here is optional. The Editor must be perfectly usable with none
-//! of these installed â€” see PLAN.md Â§3.6 â€” so a missing server is a fact to
-//! report in Help â†’ Check Toolchains, never an error.
+//! of these installed — see PLAN.md §3.6 — so a missing server is a fact to
+//! report in Help → Check Toolchains, never an error.
 
 use std::path::{Path, PathBuf};
 
@@ -96,7 +96,7 @@ pub const ALL: &[ServerSpec] = &[RUST_ANALYZER, RUFF, PYRIGHT, PYLSP, TAPLO];
 /// The servers that serve a language, most important first.
 ///
 /// Uses the language's identifier rather than `LanguageId` so this crate does
-/// not depend on `editor-syntax` â€” the dependency would only run one way, but
+/// not depend on `editor-syntax` — the dependency would only run one way, but
 /// the protocol layer has no business knowing about grammars.
 #[must_use]
 pub fn for_language(language: &str) -> Vec<ServerSpec> {

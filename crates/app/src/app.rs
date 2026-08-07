@@ -7,7 +7,7 @@
 //! Each open document carries its own editing view state and its own parse tree
 //! for highlighting. Edits reach the parse tree by draining the document's
 //! change outbox once per frame rather than by every edit path remembering to
-//! notify it ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the same route the language server will take in M6.
+//! notify it — the same route the language server will take in M6.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -266,7 +266,7 @@ impl EditorApp {
         self.active.and_then(|i| self.docs.get_mut(i))
     }
 
-    /// Editor options from settings, with the language left at its default ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â
+    /// Editor options from settings, with the language left at its default —
     /// callers that have a document fill that in.
     fn editor_options(&self) -> EditorOptions {
         EditorOptions {
@@ -454,7 +454,7 @@ impl EditorApp {
         };
         let at_risk = self.at_risk(pending);
 
-        // Nothing actually unsaved ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â proceed without bothering the user.
+        // Nothing actually unsaved — proceed without bothering the user.
         if at_risk.is_empty() {
             self.pending = None;
             self.commit_pending(pending, ctx);
@@ -507,7 +507,7 @@ impl EditorApp {
             });
         });
 
-        // Escape is Cancel ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the safe option, never the destructive one.
+        // Escape is Cancel — the safe option, never the destructive one.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             decision = Some(Decision::Cancel);
         }
@@ -654,8 +654,8 @@ impl EditorApp {
     fn current_session(&self, ctx: &egui::Context) -> Session {
         let window = ctx.input(|i| {
             let viewport = i.viewport();
-            // Position comes from the outer rect Ã¢â‚¬â€ that is where the window
-            // actually is Ã¢â‚¬â€ but the size comes from the *inner* rect, because
+            // Position comes from the outer rect — that is where the window
+            // actually is — but the size comes from the *inner* rect, because
             // that is what `InnerSize` sets when restoring. Saving the outer
             // size and restoring it as the inner one makes the window grow by
             // the height of its own title bar on every launch.
@@ -703,8 +703,8 @@ impl EditorApp {
     fn open_folder(&mut self, folder: PathBuf) {
         tracing::info!(path = %folder.display(), "opening folder");
 
-        // Reopening the same folder Ã¢â‚¬â€ which session restore can do right after
-        // startup Ã¢â‚¬â€ should not tear down a working watch and build another.
+        // Reopening the same folder — which session restore can do right after
+        // startup — should not tear down a working watch and build another.
         if self.watcher.as_ref().is_some_and(|w| w.root() == folder) {
             self.tree.set_root(folder);
             return;
@@ -813,7 +813,7 @@ impl EditorApp {
     /// drain whatever they have said.
     ///
     /// Driven from the documents' own version counters rather than from the
-    /// edit path, so no future way of changing text can forget to tell them Ã¢â‚¬â€
+    /// edit path, so no future way of changing text can forget to tell them —
     /// the same reason the highlighter is driven from the change outbox.
     fn sync_language_servers(&mut self) {
         let extra_path = self.tool_search_path();
@@ -1491,7 +1491,7 @@ impl EditorApp {
 
         if changed {
             ui_theme::apply(ctx, resolved, scale, font_size);
-            // The code pane follows the UI theme. PLAN.md Ãƒâ€šÃ‚Â§3.11 allows pinning
+            // The code pane follows the UI theme. PLAN.md §3.11 allows pinning
             // them apart; the setting for that arrives with the settings UI.
             self.syntax_theme = SyntaxTheme::for_ui(resolved);
             self.applied_theme = Some(resolved);
@@ -1659,8 +1659,8 @@ impl EditorApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // The theme indicator is a control, not a label ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â one
-                        // of the three ways PLAN.md Ãƒâ€šÃ‚Â§3.11 requires it to be
+                        // The theme indicator is a control, not a label — one
+                        // of the three ways PLAN.md §3.11 requires it to be
                         // reachable.
                         if ui
                             .button(format!("\u{25d0} {theme_label}"))
@@ -1714,8 +1714,8 @@ impl EditorApp {
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
                 opts.language = entry.language;
                 // Bring the parse tree up to date before painting from it.
-                // Draining the outbox here means every edit path ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â typing,
-                // paste, undo, redo ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â feeds the highlighter without each one
+                // Draining the outbox here means every edit path — typing,
+                // paste, undo, redo — feeds the highlighter without each one
                 // having to remember to.
                 let changes = entry.doc.take_changes();
                 if let Some(h) = entry.highlighter.as_mut()
@@ -1857,7 +1857,7 @@ impl EditorApp {
     }
 
     /// Generated from the registry, so it cannot describe a binding that does
-    /// not exist. PLAN.md Ãƒâ€šÃ‚Â§3.10.
+    /// not exist. PLAN.md §3.10.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_shortcuts;
         egui::Window::new("Keyboard Shortcuts")
@@ -1918,7 +1918,7 @@ impl eframe::App for EditorApp {
         }
 
         // One command per frame, from whichever source fired. Keyboard first,
-        // so a shortcut is not swallowed by a menu that happens to be open ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â
+        // so a shortcut is not swallowed by a menu that happens to be open —
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
         let modal_open = self.palette.is_open()
@@ -1969,7 +1969,7 @@ impl eframe::App for EditorApp {
             }
         }
         // Between the steps of a sequence there is momentarily no process, but
-        // work is still pending ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â treating that as "finished" makes the status
+        // work is still pending — treating that as "finished" makes the status
         // bar and the console header flicker.
         if self.runner.is_running() || self.runner.has_queued_work() {
             // A running process produces output between frames, so keep
@@ -2143,7 +2143,7 @@ impl EditorApp {
 ///
 /// Replacements go through the document's normal transaction path, so they land
 /// in the undo history and reach the highlighter like any other edit. Replace
-/// All is a single transaction, and therefore a single undo step ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â undoing a
+/// All is a single transaction, and therefore a single undo step — undoing a
 /// 500-match replace one match at a time would be unusable.
 fn apply_find_action(entry: &mut OpenDoc, action: find_bar::Action) {
     use editor_core::edit::{Edit, Transaction};
@@ -2202,7 +2202,7 @@ fn new_highlighter(language: LanguageId, doc: &Document) -> Option<Highlighter> 
     Highlighter::new(language, doc.text())
 }
 
-/// Read the system clipboard, for the Edit ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Paste menu item.
+/// Read the system clipboard, for the Edit → Paste menu item.
 ///
 /// Keyboard paste does not come through here: egui synthesises `Event::Paste`
 /// with the text already attached, and the editor widget handles it. This
@@ -2213,8 +2213,8 @@ fn read_clipboard() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Which theme command the status-bar button should fire: cycle Dark ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Light ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢
-/// System ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Dark.
+/// Which theme command the status-bar button should fire: cycle Dark → Light →
+/// System → Dark.
 fn next_theme_command(current_label: &str) -> CommandId {
     match current_label {
         "Dark" => CommandId::ThemeLight,

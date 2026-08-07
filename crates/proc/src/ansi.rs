@@ -137,8 +137,14 @@ impl AnsiSink {
 
     /// Append text that did not come from the child — the command header, the
     /// exit banner — in the default style.
+    ///
+    /// Only breaks the current line if there is something on it. Ending an
+    /// already-empty line would emit a blank one before every banner, which is
+    /// what put a gap between the command header and the working directory.
     pub fn push_line(&mut self, text: &str) {
-        self.state.finish_line();
+        if !self.state.current.is_empty() {
+            self.state.finish_line();
+        }
         self.state.current.runs.push(Run {
             text: text.to_owned(),
             style: Style::default(),
@@ -458,6 +464,50 @@ mod tests {
             banner.runs[0].style,
             Style::default(),
             "the exit banner must not inherit the program's colour"
+        );
+    }
+
+    #[test]
+    fn injected_lines_do_not_leave_blank_lines_behind_them() {
+        // Regression: `push_line` always ended the current line, so a banner
+        // written when nothing was part-way through emitted an empty line
+        // first — visible as a gap between the command header and the working
+        // directory.
+        let mut sink = AnsiSink::new(100);
+        sink.push_line("> command");
+        sink.push_line("  in /somewhere");
+
+        let lines: Vec<String> = sink.lines().map(Line::plain).collect();
+        assert_eq!(
+            lines,
+            ["> command", "  in /somewhere", ""],
+            "expected no blank line between the banners"
+        );
+    }
+
+    #[test]
+    fn a_banner_after_partial_output_starts_on_its_own_line() {
+        // The other half of the same rule: output that stopped mid-line must
+        // not have the banner appended to it.
+        let mut sink = AnsiSink::new(100);
+        sink.feed(b"no trailing newline");
+        sink.push_line("[Finished]");
+
+        let lines: Vec<String> = sink.lines().map(Line::plain).collect();
+        assert_eq!(lines, ["no trailing newline", "[Finished]", ""]);
+    }
+
+    #[test]
+    fn a_banner_after_a_complete_line_does_not_add_a_gap() {
+        let mut sink = AnsiSink::new(100);
+        sink.feed(b"one\ntwo\n");
+        sink.push_line("[Finished]");
+
+        let lines: Vec<String> = sink.lines().map(Line::plain).collect();
+        assert_eq!(
+            lines,
+            ["one", "two", "[Finished]", ""],
+            "a trailing newline already ended the line"
         );
     }
 

@@ -10,6 +10,22 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **`[Finished]` appeared in the middle of a program's output.** The reader
+  thread and the process waiter both send to one channel and nothing ordered
+  them, so a program that printed several lines and exited immediately could
+  have its exit announced while output it had already produced was still
+  sitting in the terminal buffer. The exit is now announced only once the
+  reader has seen end of stream — with a two-second grace period as a fallback,
+  for the case where a grandchild process keeps the terminal open after its
+  parent has gone. A session reports itself as still running until the exit
+  event is on the channel, so a caller that stops draining when the run ends
+  cannot miss it.
+- **A banner injected into the console left a blank line behind it.** The
+  `[Finished]` and `[Exited with code N]` lines finished the current line even
+  when there was nothing on it, producing a stray gap before the banner.
+- **Comment text was corrupted in seven source files** by an editing tool that
+  re-encoded UTF-8 as cp1252; em dashes and section signs had turned into
+  mojibake. Byte-order marks were stripped from three files at the same time.
 - **Arrow keys moved focus out of the editor instead of the caret.** egui's
   focus navigation claims the arrow and Tab keys before a widget sees them
   unless the widget declares an event filter saying it wants them. `TextEdit`

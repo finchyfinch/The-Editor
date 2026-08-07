@@ -1,4 +1,4 @@
-﻿//! Running a child process under a pseudo-terminal.
+//! Running a child process under a pseudo-terminal.
 //!
 //! A PTY rather than piped stdio, which is the decision that makes `input()`
 //! prompts, `cargo`'s colour, Ctrl-C and progress bars all behave the way they
@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -59,7 +60,7 @@ impl Session {
     /// Spawn a command under a new PTY.
     ///
     /// # Errors
-    /// If the PTY cannot be opened or the program cannot be started â€” a missing
+    /// If the PTY cannot be opened or the program cannot be started — a missing
     /// interpreter, a bad working directory.
     pub fn spawn(config: &RunConfig, rows: u16, cols: u16) -> Result<Self> {
         let pty = NativePtySystem::default();
@@ -108,13 +109,15 @@ impl Session {
         let child = Arc::new(Mutex::new(child));
 
         let writer = Arc::new(Mutex::new(writer));
+        let exit_state = Arc::new(ExitState::default());
         spawn_reader(
             reader_name(config),
             &mut reader,
             tx.clone(),
             Arc::clone(&writer),
+            Arc::clone(&exit_state),
         );
-        spawn_waiter(Arc::clone(&child), tx, Arc::clone(&finished));
+        spawn_waiter(Arc::clone(&child), tx, Arc::clone(&finished), exit_state);
 
         Ok(Self {
             events,
@@ -210,7 +213,7 @@ fn reader_name(config: &RunConfig) -> String {
 /// Device Status Report: "where is the cursor?"
 ///
 /// Windows ConPTY sends this at startup and, in some configurations, waits for
-/// an answer before letting the child get on with it â€” so a console that never
+/// an answer before letting the child get on with it — so a console that never
 /// replies looks exactly like a program that produced no output and never
 /// exited. Answering is a terminal's job, so the reader thread answers.
 const DSR_REQUEST: &[u8] = b"\x1b[6n";
@@ -224,6 +227,7 @@ fn spawn_reader(
     reader: &mut Box<dyn Read + Send>,
     tx: Sender<Event>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    state: Arc<ExitState>,
 ) {
     // `reader` is moved into the thread; the caller keeps nothing.
     let mut reader = std::mem::replace(reader, Box::new(std::io::empty()));
@@ -248,6 +252,14 @@ fn spawn_reader(
                 Err(_) => break,
             }
         }
+
+        // Everything the program produced has now been sent. Announcing the
+        // exit from here — after the last Output on the same channel — is what
+        // keeps the banner below the output rather than somewhere inside it.
+        state.drained.store(true, Ordering::SeqCst);
+        if state.code.lock().is_ok_and(|c| c.is_some()) {
+            announce_exit(&state, &tx);
+        }
     });
 }
 
@@ -255,10 +267,45 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Shared between the reader and the waiter so the exit event can be ordered
+/// after the last of the output.
+///
+/// The two threads write to one channel, and a process can exit while output it
+/// already produced is still sitting in the terminal buffer. Letting the waiter
+/// announce the exit as soon as `try_wait` succeeds puts `[Finished]` in the
+/// middle of the program's output — which is exactly what happened.
+#[derive(Debug, Default)]
+struct ExitState {
+    /// `Some(code)` once the process has been reaped. The inner `Option` is
+    /// `None` for a process that was signalled rather than exiting.
+    code: Mutex<Option<Option<i32>>>,
+    /// Set once the reader has seen end of stream, so nothing more is coming.
+    drained: AtomicBool,
+    /// Ensures the exit is announced exactly once, whichever thread gets there.
+    announced: AtomicBool,
+}
+
+/// How long the waiter gives the reader to finish after the process ends.
+///
+/// Normally the reader sees end of stream within microseconds. The wait exists
+/// for the case where something else still holds the terminal open — a
+/// grandchild that outlived its parent — so the console is not left saying a
+/// finished process is still running.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+fn announce_exit(state: &ExitState, tx: &Sender<Event>) {
+    if state.announced.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let code = state.code.lock().ok().and_then(|c| *c).flatten();
+    let _ = tx.send(Event::Exited(code));
+}
+
 fn spawn_waiter(
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     tx: Sender<Event>,
     finished: Arc<AtomicBool>,
+    state: Arc<ExitState>,
 ) {
     let _ = std::thread::Builder::new()
         .name("pty-waiter".to_owned())
@@ -273,7 +320,7 @@ fn spawn_waiter(
                         // Release the lock before sleeping, or `stop` cannot
                         // take it to kill the process.
                         drop(guard);
-                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        std::thread::sleep(Duration::from_millis(30));
                     }
                     Err(e) => {
                         let _ = tx.send(Event::Failed(e.to_string()));
@@ -282,9 +329,23 @@ fn spawn_waiter(
                 }
             };
 
+            if let Ok(mut slot) = state.code.lock() {
+                *slot = Some(status.map(|s| s.exit_code() as i32));
+            }
+
+            // Let the reader finish first, so every line the program printed is
+            // already in the console before it is told the program ended.
+            let deadline = Instant::now() + DRAIN_GRACE;
+            while !state.drained.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            announce_exit(&state, &tx);
+
+            // Only now is the session finished. Flipping this before the
+            // announcement would let a caller that polls `is_running` stop
+            // draining the channel one moment before the exit event lands on
+            // it, and never see the run complete.
             finished.store(true, Ordering::Relaxed);
-            let code = status.map(|s| s.exit_code() as i32);
-            let _ = tx.send(Event::Exited(code));
         });
 }
 
@@ -292,7 +353,7 @@ fn spawn_waiter(
 ///
 /// Windows has no process groups in the Unix sense; `taskkill /T` walks the
 /// parent-child chain and is what every tool ends up using. A Job Object would
-/// be more robust â€” it survives a process re-parenting itself â€” but needs a
+/// be more robust — it survives a process re-parenting itself — but needs a
 /// meaningful amount of unsafe FFI for a case that does not arise with
 /// `cargo` or `python`.
 pub fn kill_tree(pid: u32) {
@@ -392,6 +453,58 @@ mod tests {
         );
     }
 
+    /// Regression: the exit event could overtake output still buffered in the
+    /// terminal, putting `[Finished]` in the middle of a program's output.
+    ///
+    /// Both threads write to one channel, so nothing ordered them; a short
+    /// program that printed several lines and exited immediately hit it
+    /// readily. Repeated, because a race that happens sometimes is still a bug.
+    #[test]
+    fn the_exit_event_never_overtakes_the_output() {
+        for attempt in 0..8 {
+            let script = "for i in 1 2 3 4 5 6 7 8; do echo line$i; done";
+            let config = if cfg!(windows) {
+                RunConfig {
+                    args: vec![
+                        "/C".to_owned(),
+                        "for %i in (1 2 3 4 5 6 7 8) do @echo line%i".to_owned(),
+                    ],
+                    ..trivial_command("")
+                }
+            } else {
+                RunConfig {
+                    args: vec!["-c".to_owned(), script.to_owned()],
+                    ..trivial_command("")
+                }
+            };
+
+            let session = Session::spawn(&config, 24, 80).expect("spawns");
+            let events = run_to_completion(&session);
+
+            // Every Output must come before the Exited on the same channel.
+            let exit_index = events
+                .iter()
+                .position(|e| matches!(e, Event::Exited(_)))
+                .unwrap_or_else(|| panic!("attempt {attempt}: no exit event"));
+            let output_after = events
+                .iter()
+                .skip(exit_index + 1)
+                .any(|e| matches!(e, Event::Output(_)));
+            assert!(
+                !output_after,
+                "attempt {attempt}: output arrived after the exit event, so the \
+                 banner would appear mid-output"
+            );
+
+            // ...and the last line the program printed really did arrive.
+            let text = output_text(&events);
+            assert!(
+                text.contains("line8"),
+                "attempt {attempt}: the last line was lost: {text}"
+            );
+        }
+    }
+
     #[test]
     fn a_failing_command_reports_its_exit_code() {
         let config = if cfg!(windows) {
@@ -439,6 +552,31 @@ mod tests {
         );
         run_to_completion(&session);
         assert!(!session.is_running(), "should have finished");
+    }
+
+    /// Regression: a caller that polls `is_running` and stops draining when it
+    /// goes false must still see the exit event.
+    ///
+    /// The drain-ordering fix originally set the flag as soon as the process
+    /// was reaped, which is up to a whole grace period before the event was
+    /// sent — so the run appeared to end without ever reporting a code.
+    #[test]
+    fn the_exit_event_is_already_queued_when_the_session_reports_it_finished() {
+        let session = Session::spawn(&trivial_command("x"), 24, 80).expect("spawns");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let running = session.is_running();
+            events.extend(session.drain());
+            if !running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Exited(_))),
+            "no exit event was waiting when the session said it had finished: {events:?}"
+        );
     }
 
     #[test]

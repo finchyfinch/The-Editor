@@ -1,6 +1,6 @@
-﻿//! The Editor â€” an IDE for Python and Rust.
+//! The Editor — an IDE for Python and Rust.
 //!
-//! Copyright Â© 2026 Gareth Finch. MIT licensed.
+//! Copyright © 2026 Gareth Finch. MIT licensed.
 
 // Release builds on Windows must not open a console window behind the app.
 // Debug builds keep it, because that is where the log tail is.

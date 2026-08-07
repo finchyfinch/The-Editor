@@ -2,7 +2,7 @@
 //!
 //! Shows what the running program printed, lets you type into it, and turns
 //! file references into links. Scrolling follows the output unless the user has
-//! scrolled up to read something â€” output that yanks you back to the bottom
+//! scrolled up to read something — output that yanks you back to the bottom
 //! every time a line arrives is unusable.
 
 use std::path::PathBuf;
@@ -169,7 +169,7 @@ impl Console {
             }
 
             // With links present, style is dropped in favour of the link
-            // segmentation â€” a compiler diagnostic is more useful clickable
+            // segmentation — a compiler diagnostic is more useful clickable
             // than coloured, and combining the two would mean splitting runs
             // against link boundaries for little gain.
             let mut action = None;

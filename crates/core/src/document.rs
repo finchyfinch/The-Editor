@@ -1,4 +1,4 @@
-﻿//! Documents: a rope, where it came from, and how to write it back unchanged.
+//! Documents: a rope, where it came from, and how to write it back unchanged.
 //!
 //! The rope always holds text with `\n` line endings, whatever was on disk.
 //! That keeps every offset calculation in the editor honest — a CRLF file

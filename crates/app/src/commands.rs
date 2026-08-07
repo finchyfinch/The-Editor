@@ -2,11 +2,11 @@
 //!
 //! Every user-facing action is registered here exactly once, with its title,
 //! category and keyboard shortcut. The menus, the toolbar, the command palette
-//! and the Help â†’ Keyboard Shortcuts page are all generated from this list.
+//! and the Help → Keyboard Shortcuts page are all generated from this list.
 //!
 //! The point is not tidiness. It is that a menu item and its keyboard shortcut
 //! cannot drift apart into doing different things, and that a new command
-//! cannot be added to a menu but forgotten in the palette. See PLAN.md Â§5.
+//! cannot be added to a menu but forgotten in the palette. See PLAN.md §5.
 
 use eframe::egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -140,7 +140,7 @@ pub(crate) struct Command {
 }
 
 impl Command {
-    /// `"File: Open Folder"` â€” what the palette matches against and displays.
+    /// `"File: Open Folder"` — what the palette matches against and displays.
     pub(crate) fn palette_label(&self) -> String {
         format!("{}: {}", self.category, self.title)
     }
@@ -173,7 +173,7 @@ const fn ctrl_shift(key: Key) -> Option<KeyboardShortcut> {
 /// The registry.
 ///
 /// `Modifiers::COMMAND` is Ctrl on Windows and Linux and Cmd on macOS, so the
-/// platform mapping described in PLAN.md Â§6 comes for free rather than needing
+/// platform mapping described in PLAN.md §6 comes for free rather than needing
 /// a `cfg!` at every call site.
 pub(crate) fn registry() -> &'static [Command] {
     &REGISTRY
