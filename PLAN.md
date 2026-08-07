@@ -855,11 +855,11 @@ Linux or macOS, which remains the single largest piece of unknown work.
 
 | # | Milestone | State | What is missing |
 |---|---|---|---|
-| M1 | Shell & layout | Substantially done | Tab drag-reorder and overflow dropdown; Ctrl+Tab most-recently-used cycling; go-to-file (Ctrl+P); native macOS menu bar via `muda` |
-| M2 | Editor core | Core done | Multi-cursor and column selection; line duplicate / move / delete; external-change detection; crash-recovery autosave; the §2.4 performance benchmarks |
+| M1 | Shell & layout | Substantially done | Tab drag-reorder and overflow dropdown; Ctrl+Tab most-recently-used cycling; native macOS menu bar via `muda` |
+| M2 | Editor core | Core done | Multi-cursor and column selection; external-change detection; crash-recovery autosave; the §2.4 performance benchmarks |
 | M3 | Syntax highlighting | Done for 9 languages | HTML injections (embedded `<script>`/`<style>`); shebang and manual language override; the user-editable TOML theme format |
 | M4 | Editing intelligence | Indent engine done | `.editorconfig`; trim-trailing-whitespace and final-newline on save; re-indent on paste; bracket-match highlighting; code folding |
-| M5 | Search | In-file done | Project-wide search and replace on the ripgrep engine — the crate holds only the query engine so far; go-to-symbol |
+| M5 | Search | In-file done | Project-wide search and replace on the ripgrep engine — the crate holds the query engine and a file walk so far; go-to-symbol |
 | M6 | Language servers | Mostly done | Hover, rename, code actions, format-on-save. Diagnostics, Go to Definition, Find Uses and the completion popup are done; all four have a parse-tree fallback for when no server can answer |
 | M7 | Run & console | Running done | Install Packages / Show Installed Packages; run configurations in `.ide/run.toml` |
 | M8 | Settings, themes, New File | Form done | The keymap file and conflict detection (only its path exists), user themes, and New Project. `editor.word_wrap` and `ui.syntax_theme` are read from the file and ignored by everything else, so the form does not offer them |

@@ -10,6 +10,18 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Line manipulation**: Duplicate Line (Ctrl+Shift+D), Delete Line
+  (Ctrl+Shift+K), Move Line Up/Down (Alt+Up/Down). Each acts on the whole block
+  of lines the selection touches, keeps that block selected so the shortcut can
+  be held down, and is a single undo step.
+- **Go to File (Ctrl+P).** Fuzzy-matches the project's files with the same
+  matcher as the command palette, biased towards the file name — typing `utils`
+  wants `utils.py`, not the four files inside a directory called `utils` — while
+  still matching across the whole path, so `mdl/utl` finds `models/utils.py`.
+  The walk skips `.git`, `target`, `node_modules`, `__pycache__`, `.venv` and
+  the like at any depth, does not follow symlinks, and is bounded by depth and
+  by a cap it admits to when it hits.
+
 - **Ctrl+Space forces the completion popup**, below the two-character floor
   that keeps it from appearing unbidden over a single letter.
 - **Completion works with no language server**, from the parse tree: every

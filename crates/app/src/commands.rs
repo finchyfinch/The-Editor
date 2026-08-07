@@ -41,6 +41,11 @@ pub(crate) enum CommandId {
     Replace,
     FindNext,
     FindPrevious,
+    DuplicateLine,
+    DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
+    GoToFile,
     TriggerCompletion,
     GoToDefinition,
     FindUses,
@@ -102,6 +107,11 @@ impl CommandId {
         Self::Replace,
         Self::FindNext,
         Self::FindPrevious,
+        Self::DuplicateLine,
+        Self::DeleteLine,
+        Self::MoveLineUp,
+        Self::MoveLineDown,
+        Self::GoToFile,
         Self::TriggerCompletion,
         Self::GoToDefinition,
         Self::FindUses,
@@ -171,6 +181,10 @@ const fn ctrl(key: Key) -> Option<KeyboardShortcut> {
 
 const fn plain(key: Key) -> KeyboardShortcut {
     KeyboardShortcut::new(Modifiers::NONE, key)
+}
+
+const fn alt(key: Key) -> KeyboardShortcut {
+    KeyboardShortcut::new(Modifiers::ALT, key)
 }
 
 const fn shift(key: Key) -> KeyboardShortcut {
@@ -257,6 +271,34 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Find Previous",
         Some(shift(Key::F3)),
     ),
+    // The bindings every other editor uses for these, so the muscle memory
+    // transfers. Alt is free here: the editor claims the plain arrows for the
+    // caret, and `matches_exact` keeps the two apart.
+    cmd(
+        CommandId::DuplicateLine,
+        "Edit",
+        "Duplicate Line",
+        ctrl_shift(Key::D),
+    ),
+    cmd(
+        CommandId::DeleteLine,
+        "Edit",
+        "Delete Line",
+        ctrl_shift(Key::K),
+    ),
+    cmd(
+        CommandId::MoveLineUp,
+        "Edit",
+        "Move Line Up",
+        Some(alt(Key::ArrowUp)),
+    ),
+    cmd(
+        CommandId::MoveLineDown,
+        "Edit",
+        "Move Line Down",
+        Some(alt(Key::ArrowDown)),
+    ),
+    cmd(CommandId::GoToFile, "File", "Go to File", ctrl(Key::P)),
     cmd(
         CommandId::TriggerCompletion,
         "Edit",

@@ -27,6 +27,7 @@ use eframe::egui;
 
 use crate::commands::{self, CommandId};
 use crate::completion;
+use crate::file_picker::FilePicker;
 use crate::new_file;
 use crate::palette::Palette;
 use crate::runner::Runner;
@@ -207,6 +208,8 @@ pub(crate) struct EditorApp {
     pending_delete: Option<PathBuf>,
     /// Results of the last Find Uses, and where in them the user is.
     uses: UseResults,
+    /// Go to File (Ctrl+P).
+    file_picker: FilePicker,
     /// The completion popup, and the request behind it.
     completion: completion::Popup,
     /// Document version the popup was last synced against, so the word under
@@ -279,6 +282,7 @@ impl EditorApp {
             pending_recent: None,
             pending_delete: None,
             uses: UseResults::default(),
+            file_picker: FilePicker::default(),
             completion: completion::Popup::default(),
             completion_version: None,
             lsp: editor_lsp::session::Lsp::default(),
@@ -927,6 +931,34 @@ impl EditorApp {
         });
 
         open_toolchains
+    }
+
+    /// Run an editing operation on the active document.
+    ///
+    /// Line operations are commands so they reach the menu and the palette, but
+    /// they act on the view, and every one needs the same two lookups and the
+    /// same "is there a document" guard.
+    fn on_view(&mut self, f: impl FnOnce(&mut EditorView, &mut Document) -> bool) {
+        if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i))
+            && f(&mut entry.view, &mut entry.doc)
+        {
+            // Editing a preview tab promotes it, as typing does.
+            entry.preview = false;
+        }
+    }
+
+    /// Open Go to File over a fresh listing of the project.
+    fn open_file_picker(&mut self) {
+        let Some(root) = self.tree.root().map(Path::to_path_buf) else {
+            self.info("Open a folder first: Go to File searches the project");
+            return;
+        };
+        let listing = editor_search::files::list(&root);
+        if listing.files.is_empty() {
+            self.info("No files found in this folder");
+            return;
+        }
+        self.file_picker.open(listing);
     }
 
     /// The word being typed at the caret: where it starts, and what it is.
@@ -2163,6 +2195,11 @@ impl EditorApp {
                 self.persist_settings();
             }
 
+            CommandId::DuplicateLine => self.on_view(|view, doc| view.duplicate_lines(doc)),
+            CommandId::DeleteLine => self.on_view(|view, doc| view.delete_lines(doc)),
+            CommandId::MoveLineUp => self.on_view(|view, doc| view.move_lines(doc, -1)),
+            CommandId::MoveLineDown => self.on_view(|view, doc| view.move_lines(doc, 1)),
+            CommandId::GoToFile => self.open_file_picker(),
             CommandId::TriggerCompletion => self.trigger_completion(),
             CommandId::GoToDefinition => {
                 self.ask_about_symbol(editor_lsp::session::Query::Definition);
@@ -2868,6 +2905,7 @@ impl eframe::App for EditorApp {
         // Tab, Escape and the arrows belong to it, and a global shortcut firing
         // behind it would act on a document the user is not looking at.
         let modal_open = self.completion.is_open()
+            || self.file_picker.is_open()
             || self.settings_form.is_open()
             || self.pending_delete.is_some()
             || self.palette.is_open()
@@ -3035,6 +3073,11 @@ impl eframe::App for EditorApp {
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.
         self.completion_draw(&ctx);
+        if let Some(relative) = self.file_picker.ui(&ctx)
+            && let Some(root) = self.tree.root().map(Path::to_path_buf)
+        {
+            self.open_path(&root.join(relative), false);
+        }
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
         self.toasts_ui(&ctx);
@@ -3453,6 +3496,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::NewScratch),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::OpenFile),
+            MenuEntry::Item(CommandId::GoToFile),
             MenuEntry::Recent,
             MenuEntry::Item(CommandId::OpenFolder),
             MenuEntry::Item(CommandId::CloseFolder),
@@ -3479,6 +3523,11 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::SelectAll),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::ToggleComment),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::DuplicateLine),
+            MenuEntry::Item(CommandId::DeleteLine),
+            MenuEntry::Item(CommandId::MoveLineUp),
+            MenuEntry::Item(CommandId::MoveLineDown),
             MenuEntry::Item(CommandId::Indent),
             MenuEntry::Item(CommandId::Outdent),
             MenuEntry::Separator,

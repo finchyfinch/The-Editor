@@ -867,6 +867,158 @@ impl EditorView {
     ///
     /// One transaction, so the whole block is a single undo step, and the
     /// selection is preserved so Tab can be pressed repeatedly.
+    /// The lines the selection touches, as a character range covering whole
+    /// lines including the trailing newline of the last one.
+    ///
+    /// The last line of a document has no trailing newline, so the range stops
+    /// at the end of the text; callers that move a block have to put the
+    /// newline back themselves. Getting this wrong is how line operations end
+    /// up joining two lines together.
+    fn line_block(&self, doc: &Document) -> std::ops::Range<usize> {
+        let lines = self.selected_lines(doc);
+        let start = doc.line_start(*lines.start());
+        let last = *lines.end();
+        let end = (doc.line_start(last) + doc.line_len(last) + 1).min(doc.len_chars());
+        start..end
+    }
+
+    /// Copy the selected lines and paste them directly below.
+    ///
+    /// The caret follows the copy, so pressing it twice gives three, which is
+    /// what people expect from a duplicate command.
+    pub fn duplicate_lines(&mut self, doc: &mut Document) -> bool {
+        if !doc.is_editable() {
+            return false;
+        }
+        let block = self.line_block(doc);
+        let mut text: String = doc.text().slice(block.clone()).chars().collect();
+        // The final line of a file has no newline of its own; the copy needs
+        // one or it runs into the line it was copied from.
+        if !text.ends_with('\n') {
+            text.insert(0, '\n');
+        }
+        let inserted = text.chars().count();
+
+        let before = self.selection;
+        let after = Selection::new(before.anchor + inserted, before.head + inserted);
+        doc.break_undo_run();
+        doc.apply(
+            &Transaction::new(vec![editor_core::edit::Edit::insert(block.end, text)]),
+            before,
+            after,
+        );
+        self.selection = after;
+        doc.break_undo_run();
+        self.scroll_to_caret = true;
+        self.touch();
+        true
+    }
+
+    /// Delete the selected lines outright.
+    pub fn delete_lines(&mut self, doc: &mut Document) -> bool {
+        if !doc.is_editable() || doc.len_chars() == 0 {
+            return false;
+        }
+        let mut block = self.line_block(doc);
+        // Deleting the last line takes the newline *before* it, or the file is
+        // left ending in a blank line that was not there before.
+        if block.end >= doc.len_chars() && block.start > 0 {
+            block.start -= 1;
+        }
+
+        let before = self.selection;
+        let after = Selection::at(block.start.min(doc.len_chars().saturating_sub(1)));
+        doc.break_undo_run();
+        doc.apply(
+            &Transaction::new(vec![editor_core::edit::Edit::delete(block.clone())]),
+            before,
+            after,
+        );
+        self.selection = Selection::at(block.start.min(doc.len_chars()));
+        doc.break_undo_run();
+        self.scroll_to_caret = true;
+        self.touch();
+        true
+    }
+
+    /// Move the selected lines up or down by one.
+    ///
+    /// Implemented as one replace over both blocks rather than two edits, so
+    /// there is no intermediate state in which the text is duplicated or lost,
+    /// and so the whole move is a single undo step.
+    pub fn move_lines(&mut self, doc: &mut Document, direction: isize) -> bool {
+        if !doc.is_editable() {
+            return false;
+        }
+        let lines = self.selected_lines(doc);
+        let (first, last) = (*lines.start(), *lines.end());
+        // A file ending in a newline has a final empty line that ropey counts
+        // but nobody wrote. Moving the last real line "down" into it would
+        // append a blank line that was not there before.
+        let count = doc.line_count();
+        let movable = if count > 1 && doc.line_len(count - 1) == 0 {
+            count - 1
+        } else {
+            count
+        };
+
+        let other = if direction < 0 {
+            if first == 0 {
+                return false;
+            }
+            first - 1
+        } else {
+            if last + 1 >= movable {
+                return false;
+            }
+            last + 1
+        };
+
+        // The two blocks, in document order.
+        let (upper, lower) = if direction < 0 {
+            (line_range(doc, other, other), line_range(doc, first, last))
+        } else {
+            (line_range(doc, first, last), line_range(doc, other, other))
+        };
+
+        let span = upper.start..lower.end;
+        let upper_text: String = doc.text().slice(upper.clone()).chars().collect();
+        let lower_text: String = doc.text().slice(lower.clone()).chars().collect();
+
+        // Whichever block ends the file has no trailing newline. Swapping the
+        // two verbatim would move that missing newline to the middle and glue
+        // two lines together, so the separator is rebuilt rather than carried.
+        let upper_body = upper_text.strip_suffix('\n').unwrap_or(&upper_text);
+        let lower_body = lower_text.strip_suffix('\n').unwrap_or(&lower_text);
+        let ends_with_newline = lower_text.ends_with('\n');
+        let mut swapped = format!("{lower_body}\n{upper_body}");
+        if ends_with_newline {
+            swapped.push('\n');
+        }
+
+        // Where the moved block lands, so the same lines stay selected.
+        let shift = if direction < 0 {
+            -((upper_body.chars().count() + 1) as isize)
+        } else {
+            (lower_body.chars().count() + 1) as isize
+        };
+        let moved = |offset: usize| (offset as isize + shift).max(0) as usize;
+
+        let before = self.selection;
+        let after = Selection::new(moved(before.anchor), moved(before.head));
+        doc.break_undo_run();
+        doc.apply(
+            &Transaction::new(vec![editor_core::edit::Edit::replace(span, swapped)]),
+            before,
+            after,
+        );
+        self.selection = after;
+        doc.break_undo_run();
+        self.scroll_to_caret = true;
+        self.touch();
+        true
+    }
+
     pub fn shift_lines(&mut self, doc: &mut Document, opts: EditorOptions, levels: isize) -> bool {
         if !doc.is_editable() {
             return false;
@@ -1518,6 +1670,14 @@ pub enum ContextAction {
     Paste,
 }
 
+/// The character range of whole lines `first..=last`, including the trailing
+/// newline of the last one where there is one.
+fn line_range(doc: &Document, first: usize, last: usize) -> std::ops::Range<usize> {
+    let start = doc.line_start(first);
+    let end = (doc.line_start(last) + doc.line_len(last) + 1).min(doc.len_chars());
+    start..end
+}
+
 /// Whether this key press means "by word" rather than "by character".
 ///
 /// Ctrl on Windows and Linux; Option on macOS, where Cmd+arrow is start/end of
@@ -1614,6 +1774,170 @@ mod tests {
             assert!(!word_modifier(egui::Modifiers::ALT));
         }
         assert!(!word_modifier(egui::Modifiers::NONE));
+    }
+
+    #[test]
+    fn duplicating_a_line_puts_the_copy_below_it() {
+        let mut doc = doc_with("one\ntwo\nthree\n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1)); // `two`
+        assert!(view.duplicate_lines(&mut doc));
+        assert_eq!(doc.text().to_string(), "one\ntwo\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn duplicating_again_gives_a_third_copy() {
+        // The caret has to follow the copy, or the second press duplicates the
+        // original again and the two copies end up interleaved.
+        let mut doc = doc_with("one\ntwo\n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1));
+        view.duplicate_lines(&mut doc);
+        view.duplicate_lines(&mut doc);
+        assert_eq!(doc.text().to_string(), "one\ntwo\ntwo\ntwo\n");
+    }
+
+    #[test]
+    fn duplicating_the_last_line_of_a_file_without_a_final_newline() {
+        // The block has no newline of its own, so the copy needs one in front
+        // of it or the two lines are glued together.
+        let mut doc = doc_with("one\ntwo");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1));
+        view.duplicate_lines(&mut doc);
+        assert_eq!(doc.text().to_string(), "one\ntwo\ntwo");
+    }
+
+    #[test]
+    fn duplicating_a_multi_line_selection_copies_the_whole_block() {
+        let mut doc = doc_with("a\nb\nc\n");
+        let mut view = EditorView::default();
+        view.select_range(0, doc.line_start(1) + 1);
+        view.duplicate_lines(&mut doc);
+        assert_eq!(doc.text().to_string(), "a\nb\na\nb\nc\n");
+    }
+
+    #[test]
+    fn deleting_a_line_removes_it_and_its_newline() {
+        let mut doc = doc_with("one\ntwo\nthree\n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1));
+        assert!(view.delete_lines(&mut doc));
+        assert_eq!(doc.text().to_string(), "one\nthree\n");
+    }
+
+    #[test]
+    fn deleting_the_last_line_does_not_leave_a_blank_one_behind() {
+        // Taking the newline *after* the last line is impossible -- there is
+        // none -- so the one before it goes instead.
+        let mut doc = doc_with("one\ntwo");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1));
+        view.delete_lines(&mut doc);
+        assert_eq!(doc.text().to_string(), "one");
+    }
+
+    #[test]
+    fn deleting_the_only_line_empties_the_document() {
+        let mut doc = doc_with("only\n");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        view.delete_lines(&mut doc);
+        assert_eq!(doc.text().to_string(), "");
+    }
+
+    #[test]
+    fn moving_a_line_down_swaps_it_with_the_one_below() {
+        let mut doc = doc_with("one\ntwo\nthree\n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(0));
+        assert!(view.move_lines(&mut doc, 1));
+        assert_eq!(doc.text().to_string(), "two\none\nthree\n");
+    }
+
+    #[test]
+    fn moving_a_line_up_swaps_it_with_the_one_above() {
+        let mut doc = doc_with("one\ntwo\nthree\n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(2));
+        assert!(view.move_lines(&mut doc, -1));
+        assert_eq!(doc.text().to_string(), "one\nthree\ntwo\n");
+    }
+
+    #[test]
+    fn moving_past_either_end_does_nothing() {
+        let mut doc = doc_with("one\ntwo\n");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        assert!(!view.move_lines(&mut doc, -1), "already at the top");
+        view.set_caret(doc.line_start(1));
+        assert!(!view.move_lines(&mut doc, 1), "already at the bottom");
+        assert_eq!(doc.text().to_string(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn moving_into_a_final_line_that_has_no_newline_does_not_join_them() {
+        // The missing newline belongs to the *end of the file*, not to the
+        // block being moved. Swapping the two blocks verbatim would carry it
+        // into the middle and produce "twoone".
+        let mut doc = doc_with("one\ntwo");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        view.move_lines(&mut doc, 1);
+        assert_eq!(doc.text().to_string(), "two\none");
+    }
+
+    #[test]
+    fn moving_a_line_keeps_it_selected() {
+        // So the shortcut can be held down to walk a line up a file.
+        let mut doc = doc_with("aaa\nbb\nc\n");
+        let mut view = EditorView::default();
+        view.select_range(doc.line_start(2), doc.line_start(2) + 1);
+        view.move_lines(&mut doc, -1);
+        assert_eq!(doc.text().to_string(), "aaa\nc\nbb\n");
+        assert_eq!(
+            view.selected_text(&doc).as_deref(),
+            Some("c"),
+            "the moved text is no longer selected"
+        );
+    }
+
+    #[test]
+    fn a_line_move_survives_repeated_application() {
+        // Walking a line from the bottom to the top and back must be lossless.
+        let mut doc = doc_with("one\ntwo\nthree\nfour\n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(3));
+        for _ in 0..3 {
+            view.move_lines(&mut doc, -1);
+        }
+        assert_eq!(doc.text().to_string(), "four\none\ntwo\nthree\n");
+        for _ in 0..3 {
+            view.move_lines(&mut doc, 1);
+        }
+        assert_eq!(doc.text().to_string(), "one\ntwo\nthree\nfour\n");
+    }
+
+    #[test]
+    fn each_line_operation_is_a_single_undo_step() {
+        let mut doc = doc_with("one\ntwo\nthree\n");
+        let original = doc.text().to_string();
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1));
+
+        view.duplicate_lines(&mut doc);
+        assert!(view.undo(&mut doc));
+        assert_eq!(doc.text().to_string(), original, "duplicate");
+
+        view.set_caret(doc.line_start(1));
+        view.delete_lines(&mut doc);
+        assert!(view.undo(&mut doc));
+        assert_eq!(doc.text().to_string(), original, "delete");
+
+        view.set_caret(doc.line_start(1));
+        view.move_lines(&mut doc, 1);
+        assert!(view.undo(&mut doc));
+        assert_eq!(doc.text().to_string(), original, "move");
     }
 
     #[test]

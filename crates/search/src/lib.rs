@@ -5,6 +5,7 @@
 //! remains cancellable. A project-wide replace is applied as a single undoable
 //! operation. See PLAN.md §3.7.
 
+pub mod files;
 pub mod query;
 
 // Still to come.
