@@ -864,7 +864,7 @@ Linux or macOS, which remains the single largest piece of unknown work.
 | M7 | Run & console | Running done | Install Packages / Show Installed Packages; run configurations in `.ide/run.toml` |
 | M8 | Settings, themes, New File | Form done | The keymap file and conflict detection (only its path exists), user themes, and New Project. `editor.word_wrap` and `ui.syntax_theme` are read from the file and ignored by everything else, so the form does not offer them |
 | M9 | Polish & docs | Partly | About, Keyboard Shortcuts and Check Toolchains exist. Missing: user manual, third-party licence page, accessibility pass, icons and app icon, first-run experience, startup perf pass |
-| M10 | Release 1.0.0 | Not started | Packaging for all three platforms, checksums, release notes |
+| M10 | Release 1.0.0 | Windows done | macOS `.app`/dmg and Linux AppImage/deb; release notes. Windows ships as a single statically linked exe in a zip with a SHA-256, built by `tools/make-release.bat` |
 
 ### Landed beyond the plan
 

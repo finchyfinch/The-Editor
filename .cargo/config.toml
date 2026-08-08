@@ -9,3 +9,13 @@ editor = ["run", "--package", "the-editor"]
 
 # The M2 rendering spike. See crates/spike/src/main.rs.
 spike = ["run", "--release", "--package", "editor-spike"]
+
+# Link the C runtime statically on Windows.
+#
+# Without this the executable imports VCRUNTIME140.dll and will not start on a
+# machine that has never had a Visual Studio redistributable installed --
+# which, for something distributed as a portable zip and deliberately unsigned
+# (PLAN.md decision D10), is the difference between "copy one file" and "copy
+# one file, then find and run an installer from Microsoft".
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

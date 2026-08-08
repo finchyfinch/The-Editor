@@ -10,6 +10,11 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **`tools\make-release.bat`** builds, tests, and stages a Windows release into
+  `dist\` — a folder, a zip, and its SHA-256. The checksum matters more than
+  usual because the binary is deliberately unsigned, so a published hash is the
+  only way for someone to check they received what was sent.
+
 - **An application icon**, compiled into the executable as a Windows resource
   so Explorer, the taskbar and Alt+Tab show it rather than the generic one, and
   set on the window as well — those are read from different places and setting
@@ -96,6 +101,12 @@ Entries are written as each milestone lands, not retroactively at release time.
   Problems panel too, which is where the question comes up.
 
 ### Changed
+
+- **The C runtime is linked statically on Windows.** The executable previously
+  imported `VCRUNTIME140.dll` and would not start on a machine that had never
+  had a Visual Studio redistributable installed — for something distributed as
+  a portable zip, that is the difference between "copy one file" and "copy one
+  file, then find and run an installer from Microsoft".
 
 - **Tools → Open settings.toml is gone.** The Settings window replaced it, and
   its Advanced page still opens the file for anyone who wants it. The "Not yet
