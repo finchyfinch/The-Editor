@@ -23,7 +23,17 @@ pub(crate) fn init(log_dir: &Path) -> Result<(LogGuard, PathBuf)> {
     std::fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log directory {}", log_dir.display()))?;
 
-    let appender = tracing_appender::rolling::daily(log_dir, "the-editor.log");
+    // `Builder` rather than `rolling::daily`, which names files
+    // `the-editor.log.2026-08-08` -- a dot in the middle and no extension at
+    // the end, so Windows has no idea what to open it with and the user is
+    // asked to choose an application every time. `the-editor_2026-08-08.log`
+    // opens in a text editor by double-clicking.
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("the-editor")
+        .filename_suffix("log")
+        .build(log_dir)
+        .with_context(|| format!("opening the log in {}", log_dir.display()))?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {

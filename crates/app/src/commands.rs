@@ -445,19 +445,122 @@ pub(crate) fn get(id: CommandId) -> &'static Command {
 ///
 /// Consuming the shortcut prevents it also reaching a focused text field.
 pub(crate) fn triggered(ctx: &eframe::egui::Context) -> Option<CommandId> {
-    registry().iter().find_map(|cmd| {
-        if !cmd.global {
-            return None;
-        }
+    // Most modifiers first. egui's `consume_shortcut` matches *logically*, not
+    // exactly: an extra Shift or Alt is ignored, so Ctrl+Shift+Z satisfies a
+    // Ctrl+Z binding. Its own documentation says to check the more specific
+    // shortcut first, and in registry order Undo (Ctrl+Z) comes before Redo
+    // (Ctrl+Shift+Z) -- so Redo ran Undo, Save As ran Save, and Shift+F12 ran
+    // Go to Definition.
+    //
+    // Sorting here rather than reordering the registry, because the registry's
+    // order is what the menus and the palette read, and a future binding added
+    // in the obvious place would silently reintroduce this.
+    let mut candidates: Vec<&Command> = registry()
+        .iter()
+        .filter(|cmd| cmd.global && cmd.shortcut.is_some())
+        .collect();
+    candidates.sort_by_key(|cmd| std::cmp::Reverse(specificity(cmd)));
+
+    candidates.into_iter().find_map(|cmd| {
         let sc = cmd.shortcut?;
         ctx.input_mut(|i| i.consume_shortcut(&sc)).then_some(cmd.id)
     })
+}
+
+/// How many modifiers a binding demands. More is more specific.
+fn specificity(cmd: &Command) -> u32 {
+    let Some(sc) = cmd.shortcut else { return 0 };
+    let m = sc.modifiers;
+    u32::from(m.shift)
+        + u32::from(m.alt)
+        + u32::from(m.ctrl)
+        + u32::from(m.mac_cmd)
+        + u32::from(m.command)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// The bug this ordering exists for: Redo ran Undo.
+    ///
+    /// egui matches shortcuts logically, so an extra Shift is ignored and
+    /// Ctrl+Shift+Z satisfies Ctrl+Z. Whichever is checked first wins, and in
+    /// registry order that was Undo.
+    #[test]
+    fn a_shortcut_with_more_modifiers_is_checked_first() {
+        let mut candidates: Vec<&Command> = registry()
+            .iter()
+            .filter(|cmd| cmd.global && cmd.shortcut.is_some())
+            .collect();
+        candidates.sort_by_key(|cmd| std::cmp::Reverse(specificity(cmd)));
+
+        // For every pair sharing a key, the one demanding more modifiers must
+        // come first in the order `triggered` walks.
+        for (i, a) in candidates.iter().enumerate() {
+            for b in &candidates[i + 1..] {
+                let (Some(sa), Some(sb)) = (a.shortcut, b.shortcut) else {
+                    continue;
+                };
+                if sa.logical_key != sb.logical_key {
+                    continue;
+                }
+                assert!(
+                    specificity(a) >= specificity(b),
+                    "{:?} ({} modifiers) is checked after {:?} ({}), so it can never fire",
+                    b.id,
+                    specificity(b),
+                    a.id,
+                    specificity(a),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pairs_that_actually_collide_are_ordered_correctly() {
+        // Named explicitly, because these are the ones a user notices.
+        let order: Vec<CommandId> = {
+            let mut c: Vec<&Command> = registry()
+                .iter()
+                .filter(|cmd| cmd.global && cmd.shortcut.is_some())
+                .collect();
+            c.sort_by_key(|cmd| std::cmp::Reverse(specificity(cmd)));
+            c.into_iter().map(|cmd| cmd.id).collect()
+        };
+        let before = |a: CommandId, b: CommandId| {
+            let ia = order.iter().position(|id| *id == a);
+            let ib = order.iter().position(|id| *id == b);
+            match (ia, ib) {
+                (Some(ia), Some(ib)) => ia < ib,
+                _ => true,
+            }
+        };
+        assert!(before(CommandId::Redo, CommandId::Undo), "Ctrl+Shift+Z");
+        assert!(before(CommandId::SaveAs, CommandId::Save), "Ctrl+Shift+S");
+        assert!(
+            before(CommandId::OpenFolder, CommandId::OpenFile),
+            "Ctrl+Shift+O"
+        );
+        assert!(
+            before(CommandId::NewScratch, CommandId::NewFile),
+            "Ctrl+Shift+N"
+        );
+        assert!(
+            before(CommandId::FindPrevious, CommandId::FindNext),
+            "Shift+F3"
+        );
+        assert!(before(CommandId::RunStop, CommandId::Run), "Shift+F5");
+        assert!(
+            before(CommandId::FindUses, CommandId::GoToDefinition),
+            "Shift+F12"
+        );
+        assert!(
+            before(CommandId::PreviousUse, CommandId::NextUse),
+            "Shift+F8"
+        );
+    }
 
     #[test]
     fn every_command_id_is_registered() {

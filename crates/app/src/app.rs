@@ -218,6 +218,12 @@ pub(crate) struct EditorApp {
     pending_delete: Option<PathBuf>,
     /// Whether the Problems panel shows every file or only the open one.
     problems_all_files: bool,
+    /// The diagnostic the caret is sitting on, so the Problems panel can pick
+    /// it out of a long list. Its line and column, not an index: the list is
+    /// rebuilt every frame and an index into it would not survive.
+    problem_at_caret: Option<(PathBuf, u32, u32)>,
+    /// What the panel last scrolled to, so it only does so when it changes.
+    problem_revealed: Option<(PathBuf, u32, u32)>,
     /// Results of the last Find Uses, and where in them the user is.
     uses: UseResults,
     /// Go to File (Ctrl+P).
@@ -294,6 +300,8 @@ impl EditorApp {
             pending_recent: None,
             pending_delete: None,
             problems_all_files: false,
+            problem_at_caret: None,
+            problem_revealed: None,
             uses: UseResults::default(),
             file_picker: FilePicker::default(),
             completion: completion::Popup::default(),
@@ -869,6 +877,11 @@ impl EditorApp {
         }
 
         let mut clicked = None;
+        let here_now = self.problem_at_caret.clone();
+        // Scroll to it once per change, not every frame.
+        let mut reveal = self.problem_at_caret != self.problem_revealed;
+        self.problem_revealed = self.problem_at_caret.clone();
+
         egui::ScrollArea::both()
             .id_salt("problems")
             .auto_shrink([false, false])
@@ -900,30 +913,55 @@ impl EditorApp {
                     }
 
                     for diagnostic in diagnostics {
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.colored_label(
-                                severity_colour(ui.visuals(), diagnostic.severity),
-                                diagnostic.severity.glyph(),
-                            );
-                            ui.weak(format!("{}:{}", diagnostic.line + 1, diagnostic.column + 1));
-                            let row = ui.add(
-                                egui::Label::new(diagnostic.summary())
+                        // The one the caret is sitting on, so a long list can
+                        // be searched from the editor rather than by eye.
+                        let at_caret = here_now.as_ref().is_some_and(|(p, line, column)| {
+                            *p == path && *line == diagnostic.line && *column == diagnostic.column
+                        });
+                        let row = ui
+                            .horizontal(|ui| {
+                                ui.add_space(12.0);
+                                ui.colored_label(
+                                    severity_colour(ui.visuals(), diagnostic.severity),
+                                    diagnostic.severity.glyph(),
+                                );
+                                ui.weak(format!(
+                                    "{}:{}",
+                                    diagnostic.line + 1,
+                                    diagnostic.column + 1
+                                ));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(diagnostic.summary()).background_color(
+                                            if at_caret {
+                                                ui.visuals().selection.bg_fill
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            },
+                                        ),
+                                    )
                                     .sense(egui::Sense::click())
                                     .truncate(),
-                            );
-                            if row
-                                .on_hover_text(&diagnostic.message)
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                clicked = Some((
-                                    path.clone(),
-                                    diagnostic.line as usize,
-                                    diagnostic.column as usize,
-                                ));
-                            }
-                        });
+                                )
+                            })
+                            .inner;
+
+                        if at_caret && std::mem::take(&mut reveal) {
+                            // Only when it changed, or the panel would fight
+                            // the user for the scrollbar every frame.
+                            row.scroll_to_me(Some(egui::Align::Center));
+                        }
+                        if row
+                            .on_hover_text(&diagnostic.message)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            clicked = Some((
+                                path.clone(),
+                                diagnostic.line as usize,
+                                diagnostic.column as usize,
+                            ));
+                        }
                     }
                     ui.add_space(4.0);
                 }
@@ -998,6 +1036,36 @@ impl EditorApp {
             return;
         }
         self.file_picker.open(listing);
+    }
+
+    /// Find the diagnostic under the caret, for the Problems panel to reveal.
+    ///
+    /// Recomputed each frame from the caret rather than set when the user
+    /// clicks, so arrowing onto a squiggle reveals it too — and so it clears
+    /// itself the moment the caret moves off.
+    fn sync_problem_at_caret(&mut self) {
+        self.problem_at_caret = self.diagnostic_under_caret();
+    }
+
+    fn diagnostic_under_caret(&self) -> Option<(PathBuf, u32, u32)> {
+        let entry = self.active.and_then(|i| self.docs.get(i))?;
+        let path = entry.doc.path()?;
+        let caret = entry.view.selection.head;
+
+        self.lsp
+            .diagnostics()
+            .for_file(path)
+            .into_iter()
+            .find(|d| {
+                let start = entry.doc.offset_at(d.line as usize, d.column as usize);
+                let end = entry
+                    .doc
+                    .offset_at(d.end_line as usize, d.end_column as usize);
+                // Inclusive of the end, so a caret left just past the last
+                // character of a squiggle still counts as on it.
+                caret >= start && caret <= end.max(start)
+            })
+            .map(|d| (path.to_path_buf(), d.line, d.column))
     }
 
     /// The word being typed at the caret: where it starts, and what it is.
@@ -3016,6 +3084,7 @@ impl eframe::App for EditorApp {
         self.poll_watcher();
         self.sync_highlighters(&ctx);
         self.sync_completion();
+        self.sync_problem_at_caret();
         // Before the menu bar, toolbar and editor read this frame's events:
         // whoever looks first gets the key.
         self.completion_keys(&ctx);
@@ -3723,7 +3792,6 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::CommandPalette),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::OpenSettings),
-            MenuEntry::Item(CommandId::OpenSettingsFile),
         ],
     ),
     (

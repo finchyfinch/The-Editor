@@ -10,6 +10,10 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **The problem under the caret is highlighted and scrolled to in the Problems
+  panel.** Finding which of two hundred entries belongs to the squiggle you are
+  looking at was otherwise a manual search.
+
 - **Go to Definition searches the project when no language server can answer.**
   Previously it looked only in the open file, which for a function defined in
   another module means never finding anything. Files of the same language are
@@ -75,6 +79,10 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Changed
 
+- **Tools → Open settings.toml is gone.** The Settings window replaced it, and
+  its Advanced page still opens the file for anyone who wants it. The "Not yet
+  implemented" note has gone from that page too.
+
 - **The status bar always shows the problem count**, including `✓ No problems`.
   A blank space where a count should be reads as "nothing is wrong", which looks
   identical to "nothing is checking". Its hover now names what is actually
@@ -88,6 +96,18 @@ Entries are written as each milestone lands, not retroactively at release time.
   waiting. The panel now says so under the file's name.
 
 ### Fixed
+
+- **Redo ran Undo**, Save As ran Save, Shift+F12 ran Go to Definition, and
+  every other Shift-plus-something binding fired its unshifted twin. egui's
+  `consume_shortcut` matches modifiers *logically*, so an extra Shift is
+  ignored and Ctrl+Shift+Z satisfies a Ctrl+Z binding — whichever is checked
+  first wins, and in registry order that was always the less specific one.
+  Shortcuts are now tried most-specific first. This is also why Shift+F12 never
+  appeared to work when Find Uses was added; that was not Windows reserving
+  F12, as recorded at the time.
+- **Log files are named `the-editor_2026-08-08.log`** rather than
+  `the-editor.log.2026-08-08`, which had a dot in the middle and no extension
+  at the end, so Windows asked which application to open it with every time.
 
 - **Language servers are now told how to behave.** The Editor never answered
   `workspace/configuration`, so every server fell back on its own defaults —

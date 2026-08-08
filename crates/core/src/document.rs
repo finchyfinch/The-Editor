@@ -552,6 +552,51 @@ fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redo_puts_back_what_undo_took_away() {
+        use crate::edit::Transaction;
+        use crate::selection::Selection;
+        let mut doc = super::Document::untitled();
+        doc.apply(
+            &Transaction::insert(0, "hello"),
+            Selection::at(0),
+            Selection::at(5),
+        );
+        assert_eq!(doc.text().to_string(), "hello");
+
+        assert!(doc.undo().is_some());
+        assert_eq!(doc.text().to_string(), "", "undo");
+
+        assert!(doc.redo().is_some(), "there is something to redo");
+        assert_eq!(doc.text().to_string(), "hello", "redo");
+    }
+
+    #[test]
+    fn several_steps_undo_and_redo_in_order() {
+        use crate::edit::Transaction;
+        use crate::selection::Selection;
+        let mut doc = super::Document::untitled();
+        for (i, word) in ["one", "two", "three"].iter().enumerate() {
+            let at = doc.text().len_chars();
+            doc.apply(
+                &Transaction::insert(at, *word),
+                Selection::at(at),
+                Selection::at(at + word.len()),
+            );
+            doc.break_undo_run();
+            let _ = i;
+        }
+        assert_eq!(doc.text().to_string(), "onetwothree");
+
+        doc.undo();
+        doc.undo();
+        assert_eq!(doc.text().to_string(), "one");
+        doc.redo();
+        assert_eq!(doc.text().to_string(), "onetwo", "first redo");
+        doc.redo();
+        assert_eq!(doc.text().to_string(), "onetwothree", "second redo");
+    }
+
     use super::*;
 
     #[test]

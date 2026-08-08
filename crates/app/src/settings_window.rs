@@ -495,14 +495,6 @@ fn advanced(ui: &mut egui::Ui, settings: &Settings) -> Action {
         action = Action::OpenFile;
     }
 
-    ui.add_space(12.0);
-    heading(ui, "Not yet implemented");
-    ui.small(
-        "`editor.word_wrap` and `ui.syntax_theme` are read from the file but do nothing yet, \
-         so they are not offered above. Long lines scroll horizontally, and the code pane \
-         always follows the interface theme.",
-    );
-
     action
 }
 
