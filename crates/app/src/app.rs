@@ -3583,6 +3583,18 @@ impl eframe::App for EditorApp {
         self.delete_prompt(&ctx);
         self.toasts_ui(&ctx);
 
+        // A breakpoint asked for by a gutter click or the context menu. Drained
+        // here, after the editor has drawn: the view records the request and
+        // the application owns the breakpoint set, because breakpoints outlive
+        // the view that showed them.
+        if let Some(line) = self
+            .active
+            .and_then(|i| self.docs.get_mut(i))
+            .and_then(|e| e.view.take_breakpoint_toggle())
+        {
+            self.toggle_breakpoint(line);
+        }
+
         // The editor's right-click menu, drained after the frame it was used in
         // so nothing mutates the document while it is being painted.
         if let Some(action) = self
