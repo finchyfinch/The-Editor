@@ -229,6 +229,15 @@ pub(crate) struct EditorApp {
     problem_revealed: Option<(PathBuf, u32, u32)>,
     /// Breakpoints, which outlive any debug session and are saved with it.
     breakpoints: Breakpoints,
+    /// Tab indices in most-recently-used order, newest first, for Ctrl+Tab.
+    ///
+    /// Indices rather than paths, so an untitled buffer is in the list too;
+    /// kept in step as tabs are opened, closed and reordered.
+    mru: Vec<usize>,
+    /// Set while Ctrl is held during a Ctrl+Tab cycle. The list is only
+    /// re-ordered when it is released, or every step would move the tab you
+    /// just left to the front and cycling would bounce between two.
+    cycling: bool,
     /// Whether the "debugpy is missing" note has been shown. Once per run: it
     /// is worth saying, and worth saying only once.
     debugpy_warned: bool,
@@ -316,6 +325,8 @@ impl EditorApp {
             problem_at_caret: None,
             problem_revealed: None,
             breakpoints: Breakpoints::default(),
+            mru: Vec::new(),
+            cycling: false,
             debugpy_warned: false,
             debug: None,
             debug_view: DebugView::default(),
@@ -1109,6 +1120,86 @@ impl EditorApp {
                 caret >= start && caret <= end.max(start)
             })
             .map(|d| (path.to_path_buf(), d.line, d.column))
+    }
+
+    /// Move a tab, keeping the selection and the recent list pointing at the
+    /// same documents rather than at the same positions.
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from >= self.docs.len() || to >= self.docs.len() || from == to {
+            return;
+        }
+        let doc = self.docs.remove(from);
+        self.docs.insert(to, doc);
+
+        // Every index at or after the smaller of the two has moved.
+        let remap = |i: usize| {
+            if i == from {
+                to
+            } else if from < i && i <= to {
+                i - 1
+            } else if to <= i && i < from {
+                i + 1
+            } else {
+                i
+            }
+        };
+        self.active = self.active.map(remap);
+        for index in &mut self.mru {
+            *index = remap(*index);
+        }
+    }
+
+    /// Ctrl+Tab: step through tabs in the order they were last looked at.
+    ///
+    /// Most-recently-used rather than left-to-right, because the tab you want
+    /// next is nearly always the one you were just in — and pressing it twice
+    /// should return you there, not walk the strip.
+    fn cycle_tab(&mut self, backwards: bool) {
+        if self.docs.len() < 2 {
+            return;
+        }
+        self.refresh_mru();
+        let here = self
+            .active
+            .and_then(|a| self.mru.iter().position(|i| *i == a))
+            .unwrap_or(0);
+        let step = if backwards { -1isize } else { 1 };
+        let next = (here as isize + step).rem_euclid(self.mru.len() as isize) as usize;
+
+        self.cycling = true;
+        self.active = self.mru.get(next).copied();
+        self.focus_active();
+    }
+
+    /// Keep the recent list holding exactly the open tabs, once each.
+    fn refresh_mru(&mut self) {
+        self.mru.retain(|i| *i < self.docs.len());
+        self.mru.dedup();
+        for i in 0..self.docs.len() {
+            if !self.mru.contains(&i) {
+                self.mru.push(i);
+            }
+        }
+    }
+
+    /// Record the active tab as the most recent, once Ctrl is let go.
+    ///
+    /// Doing it on every switch would move the tab being left to the front
+    /// mid-cycle, so a second Ctrl+Tab would bounce back rather than going on.
+    fn settle_mru(&mut self, ctx: &egui::Context) {
+        if self.cycling && !ctx.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+            self.cycling = false;
+        }
+        if self.cycling {
+            return;
+        }
+        let Some(active) = self.active else { return };
+        if self.mru.first() == Some(&active) {
+            return;
+        }
+        self.mru.retain(|i| *i != active);
+        self.mru.insert(0, active);
+        self.refresh_mru();
     }
 
     /// Apply the on-save whitespace policies before writing.
@@ -2723,6 +2814,8 @@ impl EditorApp {
             CommandId::MoveLineUp => self.on_view(|view, doc| view.move_lines(doc, -1)),
             CommandId::MoveLineDown => self.on_view(|view, doc| view.move_lines(doc, 1)),
             CommandId::GoToFile => self.open_file_picker(),
+            CommandId::NextTab => self.cycle_tab(false),
+            CommandId::PreviousTab => self.cycle_tab(true),
             CommandId::ToggleBreakpoint => self.toggle_breakpoint_at_caret(),
             CommandId::DebugStart => self.debug_start_or_continue(),
             CommandId::DebugStop => self.debug_stop(),
@@ -3686,6 +3779,7 @@ impl eframe::App for EditorApp {
                 tab_bar::Action::CloseAll => {
                     self.pending = Some(Pending::CloseAll);
                 }
+                tab_bar::Action::Reorder { from, to } => self.reorder_tab(from, to),
                 tab_bar::Action::None => {}
             }
         }
@@ -3713,6 +3807,7 @@ impl eframe::App for EditorApp {
         }
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
+        self.settle_mru(&ctx);
         self.toasts_ui(&ctx);
 
         // A breakpoint asked for by a gutter click or the context menu. Drained
@@ -4157,6 +4252,8 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::SaveAs),
             MenuEntry::Item(CommandId::SaveAll),
             MenuEntry::Separator,
+            MenuEntry::Item(CommandId::NextTab),
+            MenuEntry::Item(CommandId::PreviousTab),
             MenuEntry::Item(CommandId::CloseTab),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::Exit),
@@ -4611,6 +4708,36 @@ mod tests {
             ],
             "results must read down the file, and not repeat"
         );
+    }
+
+    /// Reordering must keep the selection and the recent list pointing at the
+    /// same *documents*, not at the same positions.
+    #[test]
+    fn moving_a_tab_carries_the_indices_that_referred_to_it() {
+        // The remap, stated directly: moving 0 to 2 in [0,1,2,3].
+        let remap = |from: usize, to: usize, i: usize| {
+            if i == from {
+                to
+            } else if from < i && i <= to {
+                i - 1
+            } else if to <= i && i < from {
+                i + 1
+            } else {
+                i
+            }
+        };
+
+        // Rightwards: the dragged tab lands at 2, the ones it passed shift left.
+        assert_eq!(remap(0, 2, 0), 2, "the dragged tab");
+        assert_eq!(remap(0, 2, 1), 0);
+        assert_eq!(remap(0, 2, 2), 1);
+        assert_eq!(remap(0, 2, 3), 3, "beyond the move, untouched");
+
+        // Leftwards: the ones it passed shift right.
+        assert_eq!(remap(3, 1, 3), 1);
+        assert_eq!(remap(3, 1, 1), 2);
+        assert_eq!(remap(3, 1, 2), 3);
+        assert_eq!(remap(3, 1, 0), 0);
     }
 
     #[test]

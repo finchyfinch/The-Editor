@@ -25,6 +25,8 @@ pub(crate) enum CommandId {
     SaveAs,
     SaveAll,
     CloseTab,
+    NextTab,
+    PreviousTab,
     CloseFolder,
     Exit,
     // Edit
@@ -98,6 +100,8 @@ impl CommandId {
         Self::SaveAs,
         Self::SaveAll,
         Self::CloseTab,
+        Self::NextTab,
+        Self::PreviousTab,
         Self::CloseFolder,
         Self::Exit,
         Self::Undo,
@@ -242,6 +246,23 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
     cmd(CommandId::SaveAs, "File", "Save As", ctrl_shift(Key::S)),
     cmd(CommandId::SaveAll, "File", "Save All", None),
     cmd(CommandId::CloseTab, "File", "Close Tab", ctrl(Key::W)),
+    // Ctrl+Tab, in most-recently-used order. Registered before Close Tab so
+    // the more specific Ctrl+Shift+Tab is tried first; see `triggered`.
+    cmd(
+        CommandId::PreviousTab,
+        "File",
+        "Previous Tab",
+        Some(KeyboardShortcut::new(
+            Modifiers::COMMAND.plus(Modifiers::SHIFT),
+            Key::Tab,
+        )),
+    ),
+    cmd(
+        CommandId::NextTab,
+        "File",
+        "Next Tab",
+        Some(KeyboardShortcut::new(Modifiers::COMMAND, Key::Tab)),
+    ),
     cmd(CommandId::CloseFolder, "File", "Close Folder", None),
     cmd(CommandId::Exit, "File", "Exit", None),
     cmd(CommandId::Undo, "Edit", "Undo", ctrl(Key::Z)),
