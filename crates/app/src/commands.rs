@@ -67,6 +67,7 @@ pub(crate) enum CommandId {
     DebugStepInto,
     DebugStepOut,
     ShowOutput,
+    ShowTerminal,
     ShowProblems,
     SelectInterpreter,
     CreateVenv,
@@ -142,6 +143,7 @@ impl CommandId {
         Self::DebugStepInto,
         Self::DebugStepOut,
         Self::ShowOutput,
+        Self::ShowTerminal,
         Self::ShowProblems,
         Self::SelectInterpreter,
         Self::CreateVenv,
@@ -383,6 +385,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
     cmd(CommandId::RunStop, "Run", "Stop", Some(shift(Key::F5))),
     cmd(CommandId::RunRestart, "Run", "Restart", ctrl(Key::F5)),
     cmd(CommandId::RunTests, "Run", "Run Tests", None),
+    cmd(
+        CommandId::ShowTerminal,
+        "Run",
+        "Terminal",
+        Some(KeyboardShortcut::new(Modifiers::COMMAND, Key::Backtick)),
+    ),
     // The bindings every debugger uses, except for start: F5 is already Run,
     // and quietly changing what F5 does depending on state would be worse than
     // a second key. Alt+F5 both starts and continues, which is one idea.

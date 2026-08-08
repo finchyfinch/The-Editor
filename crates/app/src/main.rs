@@ -18,6 +18,7 @@ mod panic_hook;
 mod project_search;
 mod runner;
 mod settings_window;
+mod terminal;
 mod venv_dialog;
 mod watcher;
 

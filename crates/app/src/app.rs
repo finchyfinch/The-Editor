@@ -34,6 +34,7 @@ use crate::palette::Palette;
 use crate::project_search::ProjectSearch;
 use crate::runner::Runner;
 use crate::settings_window;
+use crate::terminal::Terminal;
 use crate::venv_dialog;
 use crate::watcher::Watcher;
 
@@ -246,6 +247,8 @@ pub(crate) struct EditorApp {
     debug: Option<editor_debug::Session>,
     /// Stack and variables for the paused session.
     debug_view: DebugView,
+    /// The integrated shell.
+    terminal: Terminal,
     /// The project-wide search panel.
     search: ProjectSearch,
     /// The rename prompt: what the symbol is called, and the new name.
@@ -276,6 +279,7 @@ enum DockTab {
     Problems,
     Debug,
     Search,
+    Terminal,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -336,6 +340,7 @@ impl EditorApp {
             debugpy_warned: false,
             debug: None,
             debug_view: DebugView::default(),
+            terminal: Terminal::default(),
             search: ProjectSearch::default(),
             rename: None,
             uses: UseResults::default(),
@@ -1295,6 +1300,25 @@ impl EditorApp {
             .apply(&editor_core::edit::Transaction::new(edits), before, before);
         entry.doc.break_undo_run();
         entry.view.set_caret(before.head.min(entry.doc.len_chars()));
+    }
+
+    /// Open a shell in the project, if one is not already running.
+    ///
+    /// Started in the project root with the virtual environment's directory
+    /// ahead of `PATH`, so `python` and `pip` are the project's from the first
+    /// command rather than after activating something.
+    fn open_terminal(&mut self) {
+        if self.terminal.is_running() {
+            return;
+        }
+        let cwd = self
+            .tree
+            .root()
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let extra = self.tool_search_path();
+        self.terminal.start(&cwd, &extra);
     }
 
     /// Start a project-wide search over the open folder.
@@ -3003,6 +3027,11 @@ impl EditorApp {
             CommandId::MoveLineUp => self.on_view(|view, doc| view.move_lines(doc, -1)),
             CommandId::MoveLineDown => self.on_view(|view, doc| view.move_lines(doc, 1)),
             CommandId::GoToFile => self.open_file_picker(),
+            CommandId::ShowTerminal => {
+                self.dock = DockTab::Terminal;
+                self.show_output = true;
+                self.open_terminal();
+            }
             CommandId::FindInProject => {
                 self.dock = DockTab::Search;
                 self.show_output = true;
@@ -3868,6 +3897,9 @@ impl eframe::App for EditorApp {
             let mut console_action = None;
             let mut debug_action = debugger::Action::None;
             let mut search_action = crate::project_search::Action::None;
+            let mut start_terminal = false;
+            // Read before the closure borrows self for the panel.
+            let terminal_cwd = self.tree.root().map(Path::to_path_buf);
             let mut problem_clicked = None;
 
             // The height is owned here rather than left to the panel.
@@ -3932,6 +3964,13 @@ impl eframe::App for EditorApp {
                         {
                             self.dock = DockTab::Search;
                         }
+                        if ui
+                            .selectable_label(self.dock == DockTab::Terminal, "TERMINAL")
+                            .clicked()
+                        {
+                            self.dock = DockTab::Terminal;
+                            start_terminal = true;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
                                 self.show_output = false;
@@ -3944,6 +3983,10 @@ impl eframe::App for EditorApp {
                         DockTab::Output => console_action = Some(self.runner.draw(ui)),
                         DockTab::Problems => problem_clicked = self.problems_ui(ui),
                         DockTab::Search => search_action = self.search.ui(ui),
+                        DockTab::Terminal => {
+                            let cwd = terminal_cwd.clone();
+                            start_terminal |= self.terminal.ui(ui, cwd.as_deref());
+                        }
                         DockTab::Debug => {
                             let running = self.debug.is_some();
                             let paused = self
@@ -3954,6 +3997,10 @@ impl eframe::App for EditorApp {
                         }
                     }
                 });
+
+            if start_terminal {
+                self.open_terminal();
+            }
 
             match search_action {
                 crate::project_search::Action::None => {}
@@ -4023,6 +4070,11 @@ impl eframe::App for EditorApp {
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
         self.search.poll();
+        if self.terminal.poll() {
+            // A shell produces output between frames; keep the loop
+            // turning while it does, and stop when it goes quiet.
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
         self.settle_mru(&ctx);
         self.toasts_ui(&ctx);
 
@@ -4546,6 +4598,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
         &[
             MenuEntry::Item(CommandId::ToggleExplorer),
             MenuEntry::Item(CommandId::ShowOutput),
+            MenuEntry::Item(CommandId::ShowTerminal),
             MenuEntry::Item(CommandId::ToggleHiddenFiles),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::ThemeDark),
