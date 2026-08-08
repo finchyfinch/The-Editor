@@ -196,47 +196,61 @@ impl Terminal {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let row = ui.fonts_mut(|f| f.row_height(&font));
 
-        egui::ScrollArea::both()
-            .id_salt("terminal_output")
-            .auto_shrink([false, false])
-            .stick_to_bottom(self.follow)
-            .max_height(ui.available_height() - row * 2.0)
-            .show_rows(ui, row, self.output.line_count(), |ui, rows| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for line in self.output.lines().skip(rows.start).take(rows.len()) {
-                    let text = line.plain();
-                    ui.label(
-                        egui::RichText::new(if text.is_empty() { " " } else { &text })
-                            .font(font.clone()),
+        // Bottom-up, so the prompt claims its height *first* and the scrollback
+        // fills whatever is left. Laying out top-down and capping the scroll
+        // area at "available height minus a guess" is what clipped the input
+        // behind the status bar: the guess has to be exactly right, and it
+        // stops being right the moment the interface font size changes.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            if self.is_running() {
+                ui.horizontal(|ui| {
+                    ui.weak("\u{203a}");
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.input)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("Type a command"),
                     );
-                }
-            });
-
-        if self.is_running() {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.weak("\u{203a}");
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.input)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("Type a command"),
-                );
-                if std::mem::take(&mut self.focus_input) {
-                    field.request_focus();
-                }
-                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    let line = std::mem::take(&mut self.input);
-                    if let Some(session) = self.session.as_ref() {
-                        let _ = session.send_input(&format!("{line}\r\n"));
+                    if std::mem::take(&mut self.focus_input) {
+                        field.request_focus();
                     }
-                    // Keep the field, so a sequence of commands can be typed
-                    // without reaching for the mouse between each.
-                    self.focus_input = true;
-                    self.follow = true;
-                }
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let line = std::mem::take(&mut self.input);
+                        if let Some(session) = self.session.as_ref() {
+                            // Carriage return alone. A terminal sends CR for
+                            // Enter, and the LF is a second key press: PSReadLine
+                            // reads it as "insert a newline", drops to its `>>`
+                            // continuation prompt, and treats the next command
+                            // as a second line of the same statement.
+                            let _ = session.send_input(&format!("{line}\r"));
+                        }
+                        // Keep focus, so a run of commands can be typed without
+                        // reaching for the mouse between each one.
+                        self.focus_input = true;
+                        self.follow = true;
+                    }
+                });
+                ui.separator();
+            }
+
+            // Whatever height is left after the prompt has taken its own.
+            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("terminal_output")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(self.follow)
+                    .show_rows(ui, row, self.output.line_count(), |ui, rows| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for line in self.output.lines().skip(rows.start).take(rows.len()) {
+                            let text = line.plain();
+                            ui.label(
+                                egui::RichText::new(if text.is_empty() { " " } else { &text })
+                                    .font(font.clone()),
+                            );
+                        }
+                    });
             });
-        }
+        });
 
         wants_start
     }
