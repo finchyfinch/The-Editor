@@ -94,6 +94,8 @@ pub struct EditorView {
     paused_line: Option<usize>,
     /// A gutter click asking to toggle a breakpoint, taken by the application.
     toggle_breakpoint: Option<usize>,
+    /// The bracket pair around the caret, recomputed as the caret moves.
+    bracket_pair: Option<editor_syntax::brackets::BracketPair>,
     /// Set by the context menu, taken by the application next frame.
     context_action: Option<ContextAction>,
     /// The scroll offset at the end of the last frame.
@@ -1336,6 +1338,16 @@ impl EditorView {
         visible: egui::Rect,
         response: &egui::Response,
     ) {
+        // The bracket around the caret, from the tree the highlighter already
+        // maintains. Recomputed per paint rather than cached: the caret moves
+        // constantly and the walk is a handful of node lookups.
+        self.bracket_pair = highlighter
+            .as_ref()
+            .and_then(|h| h.tree())
+            .and_then(|tree| {
+                editor_syntax::brackets::match_at(tree, doc.text(), self.selection.head)
+            });
+
         let line_count = doc.text().len_lines();
         let first = (((visible.top() - rect.top()) / row_height).floor().max(0.0) as usize)
             .saturating_sub(OVERSCAN_ROWS);
@@ -1561,6 +1573,31 @@ impl EditorView {
                     galley.clone(),
                     visuals.text_color(),
                 );
+            }
+
+            // Bracket match: a faint box round each half of the pair, which
+            // reads as "these two go together" without competing with the
+            // selection or the caret.
+            if let Some(pair) = &self.bracket_pair {
+                for half in [&pair.open, &pair.close] {
+                    let line_end = line_start + text.chars().count();
+                    if half.start < line_start || half.start >= line_end.max(line_start) {
+                        continue;
+                    }
+                    let column = half.start - line_start;
+                    let x = text_left + galley.pos_from_cursor(ccursor(column)).left();
+                    let width = galley.pos_from_cursor(ccursor(column + 1)).left()
+                        - galley.pos_from_cursor(ccursor(column)).left();
+                    painter.rect_stroke(
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, y),
+                            egui::vec2(width.max(1.0), row_height),
+                        ),
+                        2.0,
+                        egui::Stroke::new(1.0, visuals.weak_text_color()),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
 
             if line == caret_line {

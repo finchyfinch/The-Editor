@@ -5,17 +5,13 @@
 //! visible viewport only; parse trees are updated incrementally via
 //! `Tree::edit` on every transaction. See PLAN.md §3.5.
 
+pub mod brackets;
 pub mod errors;
 pub mod highlight;
 pub mod indent;
 pub mod symbols;
 pub mod templates;
 pub mod theme;
-
-// Still to come.
-//
-// pub mod folds;       // M4: fold ranges from the parse tree
-// pub mod brackets;    // M4: bracket matching
 
 /// Languages The Editor recognises in 1.0.
 ///
