@@ -23,7 +23,7 @@ editor-syntax.workspace = true
 editor-widgets.workspace = true
 
 anyhow.workspace = true
-eframe.workspace = true
+eframe = { workspace = true, features = ["glow"] }
 nucleo-matcher.workspace = true
 rfd.workspace = true
 tracing.workspace = true

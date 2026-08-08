@@ -88,6 +88,8 @@ pub(crate) enum CommandId {
     // Help
     About,
     KeyboardShortcuts,
+    UserManual,
+    ThirdPartyLicences,
     CheckToolchains,
     OpenLogFolder,
 }
@@ -162,6 +164,8 @@ impl CommandId {
         Self::OpenSettingsFile,
         Self::About,
         Self::KeyboardShortcuts,
+        Self::UserManual,
+        Self::ThirdPartyLicences,
         Self::CheckToolchains,
         Self::OpenLogFolder,
     ];
@@ -506,6 +510,13 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         CommandId::KeyboardShortcuts,
         "Help",
         "Keyboard Shortcuts",
+        None,
+    ),
+    cmd(CommandId::UserManual, "Help", "User Manual", None),
+    cmd(
+        CommandId::ThirdPartyLicences,
+        "Help",
+        "Third-Party Licences",
         None,
     ),
     cmd(CommandId::CheckToolchains, "Help", "Check Toolchains", None),

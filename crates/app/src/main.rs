@@ -11,6 +11,7 @@ mod cli;
 mod commands;
 mod completion;
 mod debugger;
+mod docs_window;
 mod file_picker;
 mod logging;
 mod new_file;
@@ -29,6 +30,10 @@ use editor_config::paths::AppPaths;
 use eframe::egui;
 
 fn main() -> Result<()> {
+    // Taken before anything else, so the figure logged at the first frame is
+    // startup as the user experiences it: process start to something on screen.
+    let started = std::time::Instant::now();
+
     let open = match cli::parse(std::env::args_os().skip(1)) {
         cli::Startup::Open(paths) => paths,
         cli::Startup::Print { text, failed } => {
@@ -62,6 +67,11 @@ fn main() -> Result<()> {
 
     let log_dir_display = log_dir.display().to_string();
 
+    // Read before the window is built, because it decides how to build it.
+    let renderer = editor_config::settings::Settings::load(&paths.settings_file())
+        .0
+        .renderer();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("The Editor")
@@ -72,6 +82,10 @@ fn main() -> Result<()> {
         // M1 restores the previous window geometry from the session file and
         // validates it against the monitors actually present.
         persist_window: false,
+        renderer: match renderer {
+            editor_config::settings::Renderer::Glow => eframe::Renderer::Glow,
+            editor_config::settings::Renderer::Wgpu => eframe::Renderer::Wgpu,
+        },
         ..Default::default()
     };
 
@@ -84,6 +98,7 @@ fn main() -> Result<()> {
                 paths,
                 log_dir_display,
                 open,
+                started,
             )))
         }),
     )

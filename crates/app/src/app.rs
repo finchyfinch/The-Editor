@@ -28,6 +28,7 @@ use eframe::egui;
 use crate::commands::{self, CommandId};
 use crate::completion;
 use crate::debugger::{self, Breakpoints, DebugView};
+use crate::docs_window::DocsWindow;
 use crate::file_picker::FilePicker;
 use crate::new_file;
 use crate::palette::Palette;
@@ -40,6 +41,13 @@ use crate::venv_dialog;
 use crate::watcher::Watcher;
 
 /// Metadata shown in the About dialog.
+/// The user manual, compiled in so it is there with no network and no install
+/// directory to go looking in.
+pub(crate) const MANUAL: &str = include_str!("../../../docs/manual.md");
+
+/// Generated from the resolved dependency graph by `tools/make_licences.py`.
+pub(crate) const THIRD_PARTY: &str = include_str!("../../../docs/third-party.md");
+
 pub(crate) struct BuildInfo {
     pub(crate) version: &'static str,
     pub(crate) commit: &'static str,
@@ -232,6 +240,15 @@ pub(crate) struct EditorApp {
     /// Work found lying about from a session that did not shut down, shown
     /// as a prompt on the first frame.
     recovered: Vec<recovery::Recovered>,
+    manual: DocsWindow,
+    licences: DocsWindow,
+    /// True until the welcome has been dismissed. Set when there was no
+    /// settings file to load, which is the only honest signal that nobody has
+    /// used this before.
+    first_run: bool,
+    /// When the process started, so the first frame can report how long it
+    /// took to get there. Taken once and then dropped.
+    started: Option<Instant>,
     /// What the dirty buffers looked like last frame, so an edit anywhere
     /// schedules a write without every edit path having to remember to.
     dirty_seen: Vec<(u64, u64)>,
@@ -324,7 +341,10 @@ impl EditorApp {
         paths: AppPaths,
         log_dir: String,
         open: Vec<PathBuf>,
+        started: Instant,
     ) -> Self {
+        // Asked before anything writes the file, which `new` goes on to do.
+        let first_run = !paths.settings_file().exists();
         let (settings, settings_error) = Settings::load(&paths.settings_file());
         let session = Session::load(&paths.session_file());
 
@@ -374,6 +394,10 @@ impl EditorApp {
             recovery: recovery::Recovery::new(&paths_for_recovery),
             next_recovery_id: 1,
             recovered,
+            manual: DocsWindow::default(),
+            licences: DocsWindow::default(),
+            first_run,
+            started: Some(started),
             dirty_seen: Vec::new(),
             restore: settings.restore_session().then(|| session.clone()),
             session_saved: false,
@@ -2596,6 +2620,100 @@ impl EditorApp {
         }
     }
 
+    /// Log how long it took to get to the first frame, once.
+    ///
+    /// PLAN.md §M9 asks for under 500 ms cold to interactive. A number nobody
+    /// measures is a number that drifts, and startup is the one figure a user
+    /// notices every single time without ever being able to say what it was.
+    fn report_startup(&mut self) {
+        let Some(started) = self.started.take() else {
+            return;
+        };
+        let took = started.elapsed();
+        tracing::info!(
+            millis = took.as_millis(),
+            budget_millis = 500u64,
+            within_budget = took <= Duration::from_millis(500),
+            "first frame"
+        );
+    }
+
+    /// Shown once, the first time The Editor is run.
+    ///
+    /// Three things and then out of the way. A first-run wizard that walks
+    /// through every setting is a wizard people click through without reading;
+    /// what actually helps is knowing that a *folder* is the unit of work, that
+    /// the language tools are separate and checkable, and that there is a
+    /// manual.
+    fn first_run_ui(&mut self, ctx: &egui::Context) {
+        if !self.first_run {
+            return;
+        }
+        let mut dismiss = false;
+        let mut then = None;
+
+        egui::Modal::new(egui::Id::new("first_run")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Welcome to The Editor");
+            ui.add_space(4.0);
+            ui.weak(format!("Version {}", BUILD.version));
+            ui.add_space(12.0);
+
+            ui.label(
+                "An IDE for Python and Rust. No account, no installer, and \
+                 nothing sent anywhere.",
+            );
+            ui.add_space(12.0);
+
+            ui.label(egui::RichText::new("Open a folder, not a file").strong());
+            ui.label(
+                "The folder is the project: it is what the explorer shows, what \
+                 search searches, and where The Editor looks for a virtual \
+                 environment.",
+            );
+            ui.add_space(10.0);
+
+            ui.label(egui::RichText::new("Check the toolchains").strong());
+            ui.label(
+                "Highlighting and syntax errors work on their own. Completion, \
+                 go to definition and debugging need tools you may not have \
+                 yet; this says which, and how to install them.",
+            );
+            ui.add_space(10.0);
+
+            ui.label(egui::RichText::new("The manual is in the Help menu").strong());
+            ui.label("Along with every keyboard shortcut, as the application actually has them.");
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open a folder\u{2026}").clicked() {
+                    then = Some(CommandId::OpenFolder);
+                    dismiss = true;
+                }
+                if ui.button("Check toolchains").clicked() {
+                    then = Some(CommandId::CheckToolchains);
+                    dismiss = true;
+                }
+                if ui.button("User manual").clicked() {
+                    then = Some(CommandId::UserManual);
+                    dismiss = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Start editing").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        });
+
+        if dismiss {
+            self.first_run = false;
+            if let Some(id) = then {
+                self.run_command(id, ctx);
+            }
+        }
+    }
+
     /// Offer back the unsaved work of a session that did not shut down.
     ///
     /// Modal, unlike the disk-change bar. This one is about work that exists
@@ -3481,6 +3599,8 @@ impl EditorApp {
             }
 
             CommandId::About => self.show_about = true,
+            CommandId::UserManual => self.manual.open(),
+            CommandId::ThirdPartyLicences => self.licences.open(),
             CommandId::KeyboardShortcuts => self.show_shortcuts = true,
             CommandId::CheckToolchains => {
                 // Probed on demand rather than cached: the answer changes when
@@ -4041,7 +4161,7 @@ impl EditorApp {
         let running = self.lsp.running();
         if running.is_empty() {
             "Checking syntax only \u{2014} no language server is running.\n\
-             Help \u{2192} Check Toolchains lists what could be installed."
+             Help > Check Toolchains lists what could be installed."
                 .to_owned()
         } else {
             format!("Checking syntax, plus: {}", running.join(", "))
@@ -4225,6 +4345,7 @@ impl eframe::App for EditorApp {
         if let Some(session) = self.restore.take() {
             self.restore_session(&session, &ctx);
         }
+        self.report_startup();
         self.open_from_command_line();
         self.poll_watcher();
         self.check_disk_on_focus(&ctx);
@@ -4266,7 +4387,8 @@ impl eframe::App for EditorApp {
         // as modal blocked every other shortcut in the application -- Ctrl+F,
         // Ctrl+S, F5 -- for as long as a suggestion was on screen, which while
         // typing is most of the time.
-        let modal_open = !self.recovered.is_empty()
+        let modal_open = self.first_run
+            || !self.recovered.is_empty()
             || self.rename.is_some()
             || self.file_picker.is_open()
             || self.settings_form.is_open()
@@ -4493,6 +4615,10 @@ impl eframe::App for EditorApp {
         self.toolchains_window(&ctx);
         self.settings_form_ui(&ctx);
         self.recovery_prompt(&ctx);
+        self.first_run_ui(&ctx);
+        self.manual.ui(&ctx, "user_manual", "User Manual", MANUAL);
+        self.licences
+            .ui(&ctx, "third_party", "Third-Party Licences", THIRD_PARTY);
         self.rename_ui(&ctx);
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.
@@ -5123,9 +5249,11 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
         "Help",
         &[
             MenuEntry::Item(CommandId::KeyboardShortcuts),
+            MenuEntry::Item(CommandId::UserManual),
             MenuEntry::Item(CommandId::CheckToolchains),
             MenuEntry::Item(CommandId::OpenLogFolder),
             MenuEntry::Separator,
+            MenuEntry::Item(CommandId::ThirdPartyLicences),
             MenuEntry::Item(CommandId::About),
         ],
     ),
@@ -5370,7 +5498,7 @@ mod tests {
         // The wording is asserted rather than the mechanism, because the whole
         // point is what the user reads.
         let summary = "Checking syntax only \u{2014} no language server is running.\n\
-                       Help \u{2192} Check Toolchains lists what could be installed.";
+                       Help > Check Toolchains lists what could be installed.";
         assert!(summary.contains("syntax only"));
         assert!(summary.contains("Check Toolchains"));
     }

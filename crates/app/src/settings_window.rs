@@ -16,6 +16,7 @@
 //! silently does nothing is worse than not offering it, which is why
 //! `editor.word_wrap` and `ui.syntax_theme` are absent until they are built.
 
+use editor_config::settings::Renderer;
 use editor_config::settings::Settings;
 use editor_config::settings::UnderlineDiagnostics;
 use editor_config::theme::ThemePreference;
@@ -511,6 +512,30 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
 
     changed |= row(
         ui,
+        "Graphics backend",
+        "glow (OpenGL) starts about sixteen times faster than wgpu and looks \
+         identical, which is why it is the default. Switch to wgpu only if the \
+         window fails to appear or draws incorrectly. Takes effect at the next \
+         start.",
+        |ui| {
+            let mut renderer = settings.renderer();
+            let before = renderer;
+            egui::ComboBox::from_id_salt("renderer")
+                .selected_text(renderer.as_str())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut renderer, Renderer::Glow, "glow");
+                    ui.selectable_value(&mut renderer, Renderer::Wgpu, "wgpu");
+                });
+            if renderer != before {
+                settings.set_renderer(renderer);
+                return true;
+            }
+            false
+        },
+    );
+
+    changed |= row(
+        ui,
         "Reduce motion",
         "Stop the caret blinking. Repeating animation is distracting for some \
          people and disabling for a few, and the caret is the one animation \
@@ -597,6 +622,8 @@ mod tests {
         assert!(!settings.auto_close_brackets());
         settings.set_reduce_motion(true);
         assert!(settings.reduce_motion());
+        settings.set_renderer(Renderer::Wgpu);
+        assert_eq!(settings.renderer(), Renderer::Wgpu);
 
         settings.set_underline_diagnostics(UnderlineDiagnostics::None);
         assert_eq!(settings.underline_diagnostics(), UnderlineDiagnostics::None);

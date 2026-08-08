@@ -20,7 +20,7 @@ which switching is still cheap, so they can be revisited deliberately rather tha
 
 | # | Decision | Rationale | Alternative & switch cost |
 |---|---|---|---|
-| D1 | **GUI toolkit: `egui` + `eframe`** (wgpu backend, glow fallback) — *confirmed* | Pure Rust, zero system GUI dependencies, one binary per platform, pixel-identical on all three OSes, trivial custom painting — which matters because the code editor **will** be a custom widget no matter which toolkit is chosen. Fastest path to a working IDE for a solo developer. | `floem` (what Lapce uses — better built-in text/vector stack, far thinner docs) or `slint` (excellent tooling, but GPLv3-or-commercial licensing and the editor is still custom). Switch cost is low until M2 lands, high afterwards — the editor widget is the only piece with deep toolkit coupling, so keep all toolkit types out of `ide-core`/`ide-syntax`/`ide-lsp`. |
+| D1 | **GUI toolkit: `egui` + `eframe`** (**glow backend**, wgpu available) — *confirmed; renderer reversed by measurement, see below* | Pure Rust, zero system GUI dependencies, one binary per platform, pixel-identical on all three OSes, trivial custom painting — which matters because the code editor **will** be a custom widget no matter which toolkit is chosen. Fastest path to a working IDE for a solo developer. | `floem` (what Lapce uses — better built-in text/vector stack, far thinner docs) or `slint` (excellent tooling, but GPLv3-or-commercial licensing and the editor is still custom). Switch cost is low until M2 lands, high afterwards — the editor widget is the only piece with deep toolkit coupling, so keep all toolkit types out of `ide-core`/`ide-syntax`/`ide-lsp`. |
 | D2 | **Text storage: `ropey`** rope, one buffer per document | O(log n) edits and line indexing, UTF-8 native, handles multi-MB files without the O(n) copies a `String` would cost. Battle-tested (Helix uses it). | `crop`, or a piece table. Contained inside `ide-core::Buffer`. |
 | D3 | **Highlighting: `tree-sitter`** with per-language grammars, incremental reparse | Real parse trees → correct highlighting, plus free bracket matching, code folding ranges, "select enclosing node", and indentation heuristics. One mechanism serves five features. | Regex/`syntect` (`.sublime-syntax`). Keep a `Highlighter` trait so a regex fallback can serve any language without a grammar (INI can go either way). |
 | D4 | **Intelligence: LSP client**, not hand-written analysis | Completion, diagnostics, hover, go-to-definition, rename and formatting all come from `rust-analyzer` / `ruff` / `pyright` for free and stay correct as those languages evolve. Writing a Python type inferencer is a multi-year project on its own. | None sensible. Must ship a graceful degradation path: buffer-word + keyword completion when no server is installed, so the IDE is never *broken* by a missing server. |
@@ -856,15 +856,31 @@ Linux or macOS, which remains the single largest piece of unknown work.
 | # | Milestone | State | What is missing |
 |---|---|---|---|
 | M1 | Shell & layout | Substantially done | Tab drag-reorder and overflow dropdown; Ctrl+Tab most-recently-used cycling; native macOS menu bar via `muda` |
-| M2 | Editor core | Core done | Multi-cursor and column selection; external-change detection; crash-recovery autosave; the §2.4 performance benchmarks |
+| M2 | Editor core | **Done** | — |
 | M3 | Syntax highlighting | Done for 9 languages | HTML injections (embedded `<script>`/`<style>`); shebang and manual language override; the user-editable TOML theme format |
 | M4 | Editing intelligence | Indent engine done | `.editorconfig`; trim-trailing-whitespace and final-newline on save; re-indent on paste; bracket-match highlighting; code folding |
 | M5 | Search | In-file done | Project-wide search and replace on the ripgrep engine — the crate holds the query engine and a file walk so far; go-to-symbol |
 | M6 | Language servers | Mostly done | Hover, rename, code actions, format-on-save. Diagnostics, Go to Definition, Find Uses and the completion popup are done; all four have a parse-tree fallback for when no server can answer |
 | M7 | Run & console | Running done | Install Packages / Show Installed Packages; run configurations in `.ide/run.toml` |
 | M8 | Settings, themes, New File | Form done | The keymap file and conflict detection (only its path exists), user themes, and New Project. `editor.word_wrap` and `ui.syntax_theme` are read from the file and ignored by everything else, so the form does not offer them |
-| M9 | Polish & docs | Partly | About, Keyboard Shortcuts and Check Toolchains exist. Missing: user manual, third-party licence page, accessibility pass, icons and app icon, first-run experience, startup perf pass |
+| M9 | Polish & docs | Mostly done | Remaining: a 4.5:1 contrast audit of both themes, and reading the operating system's own reduce-motion preference rather than a setting of our own |
 | M10 | Release 1.0.0 | Windows done | macOS `.app`/dmg and Linux AppImage/deb; release notes. Windows ships as a single statically linked exe in a zip with a SHA-256, built by `tools/make-release.bat` |
+
+### D1's renderer, reversed
+
+D1 chose wgpu with glow as the fallback. Measuring M9's startup budget turned
+that round. Instrumenting the phases showed our own code takes 5 ms of a 1.3
+second start: everything else is eframe creating the window and the graphics
+device. On this machine wgpu takes about 2,470 ms to the first frame and glow
+about 80 ms, and the two render identically — the same screenshot, pixel for
+pixel.
+
+Thirty times the startup for nothing anybody can see is not a trade worth
+keeping, so glow is the default. wgpu remains selectable in Settings, because
+OpenGL drivers are the weaker link on some machines and a renderer that will
+not start needs an alternative; `THE_EDITOR_RENDERER=wgpu` is the escape hatch
+for when the window never appears, which is exactly when the settings form
+cannot be reached.
 
 ### Landed beyond the plan
 

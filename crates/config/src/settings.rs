@@ -67,6 +67,13 @@ use_editorconfig = true
 # and genuinely disabling for a few, and the caret is the one animation that
 # is on screen the whole time you are reading.
 reduce_motion = false
+# Which graphics backend to draw with: \"glow\" (OpenGL) or \"wgpu\" (Direct3D,
+# Metal, Vulkan). They look identical; glow starts about sixteen times faster,
+# which is why it is the default. Switch to wgpu if the window fails to appear
+# or draws incorrectly, which would mean this machine's OpenGL driver is at
+# fault. Takes effect at the next start. If The Editor will not start at all,
+# set the THE_EDITOR_RENDERER environment variable instead.
+renderer = \"glow\"
 
 [python]
 # Leave empty to auto-detect: a .venv in the project, else python on PATH.
@@ -135,6 +142,41 @@ impl UnderlineDiagnostics {
             Self::All => "Errors and warnings",
             Self::Errors => "Errors only",
             Self::None => "Nothing",
+        }
+    }
+}
+
+/// The graphics backend to draw with.
+///
+/// PLAN.md D1 chose wgpu with glow as the fallback. Measurement reversed that:
+/// on Windows, wgpu spends about 1.3 seconds creating its device before the
+/// first frame, against 80 ms for glow, and the two are pixel-identical. That
+/// is 2.6x the startup budget spent on nothing the user can see, every launch.
+/// wgpu stays available because OpenGL drivers are the weaker link on some
+/// machines, and a renderer that will not start needs an alternative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Renderer {
+    #[default]
+    Glow,
+    Wgpu,
+}
+
+impl Renderer {
+    #[must_use]
+    pub fn parse(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "wgpu" => Self::Wgpu,
+            // Anything unrecognised gets the default rather than an error: a
+            // typo in a settings file must not stop the editor starting.
+            _ => Self::Glow,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Glow => "glow",
+            Self::Wgpu => "wgpu",
         }
     }
 }
@@ -404,6 +446,25 @@ impl Settings {
     pub fn auto_close_brackets(&self) -> bool {
         self.bool_at("editor", "auto_close_brackets")
             .unwrap_or(defaults::AUTO_CLOSE_BRACKETS)
+    }
+
+    /// Which graphics backend to draw with.
+    ///
+    /// Read before the window exists, so this is a plain string rather than an
+    /// enum the rest of the application knows about.
+    #[must_use]
+    pub fn renderer(&self) -> Renderer {
+        // The environment variable wins, because the reason to change this is
+        // usually that the window did not appear -- and you cannot reach the
+        // settings form through a window that did not appear.
+        if let Ok(name) = std::env::var("THE_EDITOR_RENDERER") {
+            return Renderer::parse(&name);
+        }
+        Renderer::parse(self.str_at("editor", "renderer").unwrap_or(""))
+    }
+
+    pub fn set_renderer(&mut self, renderer: Renderer) {
+        self.set("editor", "renderer", value(renderer.as_str()));
     }
 
     /// Whether to suppress repeating animation, chiefly the caret blink.

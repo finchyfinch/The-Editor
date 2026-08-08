@@ -137,7 +137,7 @@ impl FileTree {
                 ui.add_space(20.0);
                 ui.weak("No folder open");
                 ui.add_space(4.0);
-                ui.small("File \u{2192} Open Folder");
+                ui.small("File > Open Folder");
             });
             return Action::None;
         };
