@@ -90,9 +90,11 @@ pub struct EditorView {
     diagnostics: Vec<Underline>,
     /// Set by the context menu, taken by the application next frame.
     context_action: Option<ContextAction>,
-    /// When the wheel or trackpad was last used, so the smooth-scroll
-    /// animation can be kept fed with frames while it runs.
-    last_scroll: Option<std::time::Instant>,
+    /// The scroll offset at the end of the last frame.
+    ///
+    /// Frames are requested while this keeps changing, which is the only
+    /// reliable signal that egui's scroll easing is still running.
+    last_offset: egui::Vec2,
     /// Where the caret was painted last frame, in screen coordinates.
     ///
     /// Kept so the completion popup can be anchored under the caret. Only the
@@ -281,19 +283,9 @@ impl EditorView {
 
         let mut changed = false;
 
-        // Noted before the scroll area runs, because it consumes the delta as
-        // it applies it and there is nothing left to see afterwards.
-        if ui.input(|i| {
-            i.events
-                .iter()
-                .any(|e| matches!(e, egui::Event::MouseWheel { .. }))
-        }) {
-            self.last_scroll = Some(std::time::Instant::now());
-        }
-
         // Salted, so it cannot collide with the tab bar's scroll area above it
         // in the same panel. See the note in `tab_bar`.
-        egui::ScrollArea::both()
+        let scrolled = egui::ScrollArea::both()
             .id_salt("editor_view")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -419,6 +411,20 @@ impl EditorView {
                     &response,
                 );
             });
+
+        // Keep asking for frames for as long as the view is actually moving.
+        //
+        // A timer started from the last wheel event was the obvious thing and
+        // was wrong: egui's easing outlives any fixed window, so the animation
+        // ran out of frames part-way and the remainder was applied in one jump
+        // when some later event woke the loop -- a scroll that slid, stalled,
+        // and then lurched the rest of the way. The offset itself is the only
+        // honest signal that there is more to come.
+        let offset = scrolled.state.offset;
+        if (offset - self.last_offset).length() > 0.01 {
+            ui.ctx().request_repaint();
+        }
+        self.last_offset = offset;
 
         changed
     }
@@ -1498,18 +1504,7 @@ impl EditorView {
             ui.scroll_to_rect(target.expand2(egui::vec2(0.0, row_height * 2.0)), None);
         }
 
-        // Smooth scrolling is animated by egui over several frames. Nothing
-        // else wakes the frame loop between trackpad events, so without this
-        // the view only advances when the caret blink timer fires -- which is
-        // what made two-finger scrolling arrive in lurches with a pause
-        // between each. Requested only while the wheel is actually turning, so
-        // an idle editor still costs nothing.
-        let scrolling = self
-            .last_scroll
-            .is_some_and(|t| t.elapsed() < SCROLL_ANIMATION);
-        if scrolling {
-            ui.ctx().request_repaint();
-        } else if response.has_focus() {
+        if response.has_focus() {
             // Keep the blink animating without spinning at the full frame rate.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(120));
@@ -1706,13 +1701,6 @@ pub enum ContextAction {
     FindUses,
     Paste,
 }
-
-/// How long to keep asking for frames after the last wheel event.
-///
-/// egui eases a scroll in over several frames; the tail of that easing needs
-/// frames too, and the wheel events have stopped by then. Long enough to cover
-/// the easing, short enough that an editor left alone goes quiet.
-const SCROLL_ANIMATION: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The character range of whole lines `first..=last`, including the trailing
 /// newline of the last one where there is one.

@@ -17,6 +17,7 @@
 //! `editor.word_wrap` and `ui.syntax_theme` are absent until they are built.
 
 use editor_config::settings::Settings;
+use editor_config::settings::UnderlineDiagnostics;
 use editor_config::theme::ThemePreference;
 use eframe::egui;
 
@@ -392,6 +393,31 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
     );
 
     ui.add_space(8.0);
+    heading(ui, "Diagnostics");
+
+    changed |= row(
+        ui,
+        "Underline in the text",
+        "The gutter marks and the Problems panel always show everything. A type          checker that cannot resolve a project's imports will report most of its          lines, which makes a file unreadable when all of them are underlined.",
+        |ui| {
+            let mut level = settings.underline_diagnostics();
+            let before = level;
+            egui::ComboBox::from_id_salt("underline_diagnostics")
+                .selected_text(level.label())
+                .show_ui(ui, |ui| {
+                    for option in UnderlineDiagnostics::ALL {
+                        ui.selectable_value(&mut level, option, option.label());
+                    }
+                });
+            if level != before {
+                settings.set_underline_diagnostics(level);
+                return true;
+            }
+            false
+        },
+    );
+
+    ui.add_space(8.0);
     heading(ui, "Typing");
 
     changed |= row(
@@ -486,6 +512,11 @@ mod tests {
 
         settings.set_auto_close_brackets(false);
         assert!(!settings.auto_close_brackets());
+
+        settings.set_underline_diagnostics(UnderlineDiagnostics::None);
+        assert_eq!(settings.underline_diagnostics(), UnderlineDiagnostics::None);
+        settings.set_underline_diagnostics(UnderlineDiagnostics::All);
+        assert_eq!(settings.underline_diagnostics(), UnderlineDiagnostics::All);
 
         settings.set_python_interpreter("C:/Python/python.exe");
         assert_eq!(settings.python_interpreter(), "C:/Python/python.exe");

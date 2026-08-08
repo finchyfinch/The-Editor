@@ -1039,11 +1039,11 @@ impl EditorApp {
         if self.completion.is_waiting() || !long_enough {
             return;
         }
-        self.request_completions(start, &prefix);
+        self.request_completions(start, &prefix, false);
     }
 
     /// Ask the servers about the word starting at `start`.
-    fn request_completions(&mut self, start: usize, prefix: &str) {
+    fn request_completions(&mut self, start: usize, prefix: &str, explicit: bool) {
         let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
             return;
         };
@@ -1061,7 +1061,13 @@ impl EditorApp {
             self.completion.requested(start, prefix);
             return;
         }
-        self.complete_locally(start, prefix);
+        // The word-list fallback is not offered unbidden. A list of names that
+        // happen to appear elsewhere in the file is a reasonable answer to
+        // "suggest something", and a poor reason to put a popup over the text
+        // every time two letters are typed.
+        if explicit {
+            self.complete_locally(start, prefix);
+        }
     }
 
     /// Suggest names already written in this file.
@@ -1124,7 +1130,7 @@ impl EditorApp {
             return;
         };
         self.completion.close();
-        self.request_completions(start, &prefix);
+        self.request_completions(start, &prefix, true);
         if !self.completion.is_open() && !self.completion.is_waiting() {
             self.info("No suggestions here");
         }
@@ -1669,13 +1675,26 @@ impl EditorApp {
     /// The protocol works in zero-based line and UTF-16 column; the editor works
     /// in character offsets. Converting here rather than at the point of use
     /// means one place to get it wrong.
-    fn underlines_for(entry: &OpenDoc, store: &editor_lsp::diagnostics::Store) -> Vec<Underline> {
+    fn underlines_for(
+        entry: &OpenDoc,
+        store: &editor_lsp::diagnostics::Store,
+        level: editor_config::settings::UnderlineDiagnostics,
+    ) -> Vec<Underline> {
+        use editor_config::settings::UnderlineDiagnostics as Level;
+        if level == Level::None {
+            return Vec::new();
+        }
         let Some(path) = entry.doc.path() else {
             return Vec::new();
         };
         store
             .for_file(path)
             .into_iter()
+            // The gutter and the Problems panel still show everything; this
+            // only decides how much of it is written across the text.
+            .filter(|d| {
+                level == Level::All || d.severity == editor_lsp::diagnostics::Severity::Error
+            })
             .map(|d| {
                 let start = entry.doc.offset_at(d.line as usize, d.column as usize);
                 let end = entry
@@ -2598,6 +2617,7 @@ impl EditorApp {
 
             let mut opts = self.editor_options();
             let syntax = &self.syntax_theme;
+            let underline_level = self.settings.underline_diagnostics();
             let diagnostics = self.lsp.diagnostics();
 
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
@@ -2620,9 +2640,11 @@ impl EditorApp {
                 entry
                     .view
                     .set_search_matches(entry.find.matches(), entry.find.current_match());
-                entry
-                    .view
-                    .set_diagnostics(Self::underlines_for(entry, diagnostics));
+                entry.view.set_diagnostics(Self::underlines_for(
+                    entry,
+                    diagnostics,
+                    underline_level,
+                ));
 
                 // Editing a preview tab promotes it: the file is being worked
                 // on, so it must not be replaced by the next explorer click.
@@ -2988,11 +3010,12 @@ impl eframe::App for EditorApp {
         // so a shortcut is not swallowed by a menu that happens to be open —
         // except while a modal has focus, where keystrokes belong to its
         // fields and its own shortcut must not re-open it.
-        // The popup is modal for keyboard purposes: while it is up, Enter,
-        // Tab, Escape and the arrows belong to it, and a global shortcut firing
-        // behind it would act on a document the user is not looking at.
-        let modal_open = self.completion.is_open()
-            || self.file_picker.is_open()
+        // The completion popup is deliberately *not* in this list. It already
+        // claims the five keys it needs in `completion_keys`, and treating it
+        // as modal blocked every other shortcut in the application -- Ctrl+F,
+        // Ctrl+S, F5 -- for as long as a suggestion was on screen, which while
+        // typing is most of the time.
+        let modal_open = self.file_picker.is_open()
             || self.settings_form.is_open()
             || self.pending_delete.is_some()
             || self.palette.is_open()

@@ -50,6 +50,12 @@ insert_spaces = true
 word_wrap = false
 # Typing an opening bracket or quote also inserts its closer.
 auto_close_brackets = true
+# Which diagnostics are underlined in the text: \"all\", \"errors\" or \"none\".
+# The gutter marks and the Problems panel are unaffected, so nothing is
+# hidden -- this only controls how much the editor is written on. A type
+# checker that cannot resolve a project's imports reports most of its lines,
+# which makes the file unreadable at \"all\".
+underline_diagnostics = \"errors\"
 
 [python]
 # Leave empty to auto-detect: a .venv in the project, else python on PATH.
@@ -76,6 +82,43 @@ mod defaults {
     pub(super) const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
     pub(super) const UI_FONT_SIZE_RANGE: (f32, f32) = (9.0, 32.0);
     pub(super) const TAB_WIDTH_RANGE: (usize, usize) = (1, 16);
+}
+
+/// How much of a diagnostic shows up in the text itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnderlineDiagnostics {
+    /// Everything a server reports.
+    All,
+    /// Errors only. The default, because a type checker that cannot resolve a
+    /// project's imports reports most of its lines, and a file underlined from
+    /// end to end cannot be read let alone edited. Warnings stay in the gutter
+    /// and the Problems panel.
+    #[default]
+    Errors,
+    /// Nothing in the text.
+    None,
+}
+
+impl UnderlineDiagnostics {
+    pub const ALL: [Self; 3] = [Self::All, Self::Errors, Self::None];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Errors => "errors",
+            Self::None => "none",
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "Errors and warnings",
+            Self::Errors => "Errors only",
+            Self::None => "Nothing",
+        }
+    }
 }
 
 /// Loaded settings plus the file they came from.
@@ -343,6 +386,23 @@ impl Settings {
     pub fn auto_close_brackets(&self) -> bool {
         self.bool_at("editor", "auto_close_brackets")
             .unwrap_or(defaults::AUTO_CLOSE_BRACKETS)
+    }
+
+    /// Which diagnostics to underline in the text.
+    ///
+    /// Unrecognised values fall back to the default rather than showing
+    /// nothing, which would look like the language server having stopped.
+    #[must_use]
+    pub fn underline_diagnostics(&self) -> UnderlineDiagnostics {
+        match self.str_at("editor", "underline_diagnostics") {
+            Some("all") => UnderlineDiagnostics::All,
+            Some("none") => UnderlineDiagnostics::None,
+            _ => UnderlineDiagnostics::Errors,
+        }
+    }
+
+    pub fn set_underline_diagnostics(&mut self, level: UnderlineDiagnostics) {
+        self.set("editor", "underline_diagnostics", value(level.as_str()));
     }
 
     pub fn set_auto_close_brackets(&mut self, close: bool) {

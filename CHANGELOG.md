@@ -89,6 +89,29 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **The completion popup blocked every keyboard shortcut in the application.**
+  It was listed as modal, so while a suggestion was on screen — which, while
+  typing, is most of the time — Ctrl+F, Ctrl+S and F5 all did nothing. It
+  already claims the five keys it actually needs, and now claims only those.
+- **The word-list fallback is no longer offered unbidden**, only on Ctrl+Space.
+  A list of names that happen to appear elsewhere in the file is a fair answer
+  to "suggest something" and a poor reason to cover the text every time two
+  letters are typed.
+- **Two-finger scrolling still stalled and then lurched.** The previous attempt
+  kept frames coming for a fixed 250 ms after the last wheel event, but egui's
+  easing outlives any fixed window: the animation ran out of frames part-way
+  and the remainder was applied in one jump when something else woke the loop.
+  Frames are now requested while the scroll offset is still changing, which is
+  the only honest signal that there is more to come.
+
+### Changed
+
+- **Only errors are underlined in the text by default.** A type checker that
+  cannot resolve a project's imports reports most of its lines, and a file
+  underlined end to end cannot be read, let alone edited. Warnings still appear
+  in the gutter and the Problems panel, so nothing is hidden. Settings → Editor
+  → *Underline in the text* offers all, errors only, or nothing.
+
 - **Jumping to a search match or a definition moved the caret but not the
   view.** The scroll target was taken from the painted caret rectangle, which
   only exists when the caret is *already* on screen — so the one case that
