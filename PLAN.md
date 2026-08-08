@@ -892,6 +892,29 @@ cannot type into is impossible to evaluate. The New File dialog moved from M8 to
 just after M2 for the same reason — a "new file" command that cannot name the
 file or pick its language is only half a feature.
 
+### Not in the original plan, and arguably should have been
+
+Measured against PyCharm and VS Code rather than against §3. None of these were
+considered when the plan was written; several are more valuable than things
+that were.
+
+| | Why it matters | Rough size |
+|---|---|---|
+| **Version control** | The largest omission by a distance. Change markers in the gutter, a diff view, blame, staging and committing, branch switching. "Not using GitHub" removes the *hosting*, not git — and after editing, this is the thing an IDE is used for most. | 3–4 wk |
+| **Integrated terminal** | The run console is a PTY already, so a general shell in the same dock is mostly UI. Currently every `pip install`, `git commit` or `pytest -k` means leaving the editor. | 1 wk |
+| **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. A headline PyCharm feature for Python and the natural partner to the debugger just built. | 2–3 wk |
+| **Rename / refactor** | `textDocument/rename` across the project. The request machinery exists and is unused. Renaming by find-and-replace is how people break code. | 1 wk |
+| **Autosave and local history** | The panic hook has an emergency-save scaffold that nothing fills. PyCharm's local history rescues people weekly; we can currently lose an unsaved buffer to a crash. | 1–1.5 wk |
+| **Auto-import** | Type `Path`, get `from pathlib import Path`. High value in Python specifically, and a code action the servers already offer. | 1 wk |
+| **Split panes** | Two files side by side, or two places in one file. Structural — the editor pane assumes a single active document — so best done before more is built on that assumption. | 1.5–2 wk |
+| **Outline / breadcrumbs** | `documentSymbol` gives a structure view and a breadcrumb bar for free. Navigating a 3,000-line file is currently scrolling. | 0.5 wk |
+| **Accessibility** | The editor is a custom widget that reports nothing to a screen reader. egui supports AccessKit; we have never wired it. Retrofitting this later is far harder than doing it now, and §3.11 only ever covered colour. | 1–2 wk |
+| **Diff / merge viewer** | Needed by version control, and useful on its own for comparing two files. | 1 wk |
+
+Deliberately out of scope, recorded so the decision is not re-litigated: remote
+development over SSH or containers, Jupyter notebooks, database tools, and
+profiling. Each is a product in itself.
+
 ### Outstanding logistics
 
 - Set up the bare backup remote (`git remote add origin <path-to-nas>/the-editor.git`).
