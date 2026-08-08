@@ -951,6 +951,7 @@ dependencies = [
  "editor-search",
  "editor-syntax",
  "eframe",
+ "ropey",
  "trash",
 ]
 

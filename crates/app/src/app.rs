@@ -2382,10 +2382,23 @@ impl EditorApp {
 
         for entry in &mut self.docs {
             let changes = entry.doc.take_changes();
-            if let Some(h) = entry.highlighter.as_mut()
-                && !changes.is_empty()
-            {
-                h.update(&changes, entry.doc.text());
+            if let Some(h) = entry.highlighter.as_mut() {
+                if !changes.is_empty() {
+                    h.update(&changes, entry.doc.text());
+                }
+                // A reparse that ran out of time leaves the tree a keystroke
+                // behind. Finish it as soon as nothing is being typed, on the
+                // same debounce the syntax check uses — the colours are the
+                // stale thing here, and they are worth a moment of lag to keep
+                // the keystroke itself instant.
+                if h.is_stale() {
+                    let due = *entry.syntax_due.get_or_insert(now + SYNTAX_DEBOUNCE);
+                    if now >= due {
+                        h.catch_up(entry.doc.text());
+                    } else {
+                        next_due = Some(next_due.map_or(due, |soonest: Instant| soonest.min(due)));
+                    }
+                }
             }
 
             let Some(path) = entry.doc.path().map(Path::to_path_buf) else {

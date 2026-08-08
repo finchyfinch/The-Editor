@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use editor_core::edit::Change;
 use ropey::Rope;
@@ -112,6 +113,23 @@ pub fn is_supported(language: LanguageId) -> bool {
     language == LanguageId::Ini || grammars().contains_key(&language)
 }
 
+/// How long a reparse may take while somebody is typing.
+///
+/// Comfortably inside one frame at 60 Hz. An incremental reparse of an edit
+/// that leaves the file parseable takes microseconds and never comes near
+/// this; an edit that breaks the syntax can cost hundreds of milliseconds,
+/// because tree-sitter then has almost nothing to reuse and pays for the
+/// attempt on top of the reparse. Measured on a 10,000-line Rust file, a
+/// character typed at the start of a line cost 117 ms against 39 ms for a
+/// parse from scratch — a freeze per keystroke.
+const TYPING_BUDGET: Duration = Duration::from_millis(8);
+
+/// How long the catch-up reparse may take once typing has stopped.
+///
+/// Generous, because by this point nobody is waiting on a keystroke, and
+/// giving up here would leave the highlighting wrong until the next edit.
+const IDLE_BUDGET: Duration = Duration::from_secs(2);
+
 /// Per-document highlighting state.
 pub enum Highlighter {
     /// Grammar-backed, holding a parse tree.
@@ -127,6 +145,7 @@ impl std::fmt::Debug for Highlighter {
                 .debug_struct("Highlighter::Tree")
                 .field("language", &t.language)
                 .field("parsed", &t.tree.is_some())
+                .field("stale", &t.stale)
                 .finish(),
             Self::Ini => f.write_str("Highlighter::Ini"),
         }
@@ -148,9 +167,39 @@ impl Highlighter {
             language,
             parser,
             tree: None,
+            stale: false,
         };
-        this.reparse(text);
+        // Opening a file is not a keystroke, so it gets the generous budget.
+        this.parse_within(text, IDLE_BUDGET);
         Some(Self::Tree(Box::new(this)))
+    }
+
+    /// True when the last reparse ran out of time and the tree is behind the
+    /// text.
+    ///
+    /// The caller should paint anyway — an edited tree still reports sensible
+    /// positions, so the colours are a moment stale rather than wrong — and
+    /// call [`Self::catch_up`] once typing pauses.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        match self {
+            Self::Tree(t) => t.stale,
+            Self::Ini => false,
+        }
+    }
+
+    /// Finish the reparse that typing did not have time for.
+    ///
+    /// Does nothing unless the tree is actually stale, so this is safe to call
+    /// every idle frame. Returns true if it caught up, so the caller knows the
+    /// highlighting and the syntax errors are worth recomputing.
+    pub fn catch_up(&mut self, text: &Rope) -> bool {
+        let Self::Tree(t) = self else { return false };
+        if !t.stale {
+            return false;
+        }
+        t.parse_within(text, IDLE_BUDGET);
+        !t.stale
     }
 
     /// Update after an edit.
@@ -165,14 +214,18 @@ impl Highlighter {
         match changes {
             [] => {}
             [change] => t.apply_change(change, text),
-            _ => t.reparse(text),
+            _ => t.parse_within(text, TYPING_BUDGET),
         }
     }
 
     /// Recompute from scratch — after undo, redo, or a reload from disk.
+    ///
+    /// None of those are keystrokes, so this gets the generous budget: a
+    /// reload that came out half-highlighted would stay that way.
     pub fn refresh(&mut self, text: &Rope) {
         if let Self::Tree(t) = self {
-            t.reparse(text);
+            t.tree = None;
+            t.parse_within(text, IDLE_BUDGET);
         }
     }
 
@@ -226,6 +279,8 @@ pub struct TreeHighlighter {
     language: LanguageId,
     parser: Parser,
     tree: Option<Tree>,
+    /// Set when a reparse ran out of time, so the tree is behind the text.
+    stale: bool,
 }
 
 impl std::fmt::Debug for TreeHighlighter {
@@ -240,13 +295,46 @@ impl std::fmt::Debug for TreeHighlighter {
 }
 
 impl TreeHighlighter {
-    fn reparse(&mut self, text: &Rope) {
-        self.tree = parse(&mut self.parser, text, None);
+    /// Parse, giving up if it takes longer than `budget`.
+    ///
+    /// On giving up, whatever tree we already have is kept and `stale` is set.
+    /// Throwing it away would be worse than keeping a slightly out-of-date one:
+    /// an edited tree still reports positions that line up with the text, so
+    /// the colours lag by a keystroke, whereas no tree at all means no colours,
+    /// no bracket matching and no structure until the next successful parse.
+    fn parse_within(&mut self, text: &Rope, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        // Called by tree-sitter as it works; the only thing it can do is say
+        // "stop". Checking the clock each time is cheap next to the parsing
+        // between calls.
+        let mut out_of_time = move |_: &tree_sitter::ParseState| {
+            if Instant::now() < deadline {
+                std::ops::ControlFlow::Continue(())
+            } else {
+                std::ops::ControlFlow::Break(())
+            }
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut out_of_time);
+
+        match parse(&mut self.parser, text, self.tree.as_ref(), Some(options)) {
+            Some(tree) => {
+                self.tree = Some(tree);
+                self.stale = false;
+            }
+            None => {
+                self.stale = true;
+                tracing::debug!(
+                    language = ?self.language,
+                    bytes = text.len_bytes(),
+                    "reparse ran out of time; highlighting is a keystroke behind"
+                );
+            }
+        }
     }
 
     fn apply_change(&mut self, change: &Change, text: &Rope) {
         let Some(tree) = self.tree.as_mut() else {
-            self.reparse(text);
+            self.parse_within(text, TYPING_BUDGET);
             return;
         };
 
@@ -269,7 +357,7 @@ impl TreeHighlighter {
         };
 
         tree.edit(&edit);
-        self.tree = parse(&mut self.parser, text, self.tree.as_ref());
+        self.parse_within(text, TYPING_BUDGET);
     }
 
     fn spans(&mut self, text: &Rope, byte_range: Range<usize>, theme: &SyntaxTheme) -> Vec<Span> {
@@ -376,7 +464,12 @@ impl TreeHighlighter {
 }
 
 /// Parse a rope without copying it into a contiguous `String`.
-fn parse(parser: &mut Parser, text: &Rope, old: Option<&Tree>) -> Option<Tree> {
+fn parse(
+    parser: &mut Parser,
+    text: &Rope,
+    old: Option<&Tree>,
+    options: Option<tree_sitter::ParseOptions<'_>>,
+) -> Option<Tree> {
     parser.parse_with_options(
         &mut |byte, _| {
             if byte >= text.len_bytes() {
@@ -386,7 +479,7 @@ fn parse(parser: &mut Parser, text: &Rope, old: Option<&Tree>) -> Option<Tree> {
             &chunk.as_bytes()[byte - chunk_start..]
         },
         old,
-        None,
+        options,
     )
 }
 
@@ -762,5 +855,72 @@ mod tests {
         assert_eq!(advance(start, "abc\ndef"), Point::new(4, 3));
         assert_eq!(advance(start, "\n"), Point::new(4, 0));
         assert_eq!(advance(start, ""), start);
+    }
+
+    /// A big file that takes real work to parse, so a zero budget genuinely
+    /// runs out rather than finishing before the parser looks at the clock.
+    fn big_rust() -> Rope {
+        let block =
+            "fn f(a: u32) -> u32 {\n    a + 1 // note\n}\n\nstruct S {\n    x: String,\n}\n\n";
+        Rope::from_str(&block.repeat(4_000))
+    }
+
+    /// The point of the budget: a reparse that runs out of time keeps the tree
+    /// it already has rather than throwing it away. No tree means no colours,
+    /// no bracket matching and no structure — far worse than colours that are
+    /// a keystroke behind.
+    #[test]
+    fn a_reparse_that_runs_out_of_time_keeps_the_previous_tree() {
+        let text = big_rust();
+        let mut highlighter =
+            Highlighter::new(LanguageId::Rust, &text).expect("Rust has a grammar");
+        assert!(!highlighter.is_stale(), "the first parse had time");
+        assert!(highlighter.tree().is_some());
+
+        let Highlighter::Tree(inner) = &mut highlighter else {
+            panic!("expected a tree-backed highlighter");
+        };
+        inner.parse_within(&text, Duration::ZERO);
+
+        assert!(highlighter.is_stale(), "no time, so it gave up");
+        assert!(
+            highlighter.tree().is_some(),
+            "and kept the tree it already had"
+        );
+        assert!(
+            !highlighter
+                .spans(
+                    &text,
+                    0..200,
+                    &SyntaxTheme::for_ui(editor_config::theme::ResolvedTheme::Dark)
+                )
+                .is_empty(),
+            "a stale tree still highlights"
+        );
+    }
+
+    #[test]
+    fn catching_up_clears_the_staleness() {
+        let text = big_rust();
+        let mut highlighter =
+            Highlighter::new(LanguageId::Rust, &text).expect("Rust has a grammar");
+        let Highlighter::Tree(inner) = &mut highlighter else {
+            panic!("expected a tree-backed highlighter");
+        };
+        inner.parse_within(&text, Duration::ZERO);
+        assert!(highlighter.is_stale());
+
+        assert!(highlighter.catch_up(&text), "it caught up");
+        assert!(!highlighter.is_stale());
+        // Safe to call every idle frame: nothing to do, and it says so.
+        assert!(!highlighter.catch_up(&text), "nothing left to catch up on");
+    }
+
+    /// The fallback highlighter has no parser, so it can never fall behind.
+    #[test]
+    fn the_ini_fallback_is_never_stale() {
+        let mut ini = Highlighter::Ini;
+        assert!(!ini.is_stale());
+        assert!(!ini.catch_up(&Rope::from_str("[a]\nb = 1\n")));
     }
 }

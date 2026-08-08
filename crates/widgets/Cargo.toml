@@ -18,5 +18,13 @@ editor-proc = { version = "1.0.0", path = "../proc" }
 trash = "5.2.6"
 editor-lsp = { version = "1.0.0", path = "../lsp" }
 
+[dev-dependencies]
+ropey.workspace = true
+
+# A plain program rather than a harness: see the file's own explanation.
+[[bench]]
+name = "budgets"
+harness = false
+
 [lints]
 workspace = true
