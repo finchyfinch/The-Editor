@@ -106,6 +106,13 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **Breakpoints were invisible.** The gutter had no column reserved for them,
+  so the marker was painted underneath the line numbers and setting one looked
+  like it had done nothing. Breakpoints now have a strip of their own at the
+  far left, clicking in it toggles one, and setting a breakpoint with no
+  `debugpy` installed says so once rather than leaving a dot that can never be
+  hit.
+
 - **Redo ran Undo**, Save As ran Save, Shift+F12 ran Go to Definition, and
   every other Shift-plus-something binding fired its unshifted twin. egui's
   `consume_shortcut` matches modifiers *logically*, so an extra Shift is

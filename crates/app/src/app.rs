@@ -229,6 +229,9 @@ pub(crate) struct EditorApp {
     problem_revealed: Option<(PathBuf, u32, u32)>,
     /// Breakpoints, which outlive any debug session and are saved with it.
     breakpoints: Breakpoints,
+    /// Whether the "debugpy is missing" note has been shown. Once per run: it
+    /// is worth saying, and worth saying only once.
+    debugpy_warned: bool,
     /// The running debug session, if any.
     debug: Option<editor_debug::Session>,
     /// Stack and variables for the paused session.
@@ -313,6 +316,7 @@ impl EditorApp {
             problem_at_caret: None,
             problem_revealed: None,
             breakpoints: Breakpoints::default(),
+            debugpy_warned: false,
             debug: None,
             debug_view: DebugView::default(),
             uses: UseResults::default(),
@@ -1106,8 +1110,25 @@ impl EditorApp {
             self.info("Save the file before setting breakpoints");
             return;
         };
-        self.breakpoints.toggle(&path, line + 1);
+        let set = self.breakpoints.toggle(&path, line + 1);
         self.send_breakpoints(&path);
+
+        // Said once, on the first breakpoint of a run, if nothing can act on
+        // it. A dot appearing looks like it worked, and finding out that it
+        // cannot be hit should not wait until Alt+F5.
+        if set && !self.debugpy_warned && self.debug.is_none() {
+            self.debugpy_warned = true;
+            if let Some(interpreter) = editor_proc::interpreter::resolve(
+                &self.settings.python_interpreter(),
+                self.tree.root(),
+            ) && !editor_debug::adapter::is_available(&interpreter.path)
+            {
+                self.info(format!(
+                    "Breakpoint set, but debugging needs debugpy \u{2014} {}",
+                    editor_debug::adapter::INSTALL
+                ));
+            }
+        }
     }
 
     fn send_breakpoints(&mut self, path: &Path) {

@@ -296,11 +296,17 @@ impl EditorView {
         let space_width = ui.fonts_mut(|f| f.glyph_width(&font, ' '));
         let line_count = doc.text().len_lines();
 
-        let gutter_width = if opts.show_line_numbers {
-            space_width * (line_count.to_string().len() as f32 + 2.0) + 12.0
-        } else {
-            6.0
-        };
+        // A column of its own for breakpoints, at the very left. Drawing them
+        // over the line numbers -- which is what happened first -- makes them
+        // invisible against the digits, so a breakpoint appeared not to have
+        // been set at all.
+        let breakpoint_width = row_height;
+        let gutter_width = breakpoint_width
+            + if opts.show_line_numbers {
+                space_width * (line_count.to_string().len() as f32 + 2.0) + 12.0
+            } else {
+                6.0
+            };
 
         let mut changed = false;
 
@@ -487,6 +493,18 @@ impl EditorView {
         };
 
         response.request_focus();
+
+        // A click in the breakpoint column sets one, which is how every other
+        // editor does it and the first thing anyone tries. Handled before the
+        // caret moves, so the click does not also jump the caret to line 1.
+        if response.clicked() && pos.x < rect.left() + row_height {
+            let line = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
+            if line < doc.line_count() {
+                self.toggle_breakpoint = Some(line);
+            }
+            return false;
+        }
+
         let offset = self.offset_at_pos(ui, doc, font, pos, rect, text_left, row_height);
 
         if response.double_clicked() {
@@ -1369,14 +1387,14 @@ impl EditorView {
             );
         }
 
-        // Breakpoints, in the gutter beside the line number.
+        // Breakpoints, in their own column at the far left.
         for (line, verified) in &self.breakpoints {
             if *line < first || *line >= last {
                 continue;
             }
             let y = rect.top() + *line as f32 * row_height + row_height / 2.0;
-            let centre = egui::pos2(rect.left() + row_height * 0.45, y);
-            let radius = row_height * 0.22;
+            let centre = egui::pos2(rect.left() + row_height / 2.0, y);
+            let radius = row_height * 0.26;
             let colour = egui::Color32::from_rgb(0xd0, 0x45, 0x45);
             if *verified {
                 painter.circle_filled(centre, radius, colour);
@@ -1517,7 +1535,7 @@ impl EditorView {
                     .min_by_key(|d| d.severity)
                 {
                     painter.text(
-                        egui::pos2(rect.left() + 2.0, y),
+                        egui::pos2(rect.left() + row_height + 2.0, y),
                         egui::Align2::LEFT_TOP,
                         worst.severity.glyph(),
                         font.clone(),
