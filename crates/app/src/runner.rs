@@ -64,6 +64,15 @@ impl Runner {
         self.session.as_ref().is_some_and(Session::is_running)
     }
 
+    /// Put a banner line into the console, as a finished run does.
+    ///
+    /// The debugger reports its own start and end; without this it shared the
+    /// console with the runner but never said when it had stopped, so a program
+    /// that had run to completion looked identical to one still paused.
+    pub(crate) fn push_banner(&mut self, text: &str) {
+        self.output.push_line(text);
+    }
+
     /// Feed text straight into the console.
     ///
     /// Used by the debugger, whose output arrives as protocol events rather

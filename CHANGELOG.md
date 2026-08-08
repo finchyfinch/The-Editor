@@ -106,6 +106,22 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **The console never said when debugging had ended.** A debug session shared
+  the console with the runner but announced nothing, so a program that had run
+  to completion looked exactly like one still paused. The session now echoes
+  the command it is debugging, and prints `[Debugging finished]` or
+  `[Debugging stopped]` when it ends, as a run does.
+- **debugpy's own telemetry was printed as program output.** The adapter
+  reports its name and version through the same event, with no trailing
+  newline, so it ran into the first real line: `ptvsddebugpystart`. Only
+  `stdout`, `stderr` and console output is shown now.
+- **The toolbar shows whether anything is running.** Run greys out with a
+  spinner beside it, and Stop turns red and becomes clickable — and stops the
+  debugger when that is what is live, rather than doing nothing.
+- **Two toolbar buttons could look identical.** With no icon font available,
+  Run and Redo both fell back to `>` and Open and Find both to a circle. Every
+  button now has a distinct last-resort label, with a test that says so.
+
 - **Breakpoints were invisible.** The gutter had no column reserved for them,
   so the marker was painted underneath the line numbers and setting one looked
   like it had done nothing. Breakpoints now have a strip of their own at the

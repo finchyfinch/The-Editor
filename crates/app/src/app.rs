@@ -1199,6 +1199,13 @@ impl EditorApp {
                     let lines = self.breakpoints.for_file(&file);
                     session.set_breakpoints(&file, &lines);
                 }
+                // Echoed like a run, so the console says what is happening
+                // rather than filling with output from nowhere.
+                self.runner.push_banner(&format!(
+                    "> debug {} ({})",
+                    program.display(),
+                    interpreter.path.display()
+                ));
                 self.debug = Some(session);
                 self.debug_view.clear();
                 self.dock = DockTab::Debug;
@@ -1221,6 +1228,7 @@ impl EditorApp {
     fn debug_stop(&mut self) {
         if let Some(session) = self.debug.as_mut() {
             session.stop();
+            self.runner.push_banner("[Debugging stopped]");
         }
         self.debug = None;
         self.debug_view.clear();
@@ -1248,6 +1256,7 @@ impl EditorApp {
                     if state == editor_debug::State::Finished {
                         self.debug = None;
                         self.debug_view.clear();
+                        self.runner.push_banner("[Debugging finished]");
                         self.info("Debugging finished");
                         return;
                     }
@@ -2779,6 +2788,13 @@ impl EditorApp {
         // raising ui.font_size does not clip the toolbar or status bar.
         let row = ui.text_style_height(&egui::TextStyle::Body);
 
+        // What is going on, so Run and Stop can say so. Debugging counts as
+        // running: the program is live either way, and a Stop button that does
+        // nothing during a debug session is a lie.
+        let debugging = self.debug.is_some();
+        let busy = self.runner.is_running() || self.runner.has_queued_work() || debugging;
+        let what = if debugging { "debugging" } else { "running" };
+
         egui::Panel::top("toolbar")
             .exact_size(row * 2.2)
             .show(ui, |ui| {
@@ -2791,8 +2807,52 @@ impl EditorApp {
                                 |sc| format!("{} ({sc})", cmd.title),
                             );
                             let glyph = editor_widgets::icon::pick(ui, toolbar_glyphs(*id));
-                            if ui.button(glyph).on_hover_text(tip).clicked() {
-                                invoked = Some(*id);
+
+                            match id {
+                                // While something is live, Run is spent and
+                                // Stop is the live one. Saying so with enabled
+                                // state and colour rather than with a changing
+                                // glyph, because a button whose icon changes
+                                // under the pointer is harder to aim at than
+                                // one that greys out.
+                                CommandId::Run if busy => {
+                                    ui.add_enabled(false, egui::Button::new(glyph))
+                                        .on_disabled_hover_text(format!("Already {what}"));
+                                    // An actual moving thing, so it is obvious
+                                    // at a glance that this is not a stalled
+                                    // window.
+                                    ui.spinner();
+                                }
+                                CommandId::RunStop => {
+                                    let button = egui::Button::new(
+                                        egui::RichText::new(glyph).color(if busy {
+                                            ui.visuals().error_fg_color
+                                        } else {
+                                            ui.visuals().weak_text_color()
+                                        }),
+                                    );
+                                    if ui
+                                        .add_enabled(busy, button)
+                                        .on_hover_text(if debugging {
+                                            "Stop debugging".to_owned()
+                                        } else {
+                                            tip.clone()
+                                        })
+                                        .on_disabled_hover_text("Nothing is running")
+                                        .clicked()
+                                    {
+                                        invoked = Some(if debugging {
+                                            CommandId::DebugStop
+                                        } else {
+                                            CommandId::RunStop
+                                        });
+                                    }
+                                }
+                                _ => {
+                                    if ui.button(glyph).on_hover_text(tip).clicked() {
+                                        invoked = Some(*id);
+                                    }
+                                }
                             }
                         }
                         ui.separator();
@@ -3883,21 +3943,23 @@ fn menu_item(ui: &mut egui::Ui, id: CommandId) -> egui::Response {
 /// everything and a missing glyph is drawn as a box — silently, and identically
 /// for every button that misses. See `editor_widgets::icon`.
 fn toolbar_glyphs(id: CommandId) -> &'static [&'static str] {
-    // Text glyphs until the icon set lands in M9. They are unambiguous with
-    // the tooltip, which every button has.
+    // Icons first, then a shape from a block the bundled fonts do cover, then
+    // a short label. The labels are two letters rather than a lookalike
+    // symbol: with no icon font, `>` for both Run and Redo, and a circle for
+    // both Open and Find, is worse than plain text.
     match id {
         CommandId::NewFile => &["\u{2795}", "+"],
-        CommandId::OpenFile => &["\u{1f4c2}", "\u{25b1}", "O"],
-        CommandId::Save => &["\u{1f4be}", "\u{25bd}", "S"],
-        CommandId::SaveAll => &["\u{1f5c3}", "\u{25bc}", "A"],
-        CommandId::Undo => &["\u{21b6}", "\u{25c0}", "<"],
-        CommandId::Redo => &["\u{21b7}", "\u{25b6}", ">"],
-        CommandId::Find => &["\u{1f50d}", "\u{25cb}", "F"],
-        CommandId::Run => &["\u{25b6}", ">"],
-        CommandId::RunStop => &["\u{25a0}", "#"],
-        CommandId::ToggleExplorer => &["\u{2630}", "\u{25a4}", "E"],
-        CommandId::CommandPalette => &["\u{2318}", "\u{25c8}", "P"],
-        CommandId::OpenSettings | CommandId::OpenSettingsFile => &["\u{2699}", "\u{25cf}", "S"],
+        CommandId::OpenFile => &["\u{1f4c2}", "Op"],
+        CommandId::Save => &["\u{1f4be}", "Sv"],
+        CommandId::SaveAll => &["\u{1f5c3}", "SA"],
+        CommandId::Undo => &["\u{21b6}", "Un"],
+        CommandId::Redo => &["\u{21b7}", "Re"],
+        CommandId::Find => &["\u{1f50d}", "Fi"],
+        CommandId::Run => &["\u{25b6}", "\u{25b8}", "Run"],
+        CommandId::RunStop => &["\u{25a0}", "Stop"],
+        CommandId::ToggleExplorer => &["\u{2630}", "\u{25a4}", "Ex"],
+        CommandId::CommandPalette => &["\u{2318}", "\u{25c8}", "Cmd"],
+        CommandId::OpenSettings | CommandId::OpenSettingsFile => &["\u{2699}", "\u{25cf}", "Set"],
         _ => &["?"],
     }
 }
@@ -4147,6 +4209,19 @@ mod tests {
             for id in *group {
                 let glyphs = toolbar_glyphs(*id);
                 assert_ne!(glyphs, ["?"], "{id:?} is on the toolbar but has no glyph");
+                // Two buttons whose last-resort label is the same are
+                // indistinguishable on a machine whose fonts cover neither
+                // icon -- which is this one. Run and Redo were both `>`.
+                for other in TOOLBAR.iter().flat_map(|g| g.iter()) {
+                    if other == id {
+                        continue;
+                    }
+                    assert_ne!(
+                        glyphs.last(),
+                        toolbar_glyphs(*other).last(),
+                        "{id:?} and {other:?} fall back to the same label"
+                    );
+                }
                 assert!(
                     glyphs.len() >= 2 || glyphs[0].is_ascii(),
                     "{id:?} has a single non-ASCII glyph and so no fallback if the                      font cannot draw it"

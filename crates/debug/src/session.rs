@@ -351,7 +351,16 @@ impl Session {
                 out.push(DebugEvent::StateChanged(State::Finished));
             }
             Some("output") => {
-                if let Some(text) = body.get("output").and_then(Value::as_str) {
+                // Only what the program actually printed. debugpy also reports
+                // its own telemetry through this event -- the adapter's name
+                // and version, with no trailing newline -- which ran together
+                // with the first line of real output as `ptvsddebugpystart`.
+                let category = body
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .unwrap_or("console");
+                let wanted = matches!(category, "stdout" | "stderr" | "console" | "important");
+                if wanted && let Some(text) = body.get("output").and_then(Value::as_str) {
                     out.push(DebugEvent::Output(text.to_owned()));
                 }
             }
@@ -625,6 +634,18 @@ mod tests {
         assert_eq!(vars[0].kind.as_deref(), Some("list"));
         assert_eq!(vars[1].kind, None, "a missing type is not an error");
         assert_eq!(vars[1].value, "2");
+    }
+
+    #[test]
+    fn only_the_programs_own_output_reaches_the_console() {
+        // debugpy reports its own name and version as `telemetry` output, with
+        // no trailing newline, so it ran straight into the first line the
+        // program printed: `ptvsddebugpystart`.
+        let wanted =
+            |category: &str| matches!(category, "stdout" | "stderr" | "console" | "important");
+        assert!(wanted("stdout"));
+        assert!(wanted("stderr"));
+        assert!(!wanted("telemetry"));
     }
 
     #[test]
