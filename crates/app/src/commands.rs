@@ -56,6 +56,12 @@ pub(crate) enum CommandId {
     RunStop,
     RunRestart,
     RunTests,
+    ToggleBreakpoint,
+    DebugStart,
+    DebugStop,
+    DebugStepOver,
+    DebugStepInto,
+    DebugStepOut,
     ShowOutput,
     ShowProblems,
     SelectInterpreter,
@@ -121,6 +127,12 @@ impl CommandId {
         Self::RunStop,
         Self::RunRestart,
         Self::RunTests,
+        Self::ToggleBreakpoint,
+        Self::DebugStart,
+        Self::DebugStop,
+        Self::DebugStepOver,
+        Self::DebugStepInto,
+        Self::DebugStepOut,
         Self::ShowOutput,
         Self::ShowProblems,
         Self::SelectInterpreter,
@@ -185,6 +197,10 @@ const fn plain(key: Key) -> KeyboardShortcut {
 
 const fn alt(key: Key) -> KeyboardShortcut {
     KeyboardShortcut::new(Modifiers::ALT, key)
+}
+
+const fn alt_shift(key: Key) -> KeyboardShortcut {
+    KeyboardShortcut::new(Modifiers::ALT.plus(Modifiers::SHIFT), key)
 }
 
 const fn shift(key: Key) -> KeyboardShortcut {
@@ -330,6 +346,45 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
     cmd(CommandId::RunStop, "Run", "Stop", Some(shift(Key::F5))),
     cmd(CommandId::RunRestart, "Run", "Restart", ctrl(Key::F5)),
     cmd(CommandId::RunTests, "Run", "Run Tests", None),
+    // The bindings every debugger uses, except for start: F5 is already Run,
+    // and quietly changing what F5 does depending on state would be worse than
+    // a second key. Alt+F5 both starts and continues, which is one idea.
+    cmd(
+        CommandId::ToggleBreakpoint,
+        "Run",
+        "Toggle Breakpoint",
+        Some(plain(Key::F9)),
+    ),
+    cmd(
+        CommandId::DebugStart,
+        "Run",
+        "Start Debugging / Continue",
+        Some(alt(Key::F5)),
+    ),
+    cmd(
+        CommandId::DebugStop,
+        "Run",
+        "Stop Debugging",
+        Some(alt_shift(Key::F5)),
+    ),
+    cmd(
+        CommandId::DebugStepOver,
+        "Run",
+        "Step Over",
+        Some(plain(Key::F10)),
+    ),
+    cmd(
+        CommandId::DebugStepInto,
+        "Run",
+        "Step Into",
+        Some(plain(Key::F11)),
+    ),
+    cmd(
+        CommandId::DebugStepOut,
+        "Run",
+        "Step Out",
+        Some(shift(Key::F11)),
+    ),
     cmd(
         CommandId::ShowOutput,
         "View",

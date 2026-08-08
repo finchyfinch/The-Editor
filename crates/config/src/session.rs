@@ -90,6 +90,9 @@ pub struct Session {
     /// configuration: it changes constantly, nobody hand-edits it, and losing
     /// it costs nothing.
     pub recent_files: Vec<PathBuf>,
+    /// Breakpoints per file, one-based. Kept across runs, because losing them
+    /// on restart means placing them all again to resume where you left off.
+    pub breakpoints: Vec<(PathBuf, Vec<usize>)>,
 }
 
 /// How many entries the recent list keeps.
@@ -174,6 +177,31 @@ impl Session {
                 .unwrap_or(false),
             // Entries whose file has since gone are dropped on load rather than
             // shown and then failing to open.
+            breakpoints: doc
+                .get("breakpoints")
+                .and_then(Item::as_array_of_tables)
+                .map(|tables| {
+                    tables
+                        .iter()
+                        .filter_map(|t| {
+                            let path = PathBuf::from(t.get("path")?.as_str()?);
+                            // A file that has gone takes its breakpoints with
+                            // it, as its open tab already does.
+                            if !path.is_file() {
+                                return None;
+                            }
+                            let lines: Vec<usize> = t
+                                .get("lines")?
+                                .as_array()?
+                                .iter()
+                                .filter_map(|v| usize::try_from(v.as_integer()?).ok())
+                                .filter(|l| *l > 0)
+                                .collect();
+                            (!lines.is_empty()).then_some((path, lines))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             recent_files: doc
                 .get("recent_files")
                 .and_then(Item::as_array)
@@ -243,6 +271,24 @@ impl Session {
         }
         if !files.is_empty() {
             doc["files"] = Item::ArrayOfTables(files);
+        }
+
+        let mut breakpoints = toml_edit::ArrayOfTables::new();
+        for (path, lines) in &self.breakpoints {
+            if lines.is_empty() {
+                continue;
+            }
+            let mut table = Table::new();
+            table["path"] = value(path.display().to_string());
+            let mut array = toml_edit::Array::new();
+            for line in lines {
+                array.push(*line as i64);
+            }
+            table["lines"] = value(array);
+            breakpoints.push(table);
+        }
+        if !breakpoints.is_empty() {
+            doc["breakpoints"] = Item::ArrayOfTables(breakpoints);
         }
 
         if !self.recent_files.is_empty() {

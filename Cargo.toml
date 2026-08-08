@@ -5,6 +5,7 @@ members = [
     "crates/core",
     "crates/syntax",
     "crates/lsp",
+    "crates/debug",
     "crates/proc",
     "crates/search",
     "crates/config",
@@ -27,6 +28,7 @@ publish = false
 editor-core = { path = "crates/core" }
 editor-syntax = { path = "crates/syntax" }
 editor-lsp = { path = "crates/lsp" }
+editor-debug = { path = "crates/debug" }
 editor-proc = { path = "crates/proc" }
 editor-search = { path = "crates/search" }
 editor-config = { path = "crates/config" }

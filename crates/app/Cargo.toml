@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 editor-config.workspace = true
 editor-core.workspace = true
+editor-debug.workspace = true
 editor-lsp = { version = "1.0.0", path = "../lsp" }
 editor-proc = { version = "1.0.0", path = "../proc" }
 editor-search.workspace = true

@@ -88,6 +88,12 @@ pub struct EditorView {
     current_match: Option<std::ops::Range<usize>>,
     /// Diagnostic underlines, supplied by the application each frame.
     diagnostics: Vec<Underline>,
+    /// Breakpoint lines (zero-based) and whether the debugger could bind them.
+    breakpoints: Vec<(usize, bool)>,
+    /// The line the debugger is currently stopped on, zero-based.
+    paused_line: Option<usize>,
+    /// A gutter click asking to toggle a breakpoint, taken by the application.
+    toggle_breakpoint: Option<usize>,
     /// Set by the context menu, taken by the application next frame.
     context_action: Option<ContextAction>,
     /// The scroll offset at the end of the last frame.
@@ -250,6 +256,20 @@ impl EditorView {
         self.context_action.take()
     }
 
+    /// Breakpoints to draw in the gutter, and the line execution is stopped on.
+    ///
+    /// Supplied per frame rather than held, for the same reason diagnostics are:
+    /// they belong to the file, not to this view of it.
+    pub fn set_debug_state(&mut self, breakpoints: Vec<(usize, bool)>, paused: Option<usize>) {
+        self.breakpoints = breakpoints;
+        self.paused_line = paused;
+    }
+
+    /// A line the user clicked in the gutter, or chose from the context menu.
+    pub fn take_breakpoint_toggle(&mut self) -> Option<usize> {
+        self.toggle_breakpoint.take()
+    }
+
     /// Ranges to highlight as search results, and which of them is current.
     ///
     /// Set once per frame before drawing; cleared when the find bar closes.
@@ -355,6 +375,11 @@ impl EditorView {
                 }
 
                 response.context_menu(|ui| {
+                    if ui.button("Toggle Breakpoint").clicked() {
+                        self.toggle_breakpoint = Some(doc.line_of(self.selection.head));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Go to Definition").clicked() {
                         self.context_action = Some(ContextAction::GoToDefinition);
                         ui.close();
@@ -1324,6 +1349,43 @@ impl EditorView {
                 0.0,
                 visuals.faint_bg_color,
             );
+        }
+
+        // The line the debugger is stopped on, above the current-line stripe so
+        // it is unmistakable which is which.
+        if let Some(line) = self.paused_line
+            && line < doc.line_count()
+        {
+            let y = rect.top() + line as f32 * row_height;
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(text_left, y),
+                    egui::vec2(rect.width() - gutter_width, row_height),
+                ),
+                0.0,
+                // A wash rather than a solid fill: the code underneath is the
+                // point, and a highlight that hides it defeats itself.
+                visuals.selection.bg_fill.gamma_multiply(0.45),
+            );
+        }
+
+        // Breakpoints, in the gutter beside the line number.
+        for (line, verified) in &self.breakpoints {
+            if *line < first || *line >= last {
+                continue;
+            }
+            let y = rect.top() + *line as f32 * row_height + row_height / 2.0;
+            let centre = egui::pos2(rect.left() + row_height * 0.45, y);
+            let radius = row_height * 0.22;
+            let colour = egui::Color32::from_rgb(0xd0, 0x45, 0x45);
+            if *verified {
+                painter.circle_filled(centre, radius, colour);
+            } else {
+                // Hollow: placed, but the debugger could not bind it — usually
+                // a blank line or a comment. It will never be hit, and must not
+                // look like one that will.
+                painter.circle_stroke(centre, radius, egui::Stroke::new(1.5, colour));
+            }
         }
 
         let mut caret_rect = None;

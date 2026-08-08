@@ -27,6 +27,7 @@ use eframe::egui;
 
 use crate::commands::{self, CommandId};
 use crate::completion;
+use crate::debugger::{self, Breakpoints, DebugView};
 use crate::file_picker::FilePicker;
 use crate::new_file;
 use crate::palette::Palette;
@@ -152,6 +153,8 @@ struct OpenDoc {
     /// Document version the built-in syntax check last ran against. `None`
     /// until it has run once.
     syntax_version: Option<u64>,
+    /// Line count as of the last frame, so breakpoints can follow their lines.
+    line_count_seen: Option<usize>,
     /// When the next syntax check is due, so squiggles do not flicker under
     /// the caret while a line is half-typed.
     syntax_due: Option<Instant>,
@@ -224,6 +227,12 @@ pub(crate) struct EditorApp {
     problem_at_caret: Option<(PathBuf, u32, u32)>,
     /// What the panel last scrolled to, so it only does so when it changes.
     problem_revealed: Option<(PathBuf, u32, u32)>,
+    /// Breakpoints, which outlive any debug session and are saved with it.
+    breakpoints: Breakpoints,
+    /// The running debug session, if any.
+    debug: Option<editor_debug::Session>,
+    /// Stack and variables for the paused session.
+    debug_view: DebugView,
     /// Results of the last Find Uses, and where in them the user is.
     uses: UseResults,
     /// Go to File (Ctrl+P).
@@ -248,6 +257,7 @@ enum DockTab {
     #[default]
     Output,
     Problems,
+    Debug,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -302,6 +312,9 @@ impl EditorApp {
             problems_all_files: false,
             problem_at_caret: None,
             problem_revealed: None,
+            breakpoints: Breakpoints::default(),
+            debug: None,
+            debug_view: DebugView::default(),
             uses: UseResults::default(),
             file_picker: FilePicker::default(),
             completion: completion::Popup::default(),
@@ -428,6 +441,7 @@ impl EditorApp {
             preview,
             syntax_version: None,
             syntax_due: None,
+            line_count_seen: None,
         };
 
         // A preview tab replaces the existing one rather than adding to it.
@@ -736,6 +750,9 @@ impl EditorApp {
         // them to the front of a list that already has the older history in it
         // rather than replacing it.
         self.recent.clone_from(&session.recent_files);
+        for (path, lines) in &session.breakpoints {
+            self.breakpoints.set_file(path.clone(), lines.clone());
+        }
 
         if let Some(folder) = &session.folder {
             self.open_folder(folder.clone());
@@ -775,6 +792,7 @@ impl EditorApp {
         });
 
         Session {
+            breakpoints: self.breakpoints.flatten(),
             recent_files: self.recent.clone(),
             folder: self.tree.root().map(Path::to_path_buf),
             open_files: self
@@ -1068,6 +1086,179 @@ impl EditorApp {
             .map(|d| (path.to_path_buf(), d.line, d.column))
     }
 
+    /// Toggle a breakpoint on the caret's line, and tell a running session.
+    fn toggle_breakpoint_at_caret(&mut self) {
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            return;
+        };
+        let line = entry.doc.line_of(entry.view.selection.head);
+        self.toggle_breakpoint(line);
+    }
+
+    /// `line` is zero-based, as the editor counts; breakpoints are one-based.
+    fn toggle_breakpoint(&mut self, line: usize) {
+        let Some(path) = self
+            .active
+            .and_then(|i| self.docs.get(i))
+            .and_then(|e| e.doc.path())
+            .map(Path::to_path_buf)
+        else {
+            self.info("Save the file before setting breakpoints");
+            return;
+        };
+        self.breakpoints.toggle(&path, line + 1);
+        self.send_breakpoints(&path);
+    }
+
+    fn send_breakpoints(&mut self, path: &Path) {
+        let lines = self.breakpoints.for_file(path);
+        if let Some(session) = self.debug.as_mut() {
+            session.set_breakpoints(path, &lines);
+        }
+    }
+
+    /// Alt+F5: start a session, or continue a paused one.
+    ///
+    /// One key for both because they are the same intention — "carry on" —
+    /// and a debugger with separate Start and Continue keys makes you think
+    /// about which state you are in before you can press anything.
+    fn debug_start_or_continue(&mut self) {
+        if let Some(session) = self.debug.as_mut() {
+            if session.is_paused() {
+                session.resume(editor_debug::session::Step::Continue);
+                self.debug_view.clear();
+            }
+            return;
+        }
+
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            self.info("Open a Python file to debug");
+            return;
+        };
+        if entry.language != LanguageId::Python {
+            self.info("The debugger is for Python only at present");
+            return;
+        }
+        let Some(program) = entry.doc.path().map(Path::to_path_buf) else {
+            self.info("Save the file before debugging it");
+            return;
+        };
+        if entry.doc.is_dirty() {
+            // Debugging a file that differs from the one on disk puts every
+            // breakpoint on the wrong line, silently.
+            self.info("Save the file first \u{2014} the debugger reads it from disk");
+            return;
+        }
+
+        let Some(interpreter) = editor_proc::interpreter::resolve(
+            &self.settings.python_interpreter(),
+            self.tree.root(),
+        ) else {
+            self.error("No Python interpreter found");
+            return;
+        };
+        if !editor_debug::adapter::is_available(&interpreter.path) {
+            self.error(format!(
+                "debugpy is not installed for {} \u{2014} {}",
+                interpreter.path.display(),
+                editor_debug::adapter::INSTALL
+            ));
+            return;
+        }
+
+        let cwd = self
+            .tree
+            .root()
+            .map_or_else(|| program.parent().unwrap_or(Path::new(".")), |r| r)
+            .to_path_buf();
+
+        match editor_debug::Session::launch(&interpreter.path, &program, &cwd, &[]) {
+            Ok(mut session) => {
+                for file in self.breakpoints.files() {
+                    let lines = self.breakpoints.for_file(&file);
+                    session.set_breakpoints(&file, &lines);
+                }
+                self.debug = Some(session);
+                self.debug_view.clear();
+                self.dock = DockTab::Debug;
+                self.show_output = true;
+                self.info(format!("Debugging {}", program.display()));
+            }
+            Err(e) => self.error(format!("Could not start the debugger: {e:#}")),
+        }
+    }
+
+    fn debug_step(&mut self, how: editor_debug::session::Step) {
+        if let Some(session) = self.debug.as_mut()
+            && session.is_paused()
+        {
+            session.resume(how);
+            self.debug_view.clear();
+        }
+    }
+
+    fn debug_stop(&mut self) {
+        if let Some(session) = self.debug.as_mut() {
+            session.stop();
+        }
+        self.debug = None;
+        self.debug_view.clear();
+    }
+
+    /// Drain the debug session once per frame.
+    fn poll_debugger(&mut self, ctx: &egui::Context) {
+        let Some(session) = self.debug.as_mut() else {
+            return;
+        };
+        let events = session.poll();
+        if events.is_empty() {
+            // A paused session produces nothing until the user acts; a running
+            // one is about to. Keep the frame loop turning while it lives.
+            if session.is_alive() && !session.is_paused() {
+                ctx.request_repaint_after(Duration::from_millis(60));
+            }
+            return;
+        }
+
+        let mut jump_to = None;
+        for event in events {
+            match event {
+                editor_debug::DebugEvent::StateChanged(state) => {
+                    if state == editor_debug::State::Finished {
+                        self.debug = None;
+                        self.debug_view.clear();
+                        self.info("Debugging finished");
+                        return;
+                    }
+                }
+                editor_debug::DebugEvent::Paused { reason } => {
+                    self.debug_view.reason = reason;
+                }
+                editor_debug::DebugEvent::Stack(frames) => {
+                    self.debug_view.selected = frames.first().map(|f| f.id);
+                    self.debug_view.stack = frames;
+                    jump_to = self.debug_view.location();
+                }
+                editor_debug::DebugEvent::Variables(vars) => {
+                    self.debug_view.variables = vars;
+                }
+                editor_debug::DebugEvent::BreakpointsVerified { .. } => {}
+                editor_debug::DebugEvent::Output(text) => {
+                    self.runner.push_output(&text);
+                }
+                editor_debug::DebugEvent::Failed(message) => {
+                    self.error(format!("Debugger: {message}"));
+                }
+            }
+        }
+
+        if let Some((path, line)) = jump_to {
+            // One-based from the protocol, zero-based for the editor.
+            self.open_at(&path, line.saturating_sub(1), 0);
+        }
+    }
+
+    /// The word being typed at the caret: where it starts, and what it is.
     /// The word being typed at the caret: where it starts, and what it is.
     ///
     /// `None` when the caret is not immediately after an identifier character,
@@ -1707,6 +1898,7 @@ impl EditorApp {
     fn sync_highlighters(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let mut next_due: Option<Instant> = None;
+        let mut breakpoints_changed: Vec<PathBuf> = Vec::new();
 
         for entry in &mut self.docs {
             let changes = entry.doc.take_changes();
@@ -1721,6 +1913,27 @@ impl EditorApp {
                 // same reason the language servers cannot see it.
                 continue;
             };
+
+            // Carry breakpoints with the lines they were put on. Approximated
+            // from the change in line count rather than from the edit itself:
+            // exact tracking needs every edit's range, and being one line out
+            // after a multi-cursor paste is a much smaller problem than a
+            // breakpoint that silently stops matching its statement.
+            let lines_now = entry.doc.line_count();
+            if let Some(before) = entry.line_count_seen
+                && before != lines_now
+                && !self.breakpoints.for_file(&path).is_empty()
+            {
+                let caret_line = entry.doc.line_of(entry.view.selection.head);
+                let delta = lines_now as isize - before as isize;
+                self.breakpoints.shift(
+                    &path,
+                    caret_line.saturating_sub(delta.unsigned_abs()),
+                    delta,
+                );
+                breakpoints_changed.push(path.clone());
+            }
+            entry.line_count_seen = Some(lines_now);
             let version = entry.doc.version();
             if entry.syntax_version == Some(version) {
                 continue;
@@ -1744,6 +1957,10 @@ impl EditorApp {
                 .set_builtin(&path, found.into_iter().map(to_diagnostic).collect());
             entry.syntax_version = Some(version);
             entry.syntax_due = None;
+        }
+
+        for path in breakpoints_changed {
+            self.send_breakpoints(&path);
         }
 
         // Nothing else will wake the frame loop once typing stops, so the
@@ -2203,6 +2420,7 @@ impl EditorApp {
                     preview: false,
                     syntax_version: None,
                     syntax_due: None,
+                    line_count_seen: None,
                 });
                 self.active = Some(self.docs.len() - 1);
                 self.focus_active();
@@ -2403,6 +2621,12 @@ impl EditorApp {
             CommandId::MoveLineUp => self.on_view(|view, doc| view.move_lines(doc, -1)),
             CommandId::MoveLineDown => self.on_view(|view, doc| view.move_lines(doc, 1)),
             CommandId::GoToFile => self.open_file_picker(),
+            CommandId::ToggleBreakpoint => self.toggle_breakpoint_at_caret(),
+            CommandId::DebugStart => self.debug_start_or_continue(),
+            CommandId::DebugStop => self.debug_stop(),
+            CommandId::DebugStepOver => self.debug_step(editor_debug::session::Step::Over),
+            CommandId::DebugStepInto => self.debug_step(editor_debug::session::Step::Into),
+            CommandId::DebugStepOut => self.debug_step(editor_debug::session::Step::Out),
             CommandId::TriggerCompletion => self.trigger_completion(),
             CommandId::GoToDefinition => {
                 self.ask_about_symbol(editor_lsp::session::Query::Definition);
@@ -2716,6 +2940,27 @@ impl EditorApp {
             let mut opts = self.editor_options();
             let syntax = &self.syntax_theme;
             let underline_level = self.settings.underline_diagnostics();
+            // Read before the mutable borrow below. Breakpoints are stored
+            // one-based, as the gutter and the protocol both count them, and
+            // converted here for painting.
+            let active_path = self
+                .active
+                .and_then(|i| self.docs.get(i))
+                .and_then(|e| e.doc.path())
+                .map(Path::to_path_buf);
+            let breakpoints_here: Vec<(usize, bool)> = active_path
+                .as_ref()
+                .map(|p| {
+                    self.breakpoints
+                        .for_file(p)
+                        .into_iter()
+                        .map(|line| (line.saturating_sub(1), true))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let paused_line = self.debug_view.location().and_then(|(path, line)| {
+                (Some(&path) == active_path.as_ref()).then(|| line.saturating_sub(1))
+            });
             let diagnostics = self.lsp.diagnostics();
 
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
@@ -2743,6 +2988,9 @@ impl EditorApp {
                     diagnostics,
                     underline_level,
                 ));
+                entry
+                    .view
+                    .set_debug_state(breakpoints_here.clone(), paused_line);
 
                 // Editing a preview tab promotes it: the file is being worked
                 // on, so it must not be replaced by the next explorer click.
@@ -3082,6 +3330,7 @@ impl eframe::App for EditorApp {
             self.restore_session(&session, &ctx);
         }
         self.poll_watcher();
+        self.poll_debugger(&ctx);
         self.sync_highlighters(&ctx);
         self.sync_completion();
         self.sync_problem_at_caret();
@@ -3175,6 +3424,7 @@ impl eframe::App for EditorApp {
 
         if self.show_output {
             let mut console_action = None;
+            let mut debug_action = debugger::Action::None;
             let mut problem_clicked = None;
 
             // The height is owned here rather than left to the panel.
@@ -3227,6 +3477,12 @@ impl eframe::App for EditorApp {
                         {
                             self.dock = DockTab::Problems;
                         }
+                        if ui
+                            .selectable_label(self.dock == DockTab::Debug, "DEBUG")
+                            .clicked()
+                        {
+                            self.dock = DockTab::Debug;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
                                 self.show_output = false;
@@ -3238,9 +3494,24 @@ impl eframe::App for EditorApp {
                     match self.dock {
                         DockTab::Output => console_action = Some(self.runner.draw(ui)),
                         DockTab::Problems => problem_clicked = self.problems_ui(ui),
+                        DockTab::Debug => {
+                            let running = self.debug.is_some();
+                            let paused = self
+                                .debug
+                                .as_ref()
+                                .is_some_and(editor_debug::Session::is_paused);
+                            debug_action = self.debug_view.ui(ui, running, paused);
+                        }
                     }
                 });
 
+            if let debugger::Action::SelectFrame { id, path, line } = debug_action {
+                self.debug_view.selected = Some(id);
+                if let Some(session) = self.debug.as_mut() {
+                    session.select_frame(id);
+                }
+                self.open_at(&path, line.saturating_sub(1), 0);
+            }
             if let Some(action) = console_action {
                 self.apply_console_action(action);
             }
@@ -3781,6 +4052,13 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::RunRestart),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::RunTests),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::ToggleBreakpoint),
+            MenuEntry::Item(CommandId::DebugStart),
+            MenuEntry::Item(CommandId::DebugStepOver),
+            MenuEntry::Item(CommandId::DebugStepInto),
+            MenuEntry::Item(CommandId::DebugStepOut),
+            MenuEntry::Item(CommandId::DebugStop),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::SelectInterpreter),
             MenuEntry::Item(CommandId::CreateVenv),

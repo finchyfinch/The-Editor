@@ -9,6 +9,7 @@
 mod app;
 mod commands;
 mod completion;
+mod debugger;
 mod file_picker;
 mod logging;
 mod new_file;

@@ -870,6 +870,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor-debug"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "editor-lsp",
+ "editor-proc",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "editor-lsp"
 version = "1.0.0"
 dependencies = [
@@ -3523,6 +3535,7 @@ dependencies = [
  "arboard",
  "editor-config",
  "editor-core",
+ "editor-debug",
  "editor-lsp",
  "editor-proc",
  "editor-search",

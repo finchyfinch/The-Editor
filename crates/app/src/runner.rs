@@ -64,6 +64,15 @@ impl Runner {
         self.session.as_ref().is_some_and(Session::is_running)
     }
 
+    /// Feed text straight into the console.
+    ///
+    /// Used by the debugger, whose output arrives as protocol events rather
+    /// than through a terminal, but which belongs in the same place the user
+    /// already looks for a program's output.
+    pub(crate) fn push_output(&mut self, text: &str) {
+        self.output.feed(text.as_bytes());
+    }
+
     /// The output buffer. Used by tests and by anything that wants to copy the
     /// transcript; the console reads it through [`Self::draw`].
     #[must_use]

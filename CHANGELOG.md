@@ -10,6 +10,15 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **A Python debugger.** Breakpoints (F9, or right-click → Toggle Breakpoint),
+  single stepping (F10 over, F11 into, Shift+F11 out), Alt+F5 to start and to
+  continue, Alt+Shift+F5 to stop. A **Debug** tab in the bottom dock shows the
+  call stack and the selected frame's local variables; clicking a frame jumps
+  to it. Breakpoints are drawn in the gutter — hollow if the debugger could not
+  bind them — follow their lines as the file is edited, and are saved with the
+  session. Needs `debugpy`; the editor says so with the command to install it.
+  Python only: Rust needs a different adapter.
+
 - **The problem under the caret is highlighted and scrolled to in the Problems
   panel.** Finding which of two hundred entries belongs to the squiggle you are
   looking at was otherwise a manual search.
