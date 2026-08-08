@@ -10,6 +10,15 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **An application icon**, compiled into the executable as a Windows resource
+  so Explorer, the taskbar and Alt+Tab show it rather than the generic one, and
+  set on the window as well — those are read from different places and setting
+  one does not set the other. The exe also carries its product name,
+  description and copyright. Drawn at each size it is displayed at rather than
+  scaled down from one large image, because the size that matters most is 16 px
+  and thin strokes do not survive being resampled to it. `tools/make_icon.py`
+  regenerates the assets.
+
 - **A Python debugger.** Breakpoints (F9, or right-click → Toggle Breakpoint),
   single stepping (F10 over, F11 into, Shift+F11 out), Alt+F5 to start and to
   continue, Alt+Shift+F5 to stop. A **Debug** tab in the bottom dock shows the

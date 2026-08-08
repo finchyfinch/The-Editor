@@ -50,7 +50,8 @@ fn main() -> Result<()> {
             .with_title("The Editor")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 400.0])
-            .with_app_id("uk.garethfinch.the-editor"),
+            .with_app_id("uk.garethfinch.the-editor")
+            .with_icon(window_icon()),
         // M1 restores the previous window geometry from the session file and
         // validates it against the monitors actually present.
         persist_window: false,
@@ -66,4 +67,23 @@ fn main() -> Result<()> {
 
     tracing::info!("The Editor exiting cleanly");
     Ok(())
+}
+
+/// The icon shown in the title bar, the taskbar and Alt+Tab.
+///
+/// Separate from the one compiled into the executable: that is read from the
+/// *file* by Explorer, this is asked of the running *process*, and setting one
+/// does not set the other.
+///
+/// Stored as raw RGBA rather than a PNG so no image decoder is needed for one
+/// 64-pixel square. Generated alongside `assets/icon.ico`.
+fn window_icon() -> egui::IconData {
+    const SIZE: u32 = 64;
+    let rgba = include_bytes!("../../../assets/icon-64.rgba").to_vec();
+    debug_assert_eq!(rgba.len(), (SIZE * SIZE * 4) as usize);
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
+    }
 }

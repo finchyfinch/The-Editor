@@ -36,5 +36,10 @@ notify-debouncer-full = "0.7.0"
 # have no `Document` behind them.
 ropey.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+# Compiles the icon into the exe's resources, so Explorer, the taskbar and the
+# Alt+Tab list show it instead of the generic application icon.
+winresource = "0.1.24"
+
 [lints]
 workspace = true
