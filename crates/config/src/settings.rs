@@ -63,6 +63,10 @@ insert_final_newline = false
 # Honour a project's .editorconfig, which overrides the indent and save
 # settings above for files it covers.
 use_editorconfig = true
+# Stop the caret blinking. Repeating animation is distracting for some people
+# and genuinely disabling for a few, and the caret is the one animation that
+# is on screen the whole time you are reading.
+reduce_motion = false
 
 [python]
 # Leave empty to auto-detect: a .venv in the project, else python on PATH.
@@ -88,6 +92,7 @@ mod defaults {
     pub(super) const INSERT_SPACES: bool = true;
     pub(super) const WORD_WRAP: bool = false;
     pub(super) const AUTO_CLOSE_BRACKETS: bool = true;
+    pub(super) const REDUCE_MOTION: bool = false;
 
     /// Guard rails for hand-edited values. A `ui_scale = 40.0` should clamp to
     /// something usable rather than render an unrecoverable window.
@@ -399,6 +404,17 @@ impl Settings {
     pub fn auto_close_brackets(&self) -> bool {
         self.bool_at("editor", "auto_close_brackets")
             .unwrap_or(defaults::AUTO_CLOSE_BRACKETS)
+    }
+
+    /// Whether to suppress repeating animation, chiefly the caret blink.
+    #[must_use]
+    pub fn reduce_motion(&self) -> bool {
+        self.bool_at("editor", "reduce_motion")
+            .unwrap_or(defaults::REDUCE_MOTION)
+    }
+
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        self.set("editor", "reduce_motion", value(on));
     }
 
     /// Which diagnostics to underline in the text.

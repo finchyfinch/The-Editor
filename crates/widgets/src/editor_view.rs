@@ -43,6 +43,8 @@ pub struct EditorOptions {
     /// Drives the indentation, comment and bracket rules.
     pub language: LanguageId,
     pub auto_close_brackets: bool,
+    /// Stop the caret blinking and other repeating animation.
+    pub reduce_motion: bool,
 }
 
 impl Default for EditorOptions {
@@ -54,6 +56,7 @@ impl Default for EditorOptions {
             show_line_numbers: true,
             language: LanguageId::PlainText,
             auto_close_brackets: true,
+            reduce_motion: false,
         }
     }
 }
@@ -85,6 +88,9 @@ pub struct EditorView {
     /// Where an Alt+drag column selection started. Kept because the first frame
     /// of the drag overwrites the selection it began from.
     column_anchor: Option<usize>,
+    /// Copied from the options each frame, because  is called from
+    /// the paint pass where the options are no longer to hand.
+    reduce_motion: bool,
     /// Column the caret is "trying" to be in while moving vertically, so that
     /// crossing a short line and coming back returns to the original column
     /// instead of clinging to the short line's end.
@@ -495,6 +501,7 @@ impl EditorView {
         syntax: &SyntaxTheme,
         opts: EditorOptions,
     ) -> bool {
+        self.reduce_motion = opts.reduce_motion;
         let font = egui::FontId::monospace(opts.font_size);
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
         let space_width = ui.fonts_mut(|f| f.glyph_width(&font, ' '));
@@ -560,6 +567,7 @@ impl EditorView {
 
                 // The code pane *is* text, so here the I-beam is correct.
                 let response = response.on_hover_cursor(egui::CursorIcon::Text);
+                self.describe_for_screen_readers(ui, doc, &response);
 
                 let text_left = rect.left() + gutter_width;
                 let visible = ui.clip_rect().intersect(rect);
@@ -2021,7 +2029,70 @@ impl EditorView {
 
     /// Solid for a moment after any interaction, so the caret is never invisible
     /// exactly when the user looks for it.
+    /// Tell the accessibility tree what this widget is and where the caret is.
+    ///
+    /// Without this the editor is an unlabelled rectangle: a screen reader
+    /// announces the menus, the buttons and the file tree, and then nothing at
+    /// all for the one part of the window that matters. egui reports its own
+    /// widgets automatically, but a custom-painted one has to say so itself.
+    ///
+    /// The value reported is the **current line**, not the document. A screen
+    /// reader announces text as the caret moves through it, so the line is the
+    /// unit it actually wants; handing it a five-megabyte string every time the
+    /// caret moves would be both useless and ruinous.
+    fn describe_for_screen_readers(
+        &self,
+        ui: &egui::Ui,
+        doc: &Document,
+        response: &egui::Response,
+    ) {
+        let (line, column) = doc.line_col(self.selection.head);
+        let line_index = line - 1;
+        let text = doc.line_text(line_index);
+        let line_start = doc.line_start(line_index);
+        let selection = self.selection.range();
+        // Clamped to this line, in characters: the selection may run off both
+        // ends of it, and a range outside the reported value is nonsense. The
+        // line's *byte* length would be the wrong bound — a range in character
+        // offsets bounded by a byte count is only right for ASCII.
+        let line_chars = doc.line_len(line_index);
+        let from = selection.start.saturating_sub(line_start).min(line_chars);
+        let to = selection.end.saturating_sub(line_start).min(line_chars);
+        let (from, to) = (egui::text::CharIndex(from), egui::text::CharIndex(to));
+
+        let editable = doc.is_editable();
+        let label = format!(
+            "Code editor, line {line} of {}, column {column}",
+            doc.line_count()
+        );
+
+        response.widget_info(|| egui::WidgetInfo {
+            typ: egui::WidgetType::TextEdit,
+            enabled: editable,
+            label: Some(label.clone()),
+            current_text_value: Some(text.clone()),
+            text_selection: Some(from..to),
+            ..egui::WidgetInfo::new(egui::WidgetType::TextEdit)
+        });
+
+        // The node itself, so the editor has a role and a name in the tree even
+        // when nothing has happened to raise an event.
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_role(accesskit::Role::MultilineTextInput);
+            node.set_label(label.clone());
+            node.set_value(text.clone());
+            if !editable {
+                node.set_read_only();
+            }
+        });
+    }
+
     fn blink_on(&self) -> bool {
+        // A blinking caret is the animation accessibility guidance names first,
+        // and the one that is on screen the whole time you are reading.
+        if self.reduce_motion {
+            return true;
+        }
         let Some(since) = self.last_interaction.map(|t| t.elapsed().as_millis()) else {
             return true;
         };
@@ -2300,6 +2371,39 @@ mod tests {
             Selection::at(text.chars().count()),
         );
         doc
+    }
+
+    // ---- accessibility ---------------------------------------------------
+
+    /// A caret that never stops blinking is exactly the animation that
+    /// accessibility guidance names first, and unlike most animations it is on
+    /// screen the whole time you are reading.
+    #[test]
+    fn reduce_motion_leaves_the_caret_solid() {
+        let mut view = EditorView {
+            reduce_motion: false,
+            ..EditorView::default()
+        };
+
+        let seen: Vec<bool> = (0..40)
+            .map(|i| {
+                view.last_interaction = Some(
+                    std::time::Instant::now() - std::time::Duration::from_millis(600 + i * 100),
+                );
+                view.blink_on()
+            })
+            .collect();
+        assert!(
+            seen.contains(&true) && seen.contains(&false),
+            "with motion allowed the caret does blink"
+        );
+
+        view.reduce_motion = true;
+        for i in 0..40 {
+            view.last_interaction =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(600 + i * 100));
+            assert!(view.blink_on(), "reduce motion means always visible");
+        }
     }
 
     // ---- multiple carets -------------------------------------------------

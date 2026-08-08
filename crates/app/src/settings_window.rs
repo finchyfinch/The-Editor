@@ -509,6 +509,22 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
         },
     );
 
+    changed |= row(
+        ui,
+        "Reduce motion",
+        "Stop the caret blinking. Repeating animation is distracting for some \
+         people and disabling for a few, and the caret is the one animation \
+         that is on screen the whole time you are reading.",
+        |ui| {
+            let mut reduce = settings.reduce_motion();
+            if ui.checkbox(&mut reduce, "").changed() {
+                settings.set_reduce_motion(reduce);
+                return true;
+            }
+            false
+        },
+    );
+
     if changed {
         Action::Changed
     } else {
@@ -579,6 +595,8 @@ mod tests {
 
         settings.set_auto_close_brackets(false);
         assert!(!settings.auto_close_brackets());
+        settings.set_reduce_motion(true);
+        assert!(settings.reduce_motion());
 
         settings.set_underline_diagnostics(UnderlineDiagnostics::None);
         assert_eq!(settings.underline_diagnostics(), UnderlineDiagnostics::None);

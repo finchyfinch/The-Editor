@@ -17,6 +17,9 @@ editor-search = { version = "1.0.0", path = "../search" }
 editor-proc = { version = "1.0.0", path = "../proc" }
 trash = "5.2.6"
 editor-lsp = { version = "1.0.0", path = "../lsp" }
+# Re-exported by eframe; named here so the editor can describe itself to the
+# accessibility tree, which a custom-painted widget has to do for itself.
+accesskit = "0.24.1"
 
 [dev-dependencies]
 ropey.workspace = true

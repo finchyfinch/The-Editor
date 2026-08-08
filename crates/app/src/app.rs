@@ -460,6 +460,7 @@ impl EditorApp {
             show_line_numbers: true,
             language: LanguageId::PlainText,
             auto_close_brackets: self.settings.auto_close_brackets(),
+            reduce_motion: self.settings.reduce_motion(),
         };
 
         // A project's `.editorconfig` outranks these settings for files it
