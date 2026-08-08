@@ -74,6 +74,17 @@ impl EditorOptions {
 #[derive(Debug, Default)]
 pub struct EditorView {
     pub selection: Selection,
+    /// Extra carets, beyond the primary one in `selection`.
+    ///
+    /// Empty almost always, which is why the primary stays a plain field:
+    /// every command that has no multi-cursor meaning goes on reading and
+    /// writing `selection` and simply drops the extras first. Only the handful
+    /// of operations that genuinely apply to all of them — typing, deleting,
+    /// moving — know this exists.
+    secondary: Vec<Selection>,
+    /// Where an Alt+drag column selection started. Kept because the first frame
+    /// of the drag overwrites the selection it began from.
+    column_anchor: Option<usize>,
     /// Column the caret is "trying" to be in while moving vertically, so that
     /// crossing a short line and coming back returns to the original column
     /// instead of clinging to the short line's end.
@@ -161,15 +172,205 @@ impl EditorView {
         self.grab_focus = true;
     }
 
+    // ---- multiple carets --------------------------------------------------
+
+    /// How many carets there are. One, unless multi-cursor is in use.
+    #[must_use]
+    pub fn cursor_count(&self) -> usize {
+        self.secondary.len() + 1
+    }
+
+    /// Drop every caret but the primary. Returns true if any went.
+    ///
+    /// Called by everything that has no multi-cursor meaning, and by Escape.
+    pub fn collapse_cursors(&mut self) -> bool {
+        let had = !self.secondary.is_empty();
+        self.secondary.clear();
+        had
+    }
+
+    /// Every caret in document order, and which of them is the primary.
+    fn cursors(&self) -> (Vec<Selection>, usize) {
+        if self.secondary.is_empty() {
+            return (vec![self.selection], 0);
+        }
+        let mut all = Vec::with_capacity(self.secondary.len() + 1);
+        all.push((self.selection, true));
+        all.extend(self.secondary.iter().map(|s| (*s, false)));
+        all.sort_by_key(|(s, _)| (s.start(), s.end()));
+        let primary = all.iter().position(|(_, p)| *p).unwrap_or(0);
+        (all.into_iter().map(|(s, _)| s).collect(), primary)
+    }
+
+    /// Replace the caret set, merging any that have run into each other.
+    ///
+    /// Carets do collide: put three on consecutive lines, press End, and two of
+    /// them can land on the same offset. Left alone they would each apply the
+    /// next edit, so typing one character would insert three — which is how
+    /// multi-cursor implementations corrupt files.
+    fn install_cursors(&mut self, cursors: Vec<Selection>, primary: usize) {
+        let mut tagged: Vec<(Selection, bool)> = cursors
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| (s, i == primary))
+            .collect();
+        tagged.sort_by_key(|(s, _)| (s.start(), s.end()));
+
+        let mut merged: Vec<(Selection, bool)> = Vec::with_capacity(tagged.len());
+        for (sel, is_primary) in tagged {
+            match merged.last_mut() {
+                // Overlapping, or two collapsed carets in the same place.
+                Some((last, last_primary)) if sel.start() <= last.end() => {
+                    let start = last.start().min(sel.start());
+                    let end = last.end().max(sel.end());
+                    // Keep the survivor pointing the way the later one did, so
+                    // shift+arrow keeps extending in the direction it was.
+                    *last = if sel.head >= sel.anchor {
+                        Selection::new(start, end)
+                    } else {
+                        Selection::new(end, start)
+                    };
+                    *last_primary |= is_primary;
+                }
+                _ => merged.push((sel, is_primary)),
+            }
+        }
+
+        let keep = merged.iter().position(|(_, p)| *p).unwrap_or(0);
+        self.selection = merged[keep].0;
+        self.secondary = merged
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != keep)
+            .map(|(_, (s, _))| s)
+            .collect();
+    }
+
+    /// Run `motion` once for every caret, with each installed as the primary.
+    ///
+    /// Motion is the one thing that genuinely is the same operation repeated:
+    /// no caret's movement changes where any other one should end up. Doing it
+    /// this way means arrow keys, Home, End, word motion and page motion all
+    /// became multi-cursor-aware without any of them being touched.
+    fn each_cursor(&mut self, doc: &Document, motion: impl Fn(&mut Self, &Document)) {
+        if self.secondary.is_empty() {
+            motion(self, doc);
+            return;
+        }
+        let (cursors, primary) = self.cursors();
+        let saved_goal = self.goal_column;
+        let mut moved = Vec::with_capacity(cursors.len());
+        for sel in cursors {
+            self.selection = sel;
+            // Each caret keeps its own idea of the column it is aiming for;
+            // sharing one would drag them all into a single column.
+            self.goal_column = saved_goal;
+            motion(self, doc);
+            moved.push(self.selection);
+        }
+        self.install_cursors(moved, primary);
+        self.scroll_to_caret = true;
+    }
+
+    /// Add a caret at the next occurrence of what the primary has selected.
+    ///
+    /// With nothing selected, selects the word under the caret first — which is
+    /// what makes Ctrl+D, Ctrl+D, Ctrl+D read as "this word, and the next, and
+    /// the next" rather than needing a double-click to start.
+    ///
+    /// Returns false when there is nothing further to add, so the caller can
+    /// say so rather than leaving the key looking broken.
+    pub fn add_cursor_at_next_match(&mut self, doc: &Document) -> bool {
+        if self.selection.is_empty() {
+            let word = word_at(doc, self.selection.head);
+            if word.is_empty() {
+                return false;
+            }
+            self.selection = word;
+            self.scroll_to_caret = true;
+            return true;
+        }
+
+        let needle = doc.text().slice(self.selection.range()).to_string();
+        if needle.is_empty() {
+            return false;
+        }
+        let (cursors, primary) = self.cursors();
+        let taken: Vec<usize> = cursors.iter().map(|s| s.start()).collect();
+        let last = cursors.iter().map(|s| s.end()).max().unwrap_or(0);
+
+        let text = doc.text().to_string();
+        // Search from after the last caret, then wrap. Wrapping matters: having
+        // worked down a file you expect the next Ctrl+D to come back to the top
+        // rather than silently doing nothing.
+        let Some(at) = find_from(&text, &needle, last).or_else(|| find_from(&text, &needle, 0))
+        else {
+            return false;
+        };
+        if taken.contains(&at) {
+            return false; // Everything is already selected.
+        }
+
+        let mut cursors = cursors;
+        cursors.push(Selection::new(at, at + needle.chars().count()));
+        self.install_cursors(cursors, primary);
+        self.scroll_to_caret = true;
+        true
+    }
+
+    /// Add a caret one line up or down from the outermost one in that
+    /// direction, at the same column.
+    pub fn add_cursor_vertically(&mut self, doc: &Document, delta: isize) -> bool {
+        let (cursors, primary) = self.cursors();
+        // Grow away from the block, not from the primary: pressing the key
+        // repeatedly should extend the run of carets rather than fight over the
+        // same line.
+        let edge = if delta < 0 {
+            cursors.first().copied()
+        } else {
+            cursors.last().copied()
+        };
+        let Some(edge) = edge else { return false };
+
+        let line = doc.line_of(edge.head);
+        let Some(target_line) = line.checked_add_signed(delta) else {
+            return false;
+        };
+        if target_line >= doc.line_count() {
+            return false;
+        }
+        // The same goal column the arrow keys use, and for the same reason:
+        // running a column of carets past a short line and on to a long one
+        // should come back to where it started, not cling to the short line.
+        let column = self
+            .goal_column
+            .unwrap_or_else(|| edge.head - doc.line_start(line));
+        let start = doc.line_start(target_line);
+        let head = start + column.min(doc.line_len(target_line));
+
+        let mut cursors = cursors;
+        cursors.push(Selection::at(head));
+        self.install_cursors(cursors, primary);
+        self.goal_column = Some(column);
+        self.scroll_to_caret = true;
+        true
+    }
+
     // ---- application commands --------------------------------------------
     //
     // Driven from the command registry rather than from key handling here, so
     // that the menu item and the shortcut cannot diverge.
 
     /// Undo one step. Returns true if anything changed.
+    ///
+    /// Drops the extra carets. The history records one selection per step, so
+    /// the others have nothing to be restored to — and leaving them where they
+    /// were points them into text the undo has just moved, which is exactly how
+    /// the next keystroke lands somewhere unrelated.
     pub fn undo(&mut self, doc: &mut Document) -> bool {
         match doc.undo() {
             Some(sel) => {
+                self.collapse_cursors();
                 self.selection = sel;
                 self.scroll_to_caret = true;
                 self.touch();
@@ -183,6 +384,7 @@ impl EditorView {
     pub fn redo(&mut self, doc: &mut Document) -> bool {
         match doc.redo() {
             Some(sel) => {
+                self.collapse_cursors();
                 self.selection = sel;
                 self.scroll_to_caret = true;
                 self.touch();
@@ -509,18 +711,109 @@ impl EditorView {
 
         let offset = self.offset_at_pos(ui, doc, font, pos, rect, text_left, row_height);
 
+        let (alt, shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
+
+        if alt && response.dragged() {
+            // Alt+drag is a column selection: the rectangle between where the
+            // drag began and where the pointer is, one caret per line. Held
+            // separately from `column_anchor` because the offset the drag
+            // started at is not recoverable from the selection once the first
+            // frame of the drag has rewritten it.
+            let anchor = *self.column_anchor.get_or_insert(offset);
+            self.select_column(doc, anchor, offset);
+            self.goal_column = None;
+            self.touch();
+            return false;
+        }
+        self.column_anchor = None;
+
         if response.double_clicked() {
+            self.collapse_cursors();
             self.selection = word_at(doc, offset);
-        } else if response.dragged() || ui.input(|i| i.modifiers.shift) {
+        } else if alt && response.clicked() {
+            // Alt+click adds a caret, and Alt+clicking one that is already
+            // there takes it away again — otherwise a misplaced caret can only
+            // be undone by starting over.
+            self.toggle_cursor_at(offset);
+        } else if response.dragged() || shift {
             // Dragging or shift-clicking extends from the existing anchor.
             self.selection = self.selection.extended_to(offset);
         } else {
+            self.collapse_cursors();
             self.selection = Selection::at(offset);
         }
 
         self.goal_column = None;
         self.touch();
         false
+    }
+
+    /// Add a caret at `offset`, or remove the one already there.
+    fn toggle_cursor_at(&mut self, offset: usize) {
+        let (mut cursors, primary) = self.cursors();
+        if let Some(at) = cursors
+            .iter()
+            .position(|s| s.is_empty() && s.head == offset)
+        {
+            // Never remove the last one: an editor with no caret has no way to
+            // get one back except by clicking, which is what just happened.
+            if cursors.len() > 1 {
+                cursors.remove(at);
+                let primary = if primary == at {
+                    0
+                } else if primary > at {
+                    primary - 1
+                } else {
+                    primary
+                };
+                self.install_cursors(cursors, primary);
+            }
+            return;
+        }
+        cursors.push(Selection::at(offset));
+        // The caret just placed becomes the primary: it is the one being
+        // looked at, so it is the one the status bar and scrolling follow.
+        let last = cursors.len() - 1;
+        self.install_cursors(cursors, last);
+    }
+
+    /// Replace the caret set with a rectangle: one selection per line between
+    /// the two offsets, spanning the same two columns.
+    ///
+    /// Lines shorter than the left-hand column get nothing rather than a caret
+    /// jammed against their end. A column selection is about a rectangle of
+    /// text, and inventing carets on lines that do not reach into it means the
+    /// next keystroke edits lines the rectangle never covered.
+    fn select_column(&mut self, doc: &Document, from: usize, to: usize) {
+        let (first_line, first_col) = doc.line_col(from);
+        let (last_line, last_col) = doc.line_col(to);
+        let (first_line, first_col) = (first_line - 1, first_col - 1);
+        let (last_line, last_col) = (last_line - 1, last_col - 1);
+
+        let (top, bottom) = (first_line.min(last_line), first_line.max(last_line));
+        let (left, right) = (first_col.min(last_col), first_col.max(last_col));
+
+        let mut cursors = Vec::new();
+        for line in top..=bottom.min(doc.line_count().saturating_sub(1)) {
+            let len = doc.line_len(line);
+            if left > len {
+                continue;
+            }
+            let start = doc.line_start(line);
+            // A zero-width rectangle is a column of carets, which is the whole
+            // point of Alt+drag straight down.
+            cursors.push(Selection::new(start + left, start + right.min(len)));
+        }
+        if cursors.is_empty() {
+            return;
+        }
+        // The line the pointer is on stays primary, so the view follows it.
+        let primary = if last_line >= first_line {
+            cursors.len() - 1
+        } else {
+            0
+        };
+        self.install_cursors(cursors, primary);
     }
 
     /// Map a screen position to a character offset.
@@ -666,11 +959,18 @@ impl EditorView {
             }
             Key::Tab if extend => self.shift_lines(doc, opts, -1),
             Key::Backspace => {
-                if self.selection.is_empty() {
-                    if self.selection.head == 0 {
-                        return false;
+                // Deleting a whole word is one undo step, not one per
+                // character, so the run has to be broken either side of it.
+                if by_word {
+                    doc.break_undo_run();
+                }
+                // Widen every collapsed caret into the span it would delete,
+                // then delete the lot in one transaction.
+                self.each_cursor(doc, |view, doc| {
+                    if !view.selection.is_empty() || view.selection.head == 0 {
+                        return;
                     }
-                    let head = self.selection.head;
+                    let head = view.selection.head;
                     let start = if by_word {
                         // Ctrl+Backspace deletes the word, not the tab stop.
                         word::prev_boundary(doc.text(), head)
@@ -678,15 +978,10 @@ impl EditorView {
                         // Smart backspace: inside leading whitespace, delete
                         // back to the previous tab stop rather than one space
                         // at a time.
-                        head - self.backspace_width(doc, opts)
+                        head - view.backspace_width(doc, opts)
                     };
-                    // Deleting a whole word is one undo step, not one per
-                    // character, so the run has to be broken either side of it.
-                    if by_word {
-                        doc.break_undo_run();
-                    }
-                    self.selection = Selection::new(start, head);
-                }
+                    view.selection = Selection::new(start, head);
+                });
                 let changed = self.delete_selection(doc);
                 if by_word {
                     doc.break_undo_run();
@@ -694,21 +989,21 @@ impl EditorView {
                 changed
             }
             Key::Delete => {
-                if self.selection.is_empty() {
-                    let head = self.selection.head;
-                    if head >= doc.len_chars() {
-                        return false;
+                if by_word {
+                    doc.break_undo_run();
+                }
+                self.each_cursor(doc, |view, doc| {
+                    let head = view.selection.head;
+                    if !view.selection.is_empty() || head >= doc.len_chars() {
+                        return;
                     }
                     let end = if by_word {
                         word::next_boundary(doc.text(), head)
                     } else {
                         head + 1
                     };
-                    if by_word {
-                        doc.break_undo_run();
-                    }
-                    self.selection = Selection::new(head, end);
-                }
+                    view.selection = Selection::new(head, end);
+                });
                 let changed = self.delete_selection(doc);
                 if by_word {
                     doc.break_undo_run();
@@ -718,70 +1013,100 @@ impl EditorView {
             // Undo, redo and select-all are application commands, dispatched
             // through the registry so the menus and the keyboard agree. They
             // are deliberately not handled here.
+            // Every motion below runs once per caret. Making a motion
+            // multi-cursor aware therefore takes nothing: `each_cursor`
+            // installs each caret in turn and collects where it ended up.
             Key::ArrowLeft if by_word => {
-                let target = word::prev_boundary(doc.text(), self.selection.head);
-                self.set_head(target, extend);
+                self.each_cursor(doc, |v, doc| {
+                    let target = word::prev_boundary(doc.text(), v.selection.head);
+                    v.set_head(target, extend);
+                });
                 false
             }
             Key::ArrowRight if by_word => {
-                let target = word::next_boundary(doc.text(), self.selection.head);
-                self.set_head(target, extend);
+                self.each_cursor(doc, |v, doc| {
+                    let target = word::next_boundary(doc.text(), v.selection.head);
+                    v.set_head(target, extend);
+                });
                 false
             }
             Key::ArrowLeft => {
-                self.move_horizontal(doc, -1, extend);
+                self.each_cursor(doc, |v, doc| v.move_horizontal(doc, -1, extend));
                 false
             }
             Key::ArrowRight => {
-                self.move_horizontal(doc, 1, extend);
+                self.each_cursor(doc, |v, doc| v.move_horizontal(doc, 1, extend));
+                false
+            }
+            Key::ArrowUp if modifiers.command && modifiers.alt => {
+                self.add_cursor_vertically(doc, -1);
+                false
+            }
+            Key::ArrowDown if modifiers.command && modifiers.alt => {
+                self.add_cursor_vertically(doc, 1);
                 false
             }
             Key::ArrowUp => {
-                self.move_vertical(doc, -1, extend);
+                self.each_cursor(doc, |v, doc| v.move_vertical(doc, -1, extend));
                 false
             }
             Key::ArrowDown => {
-                self.move_vertical(doc, 1, extend);
+                self.each_cursor(doc, |v, doc| v.move_vertical(doc, 1, extend));
                 false
             }
             Key::PageUp => {
-                self.move_vertical(doc, -(rows_per_page as isize), extend);
+                let rows = rows_per_page as isize;
+                self.each_cursor(doc, |v, doc| v.move_vertical(doc, -rows, extend));
                 false
             }
             Key::PageDown => {
-                self.move_vertical(doc, rows_per_page as isize, extend);
+                let rows = rows_per_page as isize;
+                self.each_cursor(doc, |v, doc| v.move_vertical(doc, rows, extend));
+                false
+            }
+            Key::Escape => {
+                // How you get out of multi-cursor. Handled here rather than as
+                // an application command because with no extra carets it has to
+                // fall through to whatever else wants Escape.
+                self.collapse_cursors();
                 false
             }
             Key::Home if modifiers.command => {
+                self.collapse_cursors();
                 self.set_head(0, extend);
                 false
             }
             Key::End if modifiers.command => {
+                self.collapse_cursors();
                 self.set_head(doc.len_chars(), extend);
                 false
             }
             Key::Home => {
-                // Toggle between the first non-whitespace character and column
-                // zero — pressing Home twice on an indented line reaches the
-                // margin, which is what every editor does.
-                let line = doc.line_of(self.selection.head);
-                let start = doc.line_start(line);
-                let indent = doc
-                    .line_text(line)
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .count();
-                let target = if self.selection.head == start + indent {
-                    start
-                } else {
-                    start + indent
-                };
-                self.set_head(target, extend);
+                self.each_cursor(doc, |v, doc| {
+                    // Toggle between the first non-whitespace character and
+                    // column zero -- pressing Home twice on an indented line
+                    // reaches the margin, which is what every editor does.
+                    let line = doc.line_of(v.selection.head);
+                    let start = doc.line_start(line);
+                    let indent = doc
+                        .line_text(line)
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .count();
+                    let target = if v.selection.head == start + indent {
+                        start
+                    } else {
+                        start + indent
+                    };
+                    v.set_head(target, extend);
+                });
                 false
             }
             Key::End => {
-                let line = doc.line_of(self.selection.head);
-                self.set_head(doc.line_start(line) + doc.line_len(line), extend);
+                self.each_cursor(doc, |v, doc| {
+                    let line = doc.line_of(v.selection.head);
+                    v.set_head(doc.line_start(line) + doc.line_len(line), extend);
+                });
                 false
             }
             _ => false,
@@ -891,28 +1216,56 @@ impl EditorView {
         if !doc.is_editable() || text.is_empty() {
             return false;
         }
-        let before = self.selection;
-        let range = self.selection.range();
-        let inserted_len = text.chars().count();
-        let after = Selection::at(range.start + inserted_len);
-
-        doc.apply(&Transaction::replace(range, text), before, after);
-        self.selection = after;
-        self.goal_column = None;
-        self.scroll_to_caret = true;
-        true
+        let (cursors, primary) = self.cursors();
+        let edits = cursors
+            .iter()
+            .map(|sel| editor_core::edit::Edit::replace(sel.range(), text))
+            .collect();
+        self.apply_at_every_cursor(doc, Transaction::new(edits), cursors, primary)
     }
 
     fn delete_selection(&mut self, doc: &mut Document) -> bool {
-        if !doc.is_editable() || self.selection.is_empty() {
+        if !doc.is_editable() || self.cursors().0.iter().all(|s| s.is_empty()) {
             return false;
         }
-        let before = self.selection;
-        let range = self.selection.range();
-        let after = Selection::at(range.start);
+        let (cursors, primary) = self.cursors();
+        let edits = cursors
+            .iter()
+            .filter(|sel| !sel.is_empty())
+            .map(|sel| editor_core::edit::Edit::delete(sel.range()))
+            .collect();
+        self.apply_at_every_cursor(doc, Transaction::new(edits), cursors, primary)
+    }
 
-        doc.apply(&Transaction::delete(range), before, after);
-        self.selection = after;
+    /// Apply one transaction and put every caret where its own edit left it.
+    ///
+    /// The whole point of doing this in a single transaction is that it is a
+    /// single undo step: eight carets typing a word is one Ctrl+Z, not eight.
+    ///
+    /// Each caret lands at `remap` of the *end* of its old range. That one rule
+    /// covers both cases — a collapsed caret is carried along by its own
+    /// insertion, and a caret with a selection ends up after the replacement —
+    /// which is why the caret positions are not computed per case here.
+    fn apply_at_every_cursor(
+        &mut self,
+        doc: &mut Document,
+        tx: Transaction,
+        cursors: Vec<Selection>,
+        primary: usize,
+    ) -> bool {
+        if tx.is_empty() {
+            return false;
+        }
+        let after: Vec<Selection> = cursors
+            .iter()
+            .map(|sel| Selection::at(editor_core::edit::remap(&tx, sel.range().end)))
+            .collect();
+
+        // Undo restores the primary caret; the extra ones are not worth
+        // recording in the history, and an undo that resurrects carets the user
+        // has since dismissed is worse than one that does not.
+        doc.apply(&tx, cursors[primary], after[primary]);
+        self.install_cursors(after, primary);
         self.goal_column = None;
         self.scroll_to_caret = true;
         true
@@ -1366,7 +1719,15 @@ impl EditorView {
         let painter = ui.painter_at(ui.clip_rect());
         let visuals = ui.visuals().clone();
         let caret_line = doc.line_of(self.selection.head);
-        let sel_range = self.selection.range();
+        // Every caret's span, and every caret's head, worked out once rather
+        // than per painted row. Ordinarily this is a one-element vector.
+        let (all_cursors, _) = self.cursors();
+        let sel_ranges: Vec<std::ops::Range<usize>> = all_cursors
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.range())
+            .collect();
+        let caret_heads: Vec<usize> = all_cursors.iter().map(|s| s.head).collect();
 
         // Current-line stripe, under everything else.
         if self.selection.is_empty() {
@@ -1419,6 +1780,7 @@ impl EditorView {
         }
 
         let mut caret_rect = None;
+        let mut extra_carets: Vec<egui::Rect> = Vec::new();
 
         for line in first..last {
             let y = rect.top() + line as f32 * row_height;
@@ -1484,9 +1846,12 @@ impl EditorView {
                 }
             }
 
-            // Selection highlight for the part of this line that is selected.
-            if !self.selection.is_empty() {
-                let line_end = line_start + text.chars().count();
+            // Selection highlight for the part of this line each caret covers.
+            let line_end = line_start + text.chars().count();
+            for sel_range in &sel_ranges {
+                if sel_range.end < line_start || sel_range.start > line_end {
+                    continue;
+                }
                 let from = sel_range.start.clamp(line_start, line_end) - line_start;
                 let to = sel_range.end.clamp(line_start, line_end) - line_start;
                 if from < to || (sel_range.start <= line_end && sel_range.end > line_end) {
@@ -1600,17 +1965,31 @@ impl EditorView {
                 }
             }
 
-            if line == caret_line {
-                let column = self.selection.head - line_start;
-                let x = text_left + galley.pos_from_cursor(ccursor(column)).left();
-                caret_rect = Some(egui::Rect::from_min_size(
-                    egui::pos2(x, y),
-                    egui::vec2(1.5, row_height),
-                ));
+            let line_end = line_start + text.chars().count();
+            for head in &caret_heads {
+                if *head < line_start || *head > line_end {
+                    continue;
+                }
+                let x = text_left + galley.pos_from_cursor(ccursor(head - line_start)).left();
+                let here = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1.5, row_height));
+                if *head == self.selection.head && line == caret_line {
+                    // The primary's rectangle is the one the completion popup
+                    // anchors itself to, so it is the one worth remembering.
+                    caret_rect = Some(here);
+                } else {
+                    extra_carets.push(here);
+                }
             }
         }
 
         self.caret_screen_rect = caret_rect;
+        // Extra carets do not blink. A dozen of them flashing in unison is
+        // distracting, and a steady one is easier to count.
+        if response.has_focus() {
+            for caret in &extra_carets {
+                painter.rect_filled(*caret, 0.0, visuals.strong_text_color());
+            }
+        }
         if let Some(caret) = caret_rect
             && response.has_focus()
             && self.blink_on()
@@ -1866,6 +2245,21 @@ fn word_modifier(modifiers: egui::Modifiers) -> bool {
 /// A "word" is a run of alphanumerics and underscores — which covers both
 /// `snake_case` identifiers and ordinary prose. Clicking on whitespace or
 /// punctuation selects that run instead, rather than selecting nothing.
+/// Character offset of the first `needle` at or after character offset `from`.
+///
+/// Character offsets, not byte offsets: everything else in the editor counts
+/// characters, and `str::find` counts bytes, so the conversion has to happen
+/// somewhere. Doing it here keeps it out of the caller, where mixing the two
+/// would put a caret in the middle of a multi-byte character.
+fn find_from(text: &str, needle: &str, from: usize) -> Option<usize> {
+    let start_byte = text
+        .char_indices()
+        .nth(from)
+        .map_or(text.len(), |(byte, _)| byte);
+    let hit = text.get(start_byte..)?.find(needle)? + start_byte;
+    Some(text[..hit].chars().count())
+}
+
 fn word_at(doc: &Document, offset: usize) -> Selection {
     let line = doc.line_of(offset);
     let start_of_line = doc.line_start(line);
@@ -1906,6 +2300,251 @@ mod tests {
             Selection::at(text.chars().count()),
         );
         doc
+    }
+
+    // ---- multiple carets -------------------------------------------------
+
+    /// The core promise: one keystroke, one character at every caret, and one
+    /// undo step for the lot.
+    #[test]
+    fn typing_with_several_carets_inserts_at_each_of_them() {
+        let mut doc = doc_with("one\ntwo\nthree\n");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        assert!(view.add_cursor_vertically(&doc, 1));
+        assert!(view.add_cursor_vertically(&doc, 1));
+        assert_eq!(view.cursor_count(), 3);
+
+        assert!(view.insert(&mut doc, "# "));
+        assert_eq!(doc.text().to_string(), "# one\n# two\n# three\n");
+
+        assert!(view.undo(&mut doc));
+        assert_eq!(
+            doc.text().to_string(),
+            "one\ntwo\nthree\n",
+            "three carets typing is still one undo step"
+        );
+        assert_eq!(
+            view.cursor_count(),
+            1,
+            "undo restores one selection, so the extra carets have to go rather \
+             than be left pointing at text the undo has moved"
+        );
+    }
+
+    /// Every caret has to end up after its own insertion, not after somebody
+    /// else's. Getting this wrong is invisible for one caret and nonsense for
+    /// three.
+    #[test]
+    fn each_caret_ends_up_after_the_text_it_typed() {
+        let mut doc = doc_with("aa\nbb\ncc\n");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        view.add_cursor_vertically(&doc, 1);
+        view.add_cursor_vertically(&doc, 1);
+
+        view.insert(&mut doc, "X");
+        assert_eq!(doc.text().to_string(), "Xaa\nXbb\nXcc\n");
+
+        let (cursors, _) = view.cursors();
+        let heads: Vec<usize> = cursors.iter().map(|s| s.head).collect();
+        // "Xaa\n" is 4 characters, so the carets sit at 1, 5 and 9.
+        assert_eq!(heads, vec![1, 5, 9]);
+    }
+
+    #[test]
+    fn backspace_applies_to_every_caret() {
+        let mut doc = doc_with("_one\n_two\n");
+        let mut view = EditorView::default();
+        view.set_caret(1);
+        view.add_cursor_vertically(&doc, 1);
+        assert_eq!(view.cursor_count(), 2);
+
+        assert!(press(
+            &mut view,
+            &mut doc,
+            egui::Key::Backspace,
+            egui::Modifiers::NONE
+        ));
+        assert_eq!(doc.text().to_string(), "one\ntwo\n");
+    }
+
+    /// Carets do collide -- press End with carets on lines of different
+    /// lengths, or Backspace them into each other. Two carets in one place
+    /// would each apply the next edit, so one keystroke would insert twice.
+    #[test]
+    fn carets_that_land_on_the_same_spot_are_merged() {
+        let mut view = EditorView::default();
+        view.install_cursors(
+            vec![Selection::at(5), Selection::at(5), Selection::at(9)],
+            0,
+        );
+        assert_eq!(view.cursor_count(), 2, "the duplicate went");
+
+        let mut doc = doc_with("0123456789abc");
+        view.insert(&mut doc, "X");
+        assert_eq!(
+            doc.text().to_string(),
+            "01234X5678X9abc",
+            "one X per place, not two at the first"
+        );
+    }
+
+    #[test]
+    fn overlapping_selections_merge_into_one() {
+        let mut view = EditorView::default();
+        view.install_cursors(vec![Selection::new(2, 8), Selection::new(6, 12)], 0);
+        assert_eq!(view.cursor_count(), 1);
+        assert_eq!(view.selection.range(), 2..12);
+    }
+
+    #[test]
+    fn escape_puts_the_editor_back_to_one_caret() {
+        let mut doc = doc_with("one\ntwo\nthree\n");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        view.add_cursor_vertically(&doc, 1);
+        assert_eq!(view.cursor_count(), 2);
+
+        press(
+            &mut view,
+            &mut doc,
+            egui::Key::Escape,
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(view.cursor_count(), 1);
+    }
+
+    #[test]
+    fn arrow_keys_move_every_caret() {
+        let mut doc = doc_with("abcd\nefgh\n");
+        let mut view = EditorView::default();
+        view.set_caret(0);
+        view.add_cursor_vertically(&doc, 1);
+
+        press(
+            &mut view,
+            &mut doc,
+            egui::Key::ArrowRight,
+            egui::Modifiers::NONE,
+        );
+        press(
+            &mut view,
+            &mut doc,
+            egui::Key::ArrowRight,
+            egui::Modifiers::NONE,
+        );
+        let (cursors, _) = view.cursors();
+        assert_eq!(
+            cursors.iter().map(|s| s.head).collect::<Vec<_>>(),
+            vec![2, 7],
+            "both carets moved two characters"
+        );
+    }
+
+    /// With nothing selected, the first Ctrl+D selects the word so that the
+    /// second has something to look for.
+    #[test]
+    fn the_first_add_cursor_selects_the_word_under_the_caret() {
+        let doc = doc_with("total = total + 1");
+        let mut view = EditorView::default();
+        view.set_caret(2);
+
+        assert!(view.add_cursor_at_next_match(&doc));
+        assert_eq!(view.cursor_count(), 1);
+        assert_eq!(view.selection.range(), 0..5);
+
+        assert!(view.add_cursor_at_next_match(&doc));
+        assert_eq!(view.cursor_count(), 2, "the second `total` got a caret");
+        let (cursors, _) = view.cursors();
+        assert_eq!(cursors[1].range(), 8..13);
+    }
+
+    /// Having worked to the bottom of the file, the next one should come back
+    /// to the top rather than leaving the key looking broken.
+    #[test]
+    fn adding_cursors_wraps_round_the_end_of_the_file() {
+        let doc = doc_with("x\ny\nx\n");
+        let mut view = EditorView::default();
+        view.select_range(4, 5); // the second `x`
+        assert!(view.add_cursor_at_next_match(&doc));
+
+        let (cursors, _) = view.cursors();
+        assert_eq!(cursors.len(), 2);
+        assert_eq!(cursors[0].range(), 0..1, "wrapped to the first `x`");
+    }
+
+    #[test]
+    fn adding_a_cursor_stops_when_everything_is_already_selected() {
+        let doc = doc_with("x y x");
+        let mut view = EditorView::default();
+        view.select_range(0, 1);
+        assert!(view.add_cursor_at_next_match(&doc));
+        assert_eq!(view.cursor_count(), 2);
+        assert!(
+            !view.add_cursor_at_next_match(&doc),
+            "both are taken, so say so rather than silently doing nothing"
+        );
+    }
+
+    /// Multi-byte text: `find_from` works in bytes internally and must hand
+    /// back character offsets, or a caret lands inside a character.
+    #[test]
+    fn adding_cursors_counts_characters_not_bytes() {
+        let doc = doc_with("café x café");
+        let mut view = EditorView::default();
+        view.select_range(0, 4); // "café"
+        assert!(view.add_cursor_at_next_match(&doc));
+
+        let (cursors, _) = view.cursors();
+        assert_eq!(cursors[1].range(), 7..11, "characters, not bytes");
+        assert_eq!(doc.text().slice(cursors[1].range()).to_string(), "café");
+    }
+
+    /// A column selection is a rectangle. Lines too short to reach into it get
+    /// nothing -- inventing a caret on them means the next keystroke edits a
+    /// line the rectangle never covered.
+    #[test]
+    fn a_column_selection_skips_lines_too_short_to_reach_it() {
+        let doc = doc_with("aaaaaa\nbb\ncccccc\n");
+        let mut view = EditorView::default();
+        // Columns 3..5 down all three lines. The middle line has two
+        // characters, so it is not in the rectangle at all.
+        view.select_column(&doc, 3, doc.offset_at(2, 5));
+
+        let (cursors, _) = view.cursors();
+        assert_eq!(cursors.len(), 2, "the short line is skipped: {cursors:?}");
+        assert_eq!(doc.text().slice(cursors[0].range()).to_string(), "aa");
+        assert_eq!(doc.text().slice(cursors[1].range()).to_string(), "cc");
+    }
+
+    #[test]
+    fn a_zero_width_column_selection_is_a_column_of_carets() {
+        let doc = doc_with("one\ntwo\nsix\n");
+        let mut view = EditorView::default();
+        view.select_column(&doc, 0, doc.offset_at(2, 0));
+
+        assert_eq!(view.cursor_count(), 3);
+        assert!(
+            view.cursors().0.iter().all(|s| s.is_empty()),
+            "a rectangle with no width is three carets, not three selections"
+        );
+    }
+
+    /// Alt+click on a caret that is already there removes it, but never the
+    /// last one -- an editor with no caret cannot be typed into.
+    #[test]
+    fn alt_clicking_a_caret_removes_it_but_never_the_last_one() {
+        let mut view = EditorView::default();
+        view.set_caret(4);
+        view.toggle_cursor_at(9);
+        assert_eq!(view.cursor_count(), 2);
+
+        view.toggle_cursor_at(9);
+        assert_eq!(view.cursor_count(), 1);
+
+        view.toggle_cursor_at(4);
+        assert_eq!(view.cursor_count(), 1, "the last caret stays");
     }
 
     /// Press a key with modifiers, as `handle_keys` would.

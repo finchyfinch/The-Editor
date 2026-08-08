@@ -53,6 +53,7 @@ pub(crate) enum CommandId {
     GoToDefinition,
     FindUses,
     RenameSymbol,
+    AddCursorAtNextMatch,
     NextUse,
     PreviousUse,
     // Run
@@ -130,6 +131,7 @@ impl CommandId {
         Self::GoToDefinition,
         Self::FindUses,
         Self::RenameSymbol,
+        Self::AddCursorAtNextMatch,
         Self::NextUse,
         Self::PreviousUse,
         Self::Run,
@@ -373,6 +375,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Edit",
         "Rename Symbol",
         Some(plain(Key::F2)),
+    ),
+    cmd(
+        CommandId::AddCursorAtNextMatch,
+        "Edit",
+        "Add Cursor at Next Match",
+        ctrl(Key::D),
     ),
     cmd(CommandId::NextUse, "Edit", "Next Use", Some(plain(Key::F8))),
     cmd(

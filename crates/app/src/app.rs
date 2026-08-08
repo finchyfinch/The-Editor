@@ -3449,6 +3449,14 @@ impl EditorApp {
                 self.ask_about_symbol(editor_lsp::session::Query::References);
             }
             CommandId::RenameSymbol => self.begin_rename(),
+            CommandId::AddCursorAtNextMatch => {
+                let added = self
+                    .active_mut()
+                    .is_some_and(|entry| entry.view.add_cursor_at_next_match(&entry.doc));
+                if !added {
+                    self.info("No more occurrences");
+                }
+            }
             CommandId::NextUse => self.step_use(1),
             CommandId::PreviousUse => self.step_use(-1),
             CommandId::CommandPalette => self.palette.open(),
@@ -5047,6 +5055,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::GoToDefinition),
             MenuEntry::Item(CommandId::FindUses),
             MenuEntry::Item(CommandId::RenameSymbol),
+            MenuEntry::Item(CommandId::AddCursorAtNextMatch),
             MenuEntry::Item(CommandId::NextUse),
             MenuEntry::Item(CommandId::PreviousUse),
         ],

@@ -199,12 +199,109 @@ pub fn apply(rope: &mut Rope, tx: &Transaction) -> Applied {
     }
 }
 
+/// Where `offset` ends up once `tx` has been applied.
+///
+/// Multi-cursor needs this: after one transaction has inserted a character at
+/// each of eight carets, all eight carets are in the wrong place, and each is
+/// wrong by a different amount. Every edit before a caret moves it by that
+/// edit's net length change.
+///
+/// A caret *inside* an edited range lands at the end of the replacement. There
+/// is no better answer — the text it pointed into is gone — and the end is
+/// where typing over a selection leaves the caret, which is what makes it feel
+/// right.
+///
+/// `tx` is interpreted in pre-edit coordinates, exactly as [`apply`] does.
+#[must_use]
+pub fn remap(tx: &Transaction, offset: usize) -> usize {
+    let mut ordered: Vec<&Edit> = tx.edits.iter().collect();
+    ordered.sort_by_key(|e| e.range.start);
+
+    let mut shift: isize = 0;
+    for edit in ordered {
+        let inserted = edit.text.chars().count();
+        let removed = edit.range.len();
+        if edit.range.end <= offset {
+            shift += inserted as isize - removed as isize;
+        } else if edit.range.start < offset {
+            // Inside this edit: the character it referred to no longer exists.
+            return edit.range.start.saturating_add_signed(shift) + inserted;
+        } else {
+            break; // Sorted, so nothing later can affect this offset.
+        }
+    }
+    offset.saturating_add_signed(shift)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rope(s: &str) -> Rope {
         Rope::from_str(s)
+    }
+
+    /// The property that matters, stated as a property: remapping an offset
+    /// must agree with actually applying the transaction and looking.
+    #[test]
+    fn remapping_agrees_with_applying_the_edits() {
+        // Eight carets each typing a character, as Ctrl+D then a keystroke does.
+        let text = "one two one two one";
+        let tx = Transaction::new(
+            [0usize, 4, 8, 12, 16]
+                .iter()
+                .map(|at| Edit::insert(*at, "X"))
+                .collect(),
+        );
+        let mut r = rope(text);
+        apply(&mut r, &tx);
+        assert_eq!(r.to_string(), "Xone Xtwo Xone Xtwo Xone");
+
+        // Each caret ends up just after the character it typed, having also
+        // been pushed right by every caret before it.
+        for (i, at) in [0usize, 4, 8, 12, 16].iter().enumerate() {
+            assert_eq!(
+                remap(&tx, *at),
+                at + i + 1,
+                "the caret at {at} is after its own X and {i} earlier ones"
+            );
+        }
+    }
+
+    #[test]
+    fn an_offset_before_every_edit_does_not_move() {
+        let tx = Transaction::new(vec![Edit::insert(10, "abc"), Edit::insert(20, "de")]);
+        assert_eq!(remap(&tx, 0), 0);
+        // An insertion exactly *at* the offset carries it along, which is what
+        // puts the caret after what it just typed rather than before it.
+        assert_eq!(remap(&tx, 10), 13);
+    }
+
+    #[test]
+    fn deletions_pull_later_offsets_back() {
+        let tx = Transaction::new(vec![Edit::delete(2..5), Edit::delete(10..12)]);
+        assert_eq!(remap(&tx, 1), 1, "before everything");
+        assert_eq!(remap(&tx, 5), 2, "after the first deletion");
+        assert_eq!(remap(&tx, 12), 12 - 3 - 2);
+    }
+
+    /// A caret pointing into text that has just been replaced has nowhere
+    /// exact to go. It must land somewhere sensible rather than out of range.
+    #[test]
+    fn an_offset_inside_a_replaced_range_lands_at_the_end_of_the_replacement() {
+        let tx = Transaction::single(Edit::replace(4..9, "XY"));
+        assert_eq!(remap(&tx, 6), 4 + 2);
+        assert_eq!(remap(&tx, 4), 4, "the very start is not inside");
+        assert_eq!(remap(&tx, 9), 9 - 5 + 2, "the very end is after");
+    }
+
+    /// Undo and redo apply transactions too, and a caret must not end up past
+    /// the end of the buffer.
+    #[test]
+    fn remapping_never_runs_past_what_the_edits_can_justify() {
+        let tx = Transaction::single(Edit::delete(0..100));
+        assert_eq!(remap(&tx, 3), 0, "everything before it is gone");
+        assert_eq!(remap(&tx, 500), 400);
     }
 
     #[test]

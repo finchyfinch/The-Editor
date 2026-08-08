@@ -146,24 +146,22 @@ fn merge(
     undo: &Transaction,
     after: Selection,
 ) -> bool {
+    // A run of typing, at one caret or at twenty: each insert has to land
+    // exactly where the matching one from the previous revision ended.
+    //
+    // The multi-caret case is not the single case repeated. Caret `i` was
+    // displaced by every insertion before it as well as by its own, so what has
+    // to match is the *cumulative* length, and the undo transaction — which is
+    // applied to the document as it exists after the redo — has to be written
+    // in those shifted coordinates. Recording it in pre-edit coordinates makes
+    // one-caret undo look right while corrupting every other case.
+    if merge_typing(previous, redo, after) {
+        return true;
+    }
+
     let (Some(prev_redo), Some(new_redo)) = (previous.redo.as_single(), redo.as_single()) else {
         return false;
     };
-
-    // A run of typing: each insert lands exactly where the last one ended.
-    if prev_redo.is_simple_insert() && new_redo.is_simple_insert() {
-        let prev_end = prev_redo.range.start + prev_redo.text.chars().count();
-        if new_redo.range.start != prev_end {
-            return false;
-        }
-        let combined = format!("{}{}", prev_redo.text, new_redo.text);
-        let start = prev_redo.range.start;
-        let len = combined.chars().count();
-        previous.redo = Transaction::single(Edit::insert(start, combined));
-        previous.undo = Transaction::single(Edit::delete(start..start + len));
-        previous.after = after;
-        return true;
-    }
 
     // A run of backspaces: each deletion ends where the last one began.
     if prev_redo.is_simple_delete()
@@ -186,10 +184,152 @@ fn merge(
     false
 }
 
+/// Fold a keystroke into the previous one, however many carets are typing.
+///
+/// Returns false and changes nothing unless every edit on both sides is a
+/// plain insertion and they line up caret for caret — so a paste, a newline, or
+/// a change in the number of carets all start a fresh undo entry, which is
+/// what you would want them to do anyway.
+fn merge_typing(previous: &mut Revision, redo: &Transaction, after: Selection) -> bool {
+    if previous.redo.edits.len() != redo.edits.len() || redo.edits.is_empty() {
+        return false;
+    }
+    if !previous.redo.edits.iter().all(Edit::is_simple_insert)
+        || !redo.edits.iter().all(Edit::is_simple_insert)
+    {
+        return false;
+    }
+
+    let mut before: Vec<&Edit> = previous.redo.edits.iter().collect();
+    let mut now: Vec<&Edit> = redo.edits.iter().collect();
+    before.sort_by_key(|e| e.range.start);
+    now.sort_by_key(|e| e.range.start);
+
+    // Each new insert must sit where its caret was left, which is its own
+    // position plus every character inserted at or before it last time.
+    let mut cumulative = 0usize;
+    for (was, is) in before.iter().zip(&now) {
+        cumulative += was.text.chars().count();
+        if is.range.start != was.range.start + cumulative {
+            return false;
+        }
+    }
+
+    let mut merged_redo = Vec::with_capacity(before.len());
+    let mut merged_undo = Vec::with_capacity(before.len());
+    let mut shift = 0usize;
+    for (was, is) in before.iter().zip(&now) {
+        let text = format!("{}{}", was.text, is.text);
+        let len = text.chars().count();
+        let at = was.range.start;
+        merged_redo.push(Edit::insert(at, text));
+        // Post-redo coordinates: this insertion sits after everything inserted
+        // before it.
+        merged_undo.push(Edit::delete(at + shift..at + shift + len));
+        shift += len;
+    }
+
+    previous.redo = Transaction::new(merged_redo);
+    previous.undo = Transaction::new(merged_undo);
+    previous.after = after;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::edit::{self, Transaction};
+
+    /// The decisive check for multi-caret coalescing: type a word at several
+    /// carets, undo once, and the document must be exactly what it started as.
+    ///
+    /// Written against the rope rather than against the transactions, because
+    /// the bug this guards is arithmetic in the *undo* coordinates and only
+    /// applying it can show that up.
+    #[test]
+    fn typing_a_word_at_several_carets_undoes_in_one_step() {
+        let original = "aaa\nbbb\nccc\n";
+        let mut rope = ropey::Rope::from_str(original);
+        let mut history = History::default();
+
+        // Carets at the start of each line, typing "xy" one character at a time.
+        let mut carets = vec![0usize, 4, 8];
+        for ch in ["x", "y"] {
+            let tx = Transaction::new(
+                carets
+                    .iter()
+                    .map(|at| Edit::insert(*at, ch.to_owned()))
+                    .collect(),
+            );
+            let applied = edit::apply(&mut rope, &tx);
+            let primary = *carets.first().expect("there are carets");
+            history.push(
+                tx.clone(),
+                applied.inverse,
+                Selection::at(primary),
+                Selection::at(primary + 1),
+            );
+            // Where each caret ends up, which is where the next keystroke goes.
+            carets = carets.iter().map(|at| edit::remap(&tx, *at)).collect();
+        }
+        assert_eq!(rope.to_string(), "xyaaa\nxybbb\nxyccc\n");
+        assert_eq!(history.depth(), 1, "two keystrokes, one undo entry");
+
+        let step = history.undo().expect("something to undo");
+        edit::apply(&mut rope, &step.transaction);
+        assert_eq!(
+            rope.to_string(),
+            original,
+            "one undo must restore the document exactly"
+        );
+
+        let step = history.redo().expect("something to redo");
+        edit::apply(&mut rope, &step.transaction);
+        assert_eq!(
+            rope.to_string(),
+            "xyaaa\nxybbb\nxyccc\n",
+            "and redo puts it back"
+        );
+    }
+
+    /// Carets appearing or disappearing between keystrokes must start a new
+    /// entry rather than being folded into a mismatched one.
+    #[test]
+    fn a_change_in_the_number_of_carets_breaks_the_run() {
+        let mut rope = ropey::Rope::from_str("aaa\nbbb\n");
+        let mut history = History::default();
+
+        let one = Transaction::new(vec![Edit::insert(0, "x"), Edit::insert(4, "x")]);
+        let applied = edit::apply(&mut rope, &one);
+        history.push(one, applied.inverse, Selection::at(0), Selection::at(1));
+
+        // Now only one caret.
+        let two = Transaction::single(Edit::insert(1, "y"));
+        let applied = edit::apply(&mut rope, &two);
+        history.push(two, applied.inverse, Selection::at(1), Selection::at(2));
+
+        assert_eq!(history.depth(), 2, "different caret counts do not merge");
+    }
+
+    /// Two carets typing where the second is not where the previous keystroke
+    /// left it -- a click in between, say -- must not be folded together.
+    #[test]
+    fn inserts_that_do_not_continue_the_run_start_a_new_entry() {
+        let mut rope = ropey::Rope::from_str("aaaaaaaaaa\n");
+        let mut history = History::default();
+
+        let one = Transaction::new(vec![Edit::insert(0, "x"), Edit::insert(5, "x")]);
+        let applied = edit::apply(&mut rope, &one);
+        history.push(one, applied.inverse, Selection::at(0), Selection::at(1));
+
+        // The run would continue at 1 and 7; this is somewhere else entirely.
+        let two = Transaction::new(vec![Edit::insert(1, "y"), Edit::insert(9, "y")]);
+        let applied = edit::apply(&mut rope, &two);
+        history.push(two, applied.inverse, Selection::at(1), Selection::at(2));
+
+        assert_eq!(history.depth(), 2);
+    }
+
     use ropey::Rope;
 
     /// Drive a rope through the history the way the editor does, so the tests
