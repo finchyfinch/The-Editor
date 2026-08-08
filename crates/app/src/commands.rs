@@ -43,6 +43,7 @@ pub(crate) enum CommandId {
     Replace,
     FindNext,
     FindPrevious,
+    FindInProject,
     DuplicateLine,
     DeleteLine,
     MoveLineUp,
@@ -117,6 +118,7 @@ impl CommandId {
         Self::Replace,
         Self::FindNext,
         Self::FindPrevious,
+        Self::FindInProject,
         Self::DuplicateLine,
         Self::DeleteLine,
         Self::MoveLineUp,
@@ -301,6 +303,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Edit",
         "Find Next",
         Some(plain(Key::F3)),
+    ),
+    cmd(
+        CommandId::FindInProject,
+        "Edit",
+        "Find in Project",
+        ctrl_shift(Key::F),
     ),
     cmd(
         CommandId::FindPrevious,

@@ -15,6 +15,7 @@ mod logging;
 mod new_file;
 mod palette;
 mod panic_hook;
+mod project_search;
 mod runner;
 mod settings_window;
 mod venv_dialog;

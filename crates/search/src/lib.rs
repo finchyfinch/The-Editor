@@ -6,6 +6,7 @@
 //! operation. See PLAN.md §3.7.
 
 pub mod files;
+pub mod project;
 pub mod query;
 
 // Still to come.

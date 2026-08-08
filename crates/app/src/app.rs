@@ -31,6 +31,7 @@ use crate::debugger::{self, Breakpoints, DebugView};
 use crate::file_picker::FilePicker;
 use crate::new_file;
 use crate::palette::Palette;
+use crate::project_search::ProjectSearch;
 use crate::runner::Runner;
 use crate::settings_window;
 use crate::venv_dialog;
@@ -245,6 +246,8 @@ pub(crate) struct EditorApp {
     debug: Option<editor_debug::Session>,
     /// Stack and variables for the paused session.
     debug_view: DebugView,
+    /// The project-wide search panel.
+    search: ProjectSearch,
     /// Results of the last Find Uses, and where in them the user is.
     uses: UseResults,
     /// Go to File (Ctrl+P).
@@ -270,6 +273,7 @@ enum DockTab {
     Output,
     Problems,
     Debug,
+    Search,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -330,6 +334,7 @@ impl EditorApp {
             debugpy_warned: false,
             debug: None,
             debug_view: DebugView::default(),
+            search: ProjectSearch::default(),
             uses: UseResults::default(),
             file_picker: FilePicker::default(),
             completion: completion::Popup::default(),
@@ -1120,6 +1125,19 @@ impl EditorApp {
                 caret >= start && caret <= end.max(start)
             })
             .map(|d| (path.to_path_buf(), d.line, d.column))
+    }
+
+    /// Start a project-wide search over the open folder.
+    fn start_project_search(&mut self, query: &editor_search::query::Query) {
+        let Some(root) = self.tree.root().map(Path::to_path_buf) else {
+            self.info("Open a folder first \u{2014} project search needs one");
+            return;
+        };
+        // The same walk go-to-file uses, with the same skip list: searching
+        // `target` or `node_modules` finds thousands of matches nobody wants.
+        let listing = editor_search::files::list(&root);
+        let search = editor_search::project::Search::start(&root, listing.files, query);
+        self.search.started(search);
     }
 
     /// Move a tab, keeping the selection and the recent list pointing at the
@@ -2814,6 +2832,11 @@ impl EditorApp {
             CommandId::MoveLineUp => self.on_view(|view, doc| view.move_lines(doc, -1)),
             CommandId::MoveLineDown => self.on_view(|view, doc| view.move_lines(doc, 1)),
             CommandId::GoToFile => self.open_file_picker(),
+            CommandId::FindInProject => {
+                self.dock = DockTab::Search;
+                self.show_output = true;
+                self.search.focus();
+            }
             CommandId::NextTab => self.cycle_tab(false),
             CommandId::PreviousTab => self.cycle_tab(true),
             CommandId::ToggleBreakpoint => self.toggle_breakpoint_at_caret(),
@@ -3671,6 +3694,7 @@ impl eframe::App for EditorApp {
         if self.show_output {
             let mut console_action = None;
             let mut debug_action = debugger::Action::None;
+            let mut search_action = crate::project_search::Action::None;
             let mut problem_clicked = None;
 
             // The height is owned here rather than left to the panel.
@@ -3729,6 +3753,12 @@ impl eframe::App for EditorApp {
                         {
                             self.dock = DockTab::Debug;
                         }
+                        if ui
+                            .selectable_label(self.dock == DockTab::Search, "SEARCH")
+                            .clicked()
+                        {
+                            self.dock = DockTab::Search;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
                                 self.show_output = false;
@@ -3740,6 +3770,7 @@ impl eframe::App for EditorApp {
                     match self.dock {
                         DockTab::Output => console_action = Some(self.runner.draw(ui)),
                         DockTab::Problems => problem_clicked = self.problems_ui(ui),
+                        DockTab::Search => search_action = self.search.ui(ui),
                         DockTab::Debug => {
                             let running = self.debug.is_some();
                             let paused = self
@@ -3750,6 +3781,16 @@ impl eframe::App for EditorApp {
                         }
                     }
                 });
+
+            match search_action {
+                crate::project_search::Action::None => {}
+                crate::project_search::Action::Start(query) => self.start_project_search(&query),
+                crate::project_search::Action::Open { path, line, column } => {
+                    if let Some(root) = self.tree.root().map(Path::to_path_buf) {
+                        self.open_at(&root.join(path), line.saturating_sub(1), column);
+                    }
+                }
+            }
 
             if let debugger::Action::SelectFrame { id, path, line } = debug_action {
                 self.debug_view.selected = Some(id);
@@ -3807,6 +3848,7 @@ impl eframe::App for EditorApp {
         }
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
+        self.search.poll();
         self.settle_mru(&ctx);
         self.toasts_ui(&ctx);
 
@@ -4282,6 +4324,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::Find),
             MenuEntry::Item(CommandId::Replace),
+            MenuEntry::Item(CommandId::FindInProject),
             MenuEntry::Item(CommandId::FindNext),
             MenuEntry::Item(CommandId::FindPrevious),
             MenuEntry::Separator,

@@ -33,6 +33,16 @@ impl Query {
         }
     }
 
+    /// A regular-expression search, for tests and simple callers.
+    #[must_use]
+    pub fn regex(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_owned(),
+            regex: true,
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pattern.is_empty()
@@ -109,6 +119,23 @@ impl Matcher {
             .filter(|m| m.start() != m.end())
             .map(|m| byte_to_char(text, m.start())..byte_to_char(text, m.end()))
             .collect()
+    }
+
+    /// The character offset of the first match in one line, if any.
+    ///
+    /// Takes a `&str` rather than a rope because the project search reads whole
+    /// files off disk and never builds a rope for them: doing so for every file
+    /// in a tree, to throw each away after one pass, is the expensive way to
+    /// get the same answer.
+    #[must_use]
+    pub fn first_in_line(&self, line: &str) -> Option<usize> {
+        let found = self.regex.find(line)?;
+        if found.start() == found.end() {
+            return None;
+        }
+        // Characters, not bytes: the caret is placed in character offsets, and
+        // a line with an accent in it would otherwise be off by one per accent.
+        Some(line[..found.start()].chars().count())
     }
 
     /// The number of matches, without building the list.
