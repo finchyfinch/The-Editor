@@ -16,7 +16,7 @@ use editor_config::paths::AppPaths;
 use editor_config::session::{OpenFile, Session, WindowGeometry};
 use editor_config::settings::Settings;
 use editor_config::theme::{ResolvedTheme, ThemePreference};
-use editor_core::document::Document;
+use editor_core::document::{DiskState, Document};
 use editor_syntax::LanguageId;
 use editor_syntax::highlight::Highlighter;
 use editor_syntax::theme::SyntaxTheme;
@@ -160,6 +160,13 @@ struct OpenDoc {
     /// When the next syntax check is due, so squiggles do not flicker under
     /// the caret while a line is half-typed.
     syntax_due: Option<Instant>,
+    /// What has happened to the file behind this document's back, and so
+    /// whether the reload bar is showing.
+    ///
+    /// Held per document rather than recomputed each frame: the answer needs
+    /// a `stat`, and it has to persist across frames anyway because the bar
+    /// stays up until the user decides what to do about it.
+    disk: DiskState,
 }
 
 pub(crate) struct EditorApp {
@@ -208,6 +215,11 @@ pub(crate) struct EditorApp {
     /// Watches the open folder. `None` when no folder is open, or when the
     /// platform refused to watch it.
     watcher: Option<Watcher>,
+    /// Whether the window had focus last frame, so returning to it can be
+    /// told from merely still having it.
+    was_focused: bool,
+    /// Paths named on the command line, opened once the window exists.
+    from_command_line: Vec<PathBuf>,
     /// The session to restore on the first frame, once the window exists and
     /// its geometry can be checked against the monitors actually attached.
     restore: Option<Session>,
@@ -292,7 +304,12 @@ impl std::fmt::Debug for EditorApp {
 }
 
 impl EditorApp {
-    pub(crate) fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, log_dir: String) -> Self {
+    pub(crate) fn new(
+        cc: &eframe::CreationContext<'_>,
+        paths: AppPaths,
+        log_dir: String,
+        open: Vec<PathBuf>,
+    ) -> Self {
         let (settings, settings_error) = Settings::load(&paths.settings_file());
         let session = Session::load(&paths.session_file());
 
@@ -325,7 +342,14 @@ impl EditorApp {
             dock_height: DEFAULT_DOCK_HEIGHT,
             venv_dialog: venv_dialog::Dialog::default(),
             pending_venv: None,
-            watcher: None,
+            // Created up front rather than when a folder opens: a single file
+            // opened from the command line needs watching too, and there may
+            // never be a folder.
+            watcher: Watcher::new(Some(cc.egui_ctx.clone()))
+                .inspect_err(|e| tracing::warn!("no filesystem watcher: {e}"))
+                .ok(),
+            was_focused: true,
+            from_command_line: open,
             restore: settings.restore_session().then(|| session.clone()),
             session_saved: false,
             recent: Vec::new(),
@@ -489,6 +513,7 @@ impl EditorApp {
             preview,
             syntax_version: None,
             syntax_due: None,
+            disk: DiskState::Unchanged,
             line_count_seen: None,
         };
 
@@ -500,6 +525,7 @@ impl EditorApp {
             self.docs.push(entry);
             self.active = Some(self.docs.len() - 1);
         }
+        self.sync_watched_files();
         self.focus_active();
     }
 
@@ -525,6 +551,7 @@ impl EditorApp {
             Some(active) => Some(active.min(self.docs.len() - 1)),
             None => None,
         };
+        self.sync_watched_files();
     }
 
     /// Indices of every document with unsaved changes.
@@ -717,6 +744,9 @@ impl EditorApp {
                 let name = self.docs[index].doc.display_name();
                 self.docs[index].preview = false;
                 self.tree.refresh();
+                // Save As gives the document a new path, and possibly one in a
+                // directory nothing is watching yet.
+                self.sync_watched_files();
                 self.info(format!("Saved {name}"));
             }
             Err(e) => self.error(format!("Save failed: {e:#}")),
@@ -877,22 +907,42 @@ impl EditorApp {
 
         // Reopening the same folder — which session restore can do right after
         // startup — should not tear down a working watch and build another.
-        if self.watcher.as_ref().is_some_and(|w| w.root() == folder) {
+        if self
+            .watcher
+            .as_ref()
+            .is_some_and(|w| w.root() == Some(folder.as_path()))
+        {
             self.tree.set_root(folder);
             return;
         }
 
-        match Watcher::new(&folder) {
-            Ok(watcher) => self.watcher = Some(watcher),
-            Err(e) => {
-                // Not fatal: the tree still works, it just will not notice
-                // changes made elsewhere.
-                tracing::warn!("could not watch {}: {e}", folder.display());
-                self.watcher = None;
-                self.info("Changes made outside The Editor will not be noticed automatically");
-            }
+        if let Some(watcher) = self.watcher.as_mut()
+            && let Err(e) = watcher.set_root(&folder)
+        {
+            // Not fatal: the tree still works, it just will not notice
+            // changes made elsewhere.
+            tracing::warn!("could not watch {}: {e}", folder.display());
+            self.info("Changes made outside The Editor will not be noticed automatically");
         }
         self.tree.set_root(folder);
+        self.sync_watched_files();
+    }
+
+    /// Keep the watcher's list of loose files in step with the open tabs.
+    ///
+    /// Cheap when nothing changed — the watcher compares against what it
+    /// already has — so this can be called from anywhere a tab opens or closes
+    /// rather than being carefully threaded through each one.
+    fn sync_watched_files(&mut self) {
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        let files: Vec<PathBuf> = self
+            .docs
+            .iter()
+            .filter_map(|d| d.doc.path().map(Path::to_path_buf))
+            .collect();
+        watcher.set_files(&files);
     }
 
     /// The Problems panel: every diagnostic, grouped by file.
@@ -2441,21 +2491,152 @@ impl EditorApp {
             self.tree.refresh();
         }
 
-        // An open document whose file changed underneath it: reload silently
-        // when there is nothing to lose, warn when there is. Saving over a
-        // file that `git checkout` has rewritten is how people lose work.
         for path in &changes.touched {
-            let Some(index) = self.docs.iter().position(|d| d.doc.path() == Some(path)) else {
-                continue;
-            };
-            if self.docs[index].doc.is_dirty() {
-                let name = self.docs[index].doc.display_name();
-                self.error(format!(
-                    "{name} changed on disk and has unsaved edits \u{2014} saving will overwrite it"
-                ));
+            if let Some(index) = self.docs.iter().position(|d| d.doc.path() == Some(path)) {
+                self.reconcile_with_disk(index);
+            }
+        }
+    }
+
+    /// Open whatever the command line named, once, after the session restore.
+    ///
+    /// After, not instead: restoring the previous session and then opening the
+    /// file you asked for leaves you where you were with the new file in front,
+    /// which is what every editor does and what you want when the invocation
+    /// came from a `git commit` hook or an "open in editor" button.
+    ///
+    /// A folder argument becomes the project. Several folders and the first
+    /// wins, because there is one explorer pane.
+    fn open_from_command_line(&mut self) {
+        if self.from_command_line.is_empty() {
+            return;
+        }
+        let mut folder_taken = false;
+        for path in std::mem::take(&mut self.from_command_line) {
+            // Relative paths are relative to the shell's directory, and stay
+            // usable only until something else changes ours.
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if path.is_dir() {
+                if !folder_taken {
+                    folder_taken = true;
+                    self.open_folder(path);
+                }
                 continue;
             }
+            self.open_path(&path, false);
+        }
+    }
+
+    /// Re-check every open file when the window regains focus.
+    ///
+    /// The watcher only covers the open project folder, so a file opened from
+    /// anywhere else — and every file when no folder is open at all — would
+    /// otherwise never be checked. Coming back to the window is also exactly
+    /// when you have been off editing the thing somewhere else, which is the
+    /// case this is for.
+    ///
+    /// One `stat` per open document, on a transition rather than every frame.
+    fn check_disk_on_focus(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.focused);
+        let regained = focused && !self.was_focused;
+        self.was_focused = focused;
+        if !regained {
+            return;
+        }
+        for index in 0..self.docs.len() {
+            self.reconcile_with_disk(index);
+        }
+    }
+
+    /// Work out what happened to one document's file, and react.
+    ///
+    /// A clean buffer is reloaded without asking: there is nothing to lose, and
+    /// prompting for it is the kind of dialogue people learn to dismiss without
+    /// reading. A dirty one raises the bar in `disk_bar` instead, because
+    /// saving over a file that `git checkout` has rewritten is how work gets
+    /// lost, and that decision is not the editor's to make.
+    fn reconcile_with_disk(&mut self, index: usize) {
+        let Some(entry) = self.docs.get(index) else {
+            return;
+        };
+        match disk_response(entry.doc.disk_state(), entry.doc.is_dirty()) {
+            // Our own save, or a change already reckoned with. Leave any bar
+            // that is up alone; only a fresh change should raise one.
+            DiskResponse::Ignore => {}
+            DiskResponse::Reload => self.reload_document(index),
+            DiskResponse::Ask(state) => self.docs[index].disk = state,
+        }
+    }
+
+    /// The bar above the editor when the file has changed underneath it.
+    ///
+    /// Non-modal on purpose. A modal here interrupts whatever you were typing
+    /// to ask about something you may not care about yet, and the honest answer
+    /// is often "let me look at what I have first".
+    fn disk_bar(&mut self, ui: &mut egui::Ui, index: usize) {
+        let Some(entry) = self.docs.get(index) else {
+            return;
+        };
+        let state = entry.disk;
+        if state == DiskState::Unchanged {
+            return;
+        }
+        let name = entry.doc.display_name();
+
+        let mut reload = false;
+        let mut keep = false;
+        let mut save_back = false;
+
+        egui::Frame::default()
+            .fill(ui.visuals().warn_fg_color.gamma_multiply(0.15))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| match state {
+                    DiskState::Modified => {
+                        ui.label(format!(
+                            "{name} changed on disk, and this tab has unsaved edits."
+                        ));
+                        reload = ui
+                            .button("Reload")
+                            .on_hover_text("Throw away the edits in this tab and re-read the file")
+                            .clicked();
+                        keep = ui
+                            .button("Keep mine")
+                            .on_hover_text(
+                                "Keep what is in this tab; saving will overwrite the file",
+                            )
+                            .clicked();
+                    }
+                    DiskState::Deleted => {
+                        ui.label(format!(
+                            "{name} was deleted on disk. This tab is the only copy."
+                        ));
+                        save_back = ui.button("Save it back").clicked();
+                        keep = ui.button("Dismiss").clicked();
+                    }
+                    DiskState::Unchanged => {}
+                });
+            });
+        ui.separator();
+
+        if reload {
             self.reload_document(index);
+        } else if keep {
+            // Adopt what is on disk as the baseline so the same change is not
+            // reported again on the next filesystem event.
+            if let Some(entry) = self.docs.get_mut(index) {
+                entry.doc.accept_disk_state();
+                entry.disk = DiskState::Unchanged;
+            }
+        } else if save_back {
+            match self.docs[index].doc.save() {
+                Ok(()) => {
+                    self.docs[index].disk = DiskState::Unchanged;
+                    self.tree.refresh();
+                    self.info(format!("Wrote {name} back to disk"));
+                }
+                Err(e) => self.error(format!("Could not write it back: {e:#}")),
+            }
         }
     }
 
@@ -2475,6 +2656,9 @@ impl EditorApp {
                 entry.highlighter = new_highlighter(entry.language, &doc);
                 entry.doc = doc;
                 entry.view.set_caret(caret.min(entry.doc.len_chars()));
+                // The freshly opened document carries the file's current mtime,
+                // so the question the bar was asking has now been answered.
+                entry.disk = DiskState::Unchanged;
                 tracing::info!(path = %path.display(), "reloaded after an external change");
             }
             Err(e) => self.error(format!("Could not reload {}: {e:#}", path.display())),
@@ -2824,6 +3008,7 @@ impl EditorApp {
                     preview: false,
                     syntax_version: None,
                     syntax_due: None,
+                    disk: DiskState::Unchanged,
                     line_count_seen: None,
                 });
                 self.active = Some(self.docs.len() - 1);
@@ -2866,7 +3051,11 @@ impl EditorApp {
             }
             CommandId::CloseFolder => {
                 self.tree = FileTree::default();
-                self.watcher = None;
+                // The watcher survives: the tabs left open still need watching,
+                // and closing the folder is not a reason to stop noticing that
+                // their files changed.
+                self.watcher = Watcher::new(Some(ctx.clone())).ok();
+                self.sync_watched_files();
             }
             CommandId::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
 
@@ -3407,6 +3596,14 @@ impl EditorApp {
             }
             ui.separator();
 
+            // Directly under the tabs, above everything else in the pane:
+            // whatever happened to the file on disk outranks a search bar.
+            // This also has to come before the borrows below, which hold
+            // `self` for the rest of the closure.
+            if let Some(index) = self.active {
+                self.disk_bar(ui, index);
+            }
+
             let mut opts = self.editor_options();
             let syntax = &self.syntax_theme;
             let underline_level = self.settings.underline_diagnostics();
@@ -3799,7 +3996,9 @@ impl eframe::App for EditorApp {
         if let Some(session) = self.restore.take() {
             self.restore_session(&session, &ctx);
         }
+        self.open_from_command_line();
         self.poll_watcher();
+        self.check_disk_on_focus(&ctx);
         self.poll_debugger(&ctx);
         self.sync_highlighters(&ctx);
         self.sync_completion();
@@ -4338,6 +4537,31 @@ fn offset_of(rope: &ropey::Rope, line: usize, column: usize) -> usize {
     let start = rope.line_to_char(line);
     let len = rope.line(line).len_chars();
     (start + column).min(start + len).min(rope.len_chars())
+}
+
+/// What to do about a file that changed underneath an open document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskResponse {
+    /// Nothing happened, or nothing that has not already been dealt with.
+    Ignore,
+    /// Re-read it without asking.
+    Reload,
+    /// Put the bar up and let the user decide.
+    Ask(DiskState),
+}
+
+/// The rule, separated from the application state so it can be stated plainly.
+///
+/// The only case that reloads silently is a rewritten file with nothing unsaved
+/// in the buffer: there is genuinely nothing to lose, and a prompt for it is
+/// one people learn to dismiss unread — which is what makes the prompt that
+/// *does* matter dangerous. Everything else is the user's call.
+fn disk_response(state: DiskState, dirty: bool) -> DiskResponse {
+    match state {
+        DiskState::Unchanged => DiskResponse::Ignore,
+        DiskState::Modified if !dirty => DiskResponse::Reload,
+        other => DiskResponse::Ask(other),
+    }
 }
 
 /// Whether a file failed to parse, as opposed to merely having problems.
@@ -5009,6 +5233,47 @@ mod tests {
                 ("b.py".to_owned(), 8, 4),
             ],
             "results must read down the file, and not repeat"
+        );
+    }
+
+    /// A clean buffer is re-read without asking; a dirty one never is. Getting
+    /// this backwards silently throws away unsaved work.
+    #[test]
+    fn only_a_clean_buffer_reloads_without_asking() {
+        assert_eq!(
+            disk_response(DiskState::Modified, false),
+            DiskResponse::Reload
+        );
+        assert_eq!(
+            disk_response(DiskState::Modified, true),
+            DiskResponse::Ask(DiskState::Modified)
+        );
+    }
+
+    /// A deleted file is never reloaded, clean buffer or not: reloading means
+    /// reading, and there is nothing there to read. The tab is now the only
+    /// copy of that text in existence.
+    #[test]
+    fn a_deleted_file_always_asks_even_when_the_buffer_is_clean() {
+        assert_eq!(
+            disk_response(DiskState::Deleted, false),
+            DiskResponse::Ask(DiskState::Deleted)
+        );
+        assert_eq!(
+            disk_response(DiskState::Deleted, true),
+            DiskResponse::Ask(DiskState::Deleted)
+        );
+    }
+
+    #[test]
+    fn an_unchanged_file_is_left_alone_however_dirty_the_buffer_is() {
+        assert_eq!(
+            disk_response(DiskState::Unchanged, false),
+            DiskResponse::Ignore
+        );
+        assert_eq!(
+            disk_response(DiskState::Unchanged, true),
+            DiskResponse::Ignore
         );
     }
 

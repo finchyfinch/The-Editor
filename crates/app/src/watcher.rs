@@ -38,29 +38,47 @@ impl Changes {
     }
 }
 
-/// Watches one project folder.
+/// Watches one project folder, plus the directories holding any open files
+/// that are not inside it.
+///
+/// The second part matters more than it sounds. Open a file with no folder
+/// open, or a file from somewhere else entirely, and a project-only watch never
+/// sees it change — so the one document you are actually looking at is the one
+/// document nothing is watching.
 pub(crate) struct Watcher {
     /// Dropping this stops the watch, so it must be kept alive.
-    _debouncer: Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>,
+    debouncer: Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>,
     events: Receiver<Changes>,
-    root: PathBuf,
+    root: Option<PathBuf>,
+    /// Directories watched non-recursively for the sake of individual files.
+    /// Kept so they can be un-watched when the last file in one is closed.
+    loose: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for Watcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Watcher").field("root", &self.root).finish()
+        f.debug_struct("Watcher")
+            .field("root", &self.root)
+            .field("loose", &self.loose.len())
+            .finish()
     }
 }
 
 impl Watcher {
-    /// Start watching `root` recursively.
+    /// Start a watcher with nothing watched yet.
+    ///
+    /// `wake` is the egui context. Changes arrive on the watcher's own thread,
+    /// and an idle egui draws no frames — so without waking it the event sits
+    /// in the channel until something else happens to cause a repaint. Which is
+    /// to say: the file you are looking at changes and the editor tells you
+    /// about it only once you touch the keyboard.
     ///
     /// # Errors
-    /// If the platform watcher cannot be created or the path cannot be watched.
-    pub(crate) fn new(root: &Path) -> anyhow::Result<Self> {
+    /// If the platform watcher cannot be created.
+    pub(crate) fn new(wake: Option<eframe::egui::Context>) -> anyhow::Result<Self> {
         let (tx, events) = channel();
 
-        let mut debouncer = new_debouncer(DEBOUNCE, None, move |result: DebounceEventResult| {
+        let debouncer = new_debouncer(DEBOUNCE, None, move |result: DebounceEventResult| {
             let changes = match result {
                 Ok(events) => summarise(&events),
                 // A watch error is usually a directory disappearing
@@ -73,21 +91,92 @@ impl Watcher {
             };
             if !changes.is_empty() {
                 let _ = tx.send(changes);
+                if let Some(ctx) = wake.as_ref() {
+                    ctx.request_repaint();
+                }
             }
         })?;
 
-        debouncer.watch(root, RecursiveMode::Recursive)?;
-
         Ok(Self {
-            _debouncer: debouncer,
+            debouncer,
             events,
-            root: root.to_path_buf(),
+            root: None,
+            loose: Vec::new(),
         })
     }
 
+    /// Watch `root` and everything under it, replacing any previous root.
+    ///
+    /// # Errors
+    /// If the path cannot be watched.
+    pub(crate) fn set_root(&mut self, root: &Path) -> anyhow::Result<()> {
+        if let Some(old) = self.root.take() {
+            self.debouncer.unwatch(&old).ok();
+        }
+        self.debouncer.watch(root, RecursiveMode::Recursive)?;
+        self.root = Some(root.to_path_buf());
+        // Files that are now inside the project no longer need their own watch,
+        // and leaving it would report every change twice.
+        self.prune_loose();
+        Ok(())
+    }
+
     #[must_use]
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
+    pub(crate) fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// Make sure every one of `files` is covered by some watch.
+    ///
+    /// Watches the *directory*, not the file, and non-recursively. Watching a
+    /// file directly misses the commonest way files change: written to a
+    /// temporary and renamed over the top, which replaces the thing being
+    /// watched rather than modifying it. The directory sees that as a rename
+    /// and reports it.
+    ///
+    /// Directories no longer holding any open file are dropped, so closing
+    /// tabs does not leave watches accumulating for the session's lifetime.
+    pub(crate) fn set_files(&mut self, files: &[PathBuf]) {
+        let mut wanted: Vec<PathBuf> = files
+            .iter()
+            .filter_map(|f| f.parent())
+            .filter(|dir| !self.covered_by_root(dir))
+            .map(Path::to_path_buf)
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        for dir in &self.loose {
+            if !wanted.contains(dir) {
+                self.debouncer.unwatch(dir).ok();
+            }
+        }
+        for dir in &wanted {
+            if !self.loose.contains(dir) {
+                // A directory that has since been removed is not an error worth
+                // reporting: the file in it will show as deleted anyway.
+                self.debouncer.watch(dir, RecursiveMode::NonRecursive).ok();
+            }
+        }
+        self.loose = wanted;
+    }
+
+    /// Whether the recursive project watch already covers `dir`.
+    fn covered_by_root(&self, dir: &Path) -> bool {
+        self.root.as_ref().is_some_and(|root| dir.starts_with(root))
+    }
+
+    /// Drop loose watches that the project watch has taken over.
+    fn prune_loose(&mut self) {
+        let mut kept = Vec::new();
+        for dir in std::mem::take(&mut self.loose) {
+            if self.covered_by_root(&dir) {
+                self.debouncer.unwatch(&dir).ok();
+            } else {
+                kept.push(dir);
+            }
+        }
+        self.loose = kept;
     }
 
     /// Take everything that has settled since the last call. Never blocks.
@@ -200,8 +289,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create dir");
 
-        let watcher = Watcher::new(&dir).expect("watcher starts");
-        assert_eq!(watcher.root(), dir);
+        let mut watcher = Watcher::new(None).expect("watcher starts");
+        watcher.set_root(&dir).expect("root is watchable");
+        assert_eq!(watcher.root(), Some(dir.as_path()));
 
         // Give the platform watcher a moment to register before changing
         // anything, or the event can be missed entirely.
@@ -235,7 +325,8 @@ mod tests {
         let dir = std::env::temp_dir().join("the-editor-watcher-idle");
         std::fs::create_dir_all(&dir).expect("create dir");
 
-        let watcher = Watcher::new(&dir).expect("watcher starts");
+        let mut watcher = Watcher::new(None).expect("watcher starts");
+        watcher.set_root(&dir).expect("root is watchable");
         let started = std::time::Instant::now();
         assert!(watcher.drain().is_empty());
         assert!(started.elapsed() < Duration::from_millis(100));
@@ -245,6 +336,107 @@ mod tests {
 
     #[test]
     fn watching_a_path_that_does_not_exist_is_an_error_not_a_panic() {
-        assert!(Watcher::new(Path::new("/nonexistent/project/xyzzy")).is_err());
+        let mut watcher = Watcher::new(None).expect("watcher starts");
+        assert!(
+            watcher
+                .set_root(Path::new("/nonexistent/project/xyzzy"))
+                .is_err()
+        );
+        assert_eq!(watcher.root(), None, "a failed watch must not be recorded");
+    }
+
+    /// The case a project-only watch misses entirely: a file opened from
+    /// outside the project, or with no project open at all. That is often the
+    /// only document on screen, so it is the worst one to leave unwatched.
+    #[test]
+    fn a_file_outside_the_project_is_watched_through_its_own_directory() {
+        let dir = std::env::temp_dir().join("the-editor-watcher-loose");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = dir.join("loose.txt");
+        std::fs::write(&file, b"before").expect("write");
+
+        // No root at all: this is the "opened a single file" case.
+        let mut watcher = Watcher::new(None).expect("watcher starts");
+        watcher.set_files(std::slice::from_ref(&file));
+
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(&file, b"after").expect("rewrite");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            seen.extend(watcher.drain().touched);
+            if seen.iter().any(|p| p.ends_with("loose.txt")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            seen.iter().any(|p| p.ends_with("loose.txt")),
+            "the loose file was not watched: {seen:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Closing every tab in a directory should release its watch, or a long
+    /// session accumulates watches for files nobody has open any more.
+    #[test]
+    fn a_directory_is_unwatched_once_no_open_file_needs_it() {
+        let dir = std::env::temp_dir().join("the-editor-watcher-release");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+
+        let mut watcher = Watcher::new(None).expect("watcher starts");
+        watcher.set_files(std::slice::from_ref(&file));
+        assert_eq!(watcher.loose.len(), 1);
+
+        watcher.set_files(&[]);
+        assert!(
+            watcher.loose.is_empty(),
+            "the watch should have been dropped"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file inside the project is already covered recursively. Watching its
+    /// directory as well would report every change to it twice.
+    #[test]
+    fn a_file_inside_the_project_gets_no_second_watch() {
+        let dir = std::env::temp_dir().join("the-editor-watcher-inside");
+        std::fs::create_dir_all(dir.join("src")).expect("create dirs");
+
+        let mut watcher = Watcher::new(None).expect("watcher starts");
+        watcher.set_root(&dir).expect("root is watchable");
+        watcher.set_files(&[dir.join("src").join("main.rs")]);
+
+        assert!(
+            watcher.loose.is_empty(),
+            "the recursive project watch already covers this"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Opening a folder that contains an already-open loose file should take
+    /// the file over rather than leaving both watches in place.
+    #[test]
+    fn opening_the_project_takes_over_watches_for_files_now_inside_it() {
+        let dir = std::env::temp_dir().join("the-editor-watcher-takeover");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = dir.join("b.txt");
+        std::fs::write(&file, b"x").expect("write");
+
+        let mut watcher = Watcher::new(None).expect("watcher starts");
+        watcher.set_files(std::slice::from_ref(&file));
+        assert_eq!(watcher.loose.len(), 1);
+
+        watcher.set_root(&dir).expect("root is watchable");
+        assert!(watcher.loose.is_empty(), "the project watch covers it now");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
