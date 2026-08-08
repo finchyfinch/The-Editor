@@ -178,6 +178,37 @@ impl Document {
         }
     }
 
+    /// A document rebuilt from a crash-recovery copy.
+    ///
+    /// Dirty from the first frame, deliberately: the text has never been
+    /// written to `path`, and a buffer that claims to match a file it does not
+    /// match is how the recovered work gets lost a second time. `path` may name
+    /// a file that no longer exists, which is exactly the case worth keeping —
+    /// the buffer is then the only copy there is.
+    ///
+    /// Line endings and encoding are the platform's, because the file that
+    /// would have said otherwise is gone; where it still exists, callers open
+    /// it normally and replace the text instead, which preserves both.
+    #[must_use]
+    pub fn recovered(path: Option<PathBuf>, text: &str) -> Self {
+        Self {
+            path,
+            text: Rope::from_str(text),
+            encoding: Encoding::Utf8,
+            line_ending: LineEnding::platform_default(),
+            read_only: None,
+            large: false,
+            history: History::default(),
+            pending: Vec::new(),
+            version: 1,
+            saved_version: 0,
+            // Unknown rather than "now": claiming to have read the file at this
+            // moment would suppress the very warning the user needs if the file
+            // has moved on since the crash.
+            disk_mtime: None,
+        }
+    }
+
     /// Read a file from disk.
     ///
     /// # Errors
@@ -852,6 +883,25 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A recovered buffer is unsaved work by definition: it exists precisely
+    /// because it never reached the file. Starting it clean would let the next
+    /// close discard it without a word.
+    #[test]
+    fn a_recovered_document_starts_dirty_and_keeps_its_path() {
+        let doc = Document::recovered(Some(PathBuf::from("/project/a.py")), "work");
+        assert!(doc.is_dirty());
+        assert_eq!(doc.path(), Some(Path::new("/project/a.py")));
+        assert_eq!(doc.text().to_string(), "work");
+    }
+
+    #[test]
+    fn a_recovered_buffer_with_no_path_is_still_a_document() {
+        let doc = Document::recovered(None, "notes");
+        assert!(doc.is_dirty());
+        assert_eq!(doc.path(), None);
+        assert_eq!(doc.text().to_string(), "notes");
     }
 
     /// A document that has never been saved has no file to compare against, and

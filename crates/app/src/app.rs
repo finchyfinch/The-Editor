@@ -32,6 +32,7 @@ use crate::file_picker::FilePicker;
 use crate::new_file;
 use crate::palette::Palette;
 use crate::project_search::ProjectSearch;
+use crate::recovery;
 use crate::runner::Runner;
 use crate::settings_window;
 use crate::terminal::Terminal;
@@ -160,6 +161,10 @@ struct OpenDoc {
     /// When the next syntax check is due, so squiggles do not flicker under
     /// the caret while a line is half-typed.
     syntax_due: Option<Instant>,
+    /// Identifies this tab to the crash-recovery store for as long as it is
+    /// open. Not the path: an untitled buffer has none, and that is exactly
+    /// the buffer with nothing else to fall back on.
+    recovery_id: u64,
     /// What has happened to the file behind this document's back, and so
     /// whether the reload bar is showing.
     ///
@@ -220,6 +225,16 @@ pub(crate) struct EditorApp {
     was_focused: bool,
     /// Paths named on the command line, opened once the window exists.
     from_command_line: Vec<PathBuf>,
+    /// Copies of unsaved buffers, so a crash does not take them.
+    recovery: recovery::Recovery,
+    /// Next id to hand to a tab. Monotonic, never reused within a session.
+    next_recovery_id: u64,
+    /// Work found lying about from a session that did not shut down, shown
+    /// as a prompt on the first frame.
+    recovered: Vec<recovery::Recovered>,
+    /// What the dirty buffers looked like last frame, so an edit anywhere
+    /// schedules a write without every edit path having to remember to.
+    dirty_seen: Vec<(u64, u64)>,
     /// The session to restore on the first frame, once the window exists and
     /// its geometry can be checked against the monitors actually attached.
     restore: Option<Session>,
@@ -313,6 +328,12 @@ impl EditorApp {
         let (settings, settings_error) = Settings::load(&paths.settings_file());
         let session = Session::load(&paths.session_file());
 
+        // Before this session claims a directory of its own, so its own empty
+        // one is not among the candidates.
+        let backups = paths.backup_dir();
+        let recovered = recovery::collect(&backups, None);
+        let paths_for_recovery = backups;
+
         cc.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(8.0, 4.0);
@@ -350,6 +371,10 @@ impl EditorApp {
                 .ok(),
             was_focused: true,
             from_command_line: open,
+            recovery: recovery::Recovery::new(&paths_for_recovery),
+            next_recovery_id: 1,
+            recovered,
+            dirty_seen: Vec::new(),
             restore: settings.restore_session().then(|| session.clone()),
             session_saved: false,
             recent: Vec::new(),
@@ -504,6 +529,7 @@ impl EditorApp {
             .map_or(LanguageId::PlainText, LanguageId::from_extension);
 
         let entry = OpenDoc {
+            recovery_id: self.claim_recovery_id(),
             highlighter: new_highlighter(language, &doc),
             doc,
             view: EditorView::default(),
@@ -2498,6 +2524,185 @@ impl EditorApp {
         }
     }
 
+    fn claim_recovery_id(&mut self) -> u64 {
+        let id = self.next_recovery_id;
+        self.next_recovery_id += 1;
+        id
+    }
+
+    /// Copy unsaved buffers aside, so a crash cannot take them.
+    ///
+    /// Watches the set of `(id, version)` pairs for dirty documents rather than
+    /// being called from each edit path. Every way text can change — typing,
+    /// paste, undo, a project-wide replace, a rename applied from the language
+    /// server — bumps the version, so nothing can be added later that forgets
+    /// to schedule a write.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        self.recovery.beat();
+
+        let now: Vec<(u64, u64)> = self
+            .docs
+            .iter()
+            .filter(|d| d.doc.is_dirty())
+            .map(|d| (d.recovery_id, d.doc.version()))
+            .collect();
+
+        if now != self.dirty_seen {
+            // Anything that stopped being dirty was saved, closed, or undone
+            // back to what is on disk. Either way its copy is now a lie.
+            for (id, _) in &self.dirty_seen {
+                if !now.iter().any(|(other, _)| other == id) {
+                    self.recovery.discard(*id);
+                }
+            }
+            self.dirty_seen = now;
+            self.recovery.mark_dirty();
+        }
+
+        if self.recovery.is_due() {
+            for entry in &self.docs {
+                if !entry.doc.is_dirty() {
+                    continue;
+                }
+                self.recovery.store(
+                    entry.recovery_id,
+                    entry.doc.version(),
+                    entry.doc.path(),
+                    &entry.doc.display_name(),
+                    &entry.doc.text().to_string(),
+                );
+            }
+            self.recovery.settle();
+        }
+
+        // Without this the write never happens on an idle editor: type a
+        // sentence, walk away, and the copy is made only when you come back.
+        if let Some(wait) = self.recovery.next_wake() {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    /// Offer back the unsaved work of a session that did not shut down.
+    ///
+    /// Modal, unlike the disk-change bar. This one is about work that exists
+    /// nowhere else, the files are deleted once dismissed, and it happens at
+    /// most once per crash — all the reasons the other case is non-modal point
+    /// the other way here.
+    fn recovery_prompt(&mut self, ctx: &egui::Context) {
+        if self.recovered.is_empty() {
+            return;
+        }
+        let mut restore = false;
+        let mut discard = false;
+
+        egui::Modal::new(egui::Id::new("crash_recovery")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Unsaved work was recovered");
+            ui.add_space(6.0);
+            ui.label(
+                "The Editor did not shut down cleanly. These buffers had \
+                      changes that were never saved:",
+            );
+            ui.add_space(8.0);
+
+            egui::ScrollArea::vertical()
+                .id_salt("recovery_list")
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for item in &self.recovered {
+                        ui.horizontal(|ui| {
+                            ui.monospace(&item.name);
+                            match item.path.as_ref() {
+                                Some(path) => {
+                                    ui.weak(shorten_middle(&path.display().to_string(), 52))
+                                }
+                                None => ui.weak("never saved"),
+                            };
+                        });
+                    }
+                });
+
+            ui.add_space(10.0);
+            ui.small(
+                "Restoring opens each one in a tab with its changes, unsaved. \
+                 Undo goes back to what is on disk.",
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Restore").clicked() {
+                    restore = true;
+                }
+                if ui
+                    .button("Discard")
+                    .on_hover_text("Delete the recovered copies. This cannot be undone.")
+                    .clicked()
+                {
+                    discard = true;
+                }
+            });
+        });
+
+        if !restore && !discard {
+            return;
+        }
+        for item in std::mem::take(&mut self.recovered) {
+            if restore {
+                self.restore_one(&item);
+            }
+            recovery::dispose(&item.source);
+        }
+    }
+
+    /// Put one recovered buffer back into a tab.
+    fn restore_one(&mut self, item: &recovery::Recovered) {
+        // Where the file still exists, open it properly first and then replace
+        // the text. That keeps its encoding and line endings, and leaves one
+        // undo step between the recovered version and what is on disk — which
+        // is the comparison anyone will want to make.
+        let doc = match item.path.as_ref().map(|p| (p, Document::open(p))) {
+            Some((_, Ok(mut doc))) => {
+                let end = doc.len_chars();
+                let before = editor_core::selection::Selection::at(0);
+                doc.apply(
+                    &editor_core::edit::Transaction::new(vec![editor_core::edit::Edit::replace(
+                        0..end,
+                        item.text.clone(),
+                    )]),
+                    before,
+                    before,
+                );
+                doc.break_undo_run();
+                doc
+            }
+            _ => Document::recovered(item.path.clone(), &item.text),
+        };
+
+        let language = item
+            .path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map_or(LanguageId::PlainText, LanguageId::from_extension);
+
+        let recovery_id = self.claim_recovery_id();
+        self.docs.push(OpenDoc {
+            recovery_id,
+            highlighter: new_highlighter(language, &doc),
+            doc,
+            view: EditorView::default(),
+            language,
+            find: FindBar::default(),
+            pending_find_step: None,
+            preview: false,
+            syntax_version: None,
+            syntax_due: None,
+            disk: DiskState::Unchanged,
+            line_count_seen: None,
+        });
+        self.active = Some(self.docs.len() - 1);
+        self.sync_watched_files();
+    }
+
     /// Open whatever the command line named, once, after the session restore.
     ///
     /// After, not instead: restoring the previous session and then opening the
@@ -2515,7 +2720,7 @@ impl EditorApp {
         for path in std::mem::take(&mut self.from_command_line) {
             // Relative paths are relative to the shell's directory, and stay
             // usable only until something else changes ours.
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            let path = std::fs::canonicalize(&path).map_or(path, plain_path);
             if path.is_dir() {
                 if !folder_taken {
                     folder_taken = true;
@@ -2998,7 +3203,9 @@ impl EditorApp {
                 self.new_file.open(directory);
             }
             CommandId::NewScratch => {
+                let recovery_id = self.claim_recovery_id();
                 self.docs.push(OpenDoc {
+                    recovery_id,
                     doc: Document::untitled(),
                     view: EditorView::default(),
                     language: LanguageId::PlainText,
@@ -3999,6 +4206,7 @@ impl eframe::App for EditorApp {
         self.open_from_command_line();
         self.poll_watcher();
         self.check_disk_on_focus(&ctx);
+        self.autosave(&ctx);
         self.poll_debugger(&ctx);
         self.sync_highlighters(&ctx);
         self.sync_completion();
@@ -4020,6 +4228,10 @@ impl eframe::App for EditorApp {
                 self.pending = Some(Pending::Quit);
             } else {
                 self.quit_confirmed = true;
+                // Nothing unsaved, and the window is going: this session's
+                // recovery copies would be offered back as crash debris on the
+                // next start, which is worse than useless.
+                self.recovery.clear();
             }
         }
 
@@ -4032,7 +4244,8 @@ impl eframe::App for EditorApp {
         // as modal blocked every other shortcut in the application -- Ctrl+F,
         // Ctrl+S, F5 -- for as long as a suggestion was on screen, which while
         // typing is most of the time.
-        let modal_open = self.rename.is_some()
+        let modal_open = !self.recovered.is_empty()
+            || self.rename.is_some()
             || self.file_picker.is_open()
             || self.settings_form.is_open()
             || self.pending_delete.is_some()
@@ -4257,6 +4470,7 @@ impl eframe::App for EditorApp {
         self.shortcuts_window(&ctx);
         self.toolchains_window(&ctx);
         self.settings_form_ui(&ctx);
+        self.recovery_prompt(&ctx);
         self.rename_ui(&ctx);
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.
@@ -4537,6 +4751,26 @@ fn offset_of(rope: &ropey::Rope, line: usize, column: usize) -> usize {
     let start = rope.line_to_char(line);
     let len = rope.line(line).len_chars();
     (start + column).min(start + len).min(rope.len_chars())
+}
+
+/// Strip Windows' verbatim `\\?\` prefix from a canonicalised path.
+///
+/// `canonicalize` returns extended-length paths, which are correct but leak
+/// into everything that displays or stores one: title bars, the recent list,
+/// recovery files, and the arguments handed to a language server — some of
+/// which do not understand the form at all.
+///
+/// Only the plain drive-letter case is unwrapped. `\\?\UNC\server\share` is
+/// left alone, because dropping its prefix would produce a path that no longer
+/// refers to the same place.
+#[must_use]
+fn plain_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    let is_drive = matches!(rest.as_bytes(), [c, b':', b'\\', ..] if c.is_ascii_alphabetic());
+    if is_drive { PathBuf::from(rest) } else { path }
 }
 
 /// What to do about a file that changed underneath an open document.
@@ -5234,6 +5468,24 @@ mod tests {
             ],
             "results must read down the file, and not repeat"
         );
+    }
+
+    /// `canonicalize` on Windows returns extended-length paths, which are
+    /// correct and unusable: they reach title bars, the recent list, recovery
+    /// files, and the arguments given to language servers, some of which do not
+    /// understand the form.
+    #[test]
+    fn a_verbatim_windows_path_is_unwrapped_but_a_unc_one_is_not() {
+        assert_eq!(
+            plain_path(PathBuf::from(r"\\?\C:\workspace\a.py")),
+            PathBuf::from(r"C:\workspace\a.py")
+        );
+        // Dropping this prefix would name a different place, so it stays.
+        let unc = PathBuf::from(r"\\?\UNC\server\share\a.py");
+        assert_eq!(plain_path(unc.clone()), unc);
+        // Anything that was never verbatim passes through untouched.
+        let plain = PathBuf::from("/home/g/a.py");
+        assert_eq!(plain_path(plain.clone()), plain);
     }
 
     /// A clean buffer is re-read without asking; a dirty one never is. Getting

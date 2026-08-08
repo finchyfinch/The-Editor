@@ -17,6 +17,7 @@ mod new_file;
 mod palette;
 mod panic_hook;
 mod project_search;
+mod recovery;
 mod runner;
 mod settings_window;
 mod terminal;
