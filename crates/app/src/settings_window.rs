@@ -422,6 +422,51 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
         },
     );
 
+    changed |= row(
+        ui,
+        "Follow .editorconfig",
+        "A project's own file overrides the indent and save settings here for          the files it covers.",
+        |ui| {
+            let mut use_it = settings.use_editorconfig();
+            if ui.checkbox(&mut use_it, "").changed() {
+                settings.set_use_editorconfig(use_it);
+                return true;
+            }
+            false
+        },
+    );
+
+    ui.add_space(8.0);
+    heading(ui, "On save");
+
+    changed |= row(
+        ui,
+        "Trim trailing whitespace",
+        "Invisible, meaningless, and noise in every later diff. Lands in the          undo history, so it can be taken back.",
+        |ui| {
+            let mut trim = settings.trim_trailing_whitespace();
+            if ui.checkbox(&mut trim, "").changed() {
+                settings.set_trim_trailing_whitespace(trim);
+                return true;
+            }
+            false
+        },
+    );
+
+    changed |= row(
+        ui,
+        "End with a newline",
+        "Files without one make diffs noisier and some tools drop the last line.",
+        |ui| {
+            let mut newline = settings.insert_final_newline();
+            if ui.checkbox(&mut newline, "").changed() {
+                settings.set_insert_final_newline(newline);
+                return true;
+            }
+            false
+        },
+    );
+
     ui.add_space(8.0);
     heading(ui, "Diagnostics");
 

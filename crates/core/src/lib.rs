@@ -21,6 +21,7 @@ pub mod edit;
 pub mod filename;
 pub mod history;
 pub mod selection;
+pub mod whitespace;
 pub mod word;
 
 // Still to come.

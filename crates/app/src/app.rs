@@ -380,14 +380,34 @@ impl EditorApp {
     /// Editor options from settings, with the language left at its default —
     /// callers that have a document fill that in.
     fn editor_options(&self) -> EditorOptions {
-        EditorOptions {
+        let mut opts = EditorOptions {
             font_size: self.settings.font_size(),
             tab_width: self.settings.tab_width(),
             insert_spaces: self.settings.insert_spaces(),
             show_line_numbers: true,
             language: LanguageId::PlainText,
             auto_close_brackets: self.settings.auto_close_brackets(),
+        };
+
+        // A project's `.editorconfig` outranks these settings for files it
+        // covers: it is a statement about that code rather than about this
+        // user, and it is why two people editing one repository do not fight
+        // over tabs in the diff.
+        if self.settings.use_editorconfig()
+            && let Some(path) = self
+                .active
+                .and_then(|i| self.docs.get(i))
+                .and_then(|e| e.doc.path())
+        {
+            let style = editor_config::editorconfig::style_for(path);
+            if let Some(spaces) = style.insert_spaces {
+                opts.insert_spaces = spaces;
+            }
+            if let Some(width) = style.indent_width {
+                opts.tab_width = width;
+            }
         }
+        opts
     }
 
     /// Give the keyboard to the active editor, so an opened or selected
@@ -649,6 +669,7 @@ impl EditorApp {
         let Some(index) = self.active else {
             return;
         };
+        self.tidy_before_saving(index);
         let needs_path = ask_for_path || self.docs[index].doc.path().is_none();
 
         let result = if needs_path {
@@ -1088,6 +1109,55 @@ impl EditorApp {
                 caret >= start && caret <= end.max(start)
             })
             .map(|d| (path.to_path_buf(), d.line, d.column))
+    }
+
+    /// Apply the on-save whitespace policies before writing.
+    ///
+    /// As a transaction, so it lands in the undo history: saving and pressing
+    /// undo gets the whitespace back, which is what someone who put it there
+    /// deliberately would expect.
+    fn tidy_before_saving(&mut self, index: usize) {
+        let Some(entry) = self.docs.get(index) else {
+            return;
+        };
+        let policy = self.save_policy(entry.doc.path());
+        if policy.is_noop() {
+            return;
+        }
+        let Some(tx) = editor_core::whitespace::tidy(entry.doc.text(), policy) else {
+            return;
+        };
+
+        let Some(entry) = self.docs.get_mut(index) else {
+            return;
+        };
+        let before = entry.view.selection;
+        let after = before.clamped(entry.doc.len_chars());
+        entry.doc.break_undo_run();
+        entry.doc.apply(&tx, before, after);
+        entry.doc.break_undo_run();
+        // The edits may have deleted the text the caret was sitting in.
+        entry
+            .view
+            .set_caret(entry.view.selection.head.min(entry.doc.len_chars()));
+    }
+
+    /// What to tidy on save, with a project's `.editorconfig` taking priority.
+    fn save_policy(&self, path: Option<&Path>) -> editor_core::whitespace::OnSave {
+        let mut policy = editor_core::whitespace::OnSave {
+            trim_trailing_whitespace: self.settings.trim_trailing_whitespace(),
+            ensure_final_newline: self.settings.insert_final_newline(),
+        };
+        if let Some(path) = path.filter(|_| self.settings.use_editorconfig()) {
+            let style = editor_config::editorconfig::style_for(path);
+            if let Some(trim) = style.trim_trailing_whitespace {
+                policy.trim_trailing_whitespace = trim;
+            }
+            if let Some(newline) = style.insert_final_newline {
+                policy.ensure_final_newline = newline;
+            }
+        }
+        policy
     }
 
     /// Toggle a breakpoint on the caret's line, and tell a running session.
@@ -2469,12 +2539,14 @@ impl EditorApp {
             CommandId::SaveAs => self.save_active(true),
             CommandId::SaveAll => {
                 let mut failures = Vec::new();
-                for entry in &mut self.docs {
-                    if entry.doc.is_dirty()
-                        && entry.doc.path().is_some()
-                        && let Err(e) = entry.doc.save()
-                    {
-                        failures.push(format!("{}: {e:#}", entry.doc.display_name()));
+                for index in 0..self.docs.len() {
+                    if !self.docs[index].doc.is_dirty() || self.docs[index].doc.path().is_none() {
+                        continue;
+                    }
+                    self.tidy_before_saving(index);
+                    if let Err(e) = self.docs[index].doc.save() {
+                        let name = self.docs[index].doc.display_name();
+                        failures.push(format!("{name}: {e:#}"));
                     }
                 }
                 if failures.is_empty() {

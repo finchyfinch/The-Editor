@@ -70,7 +70,10 @@ fn embed_windows_icon() {
     res.set_icon(icon.to_str().unwrap_or("../../assets/icon.ico"));
     res.set("ProductName", "The Editor");
     res.set("FileDescription", "The Editor - an IDE for Python and Rust");
-    res.set("LegalCopyright", "Copyright (c) 2026 Gareth Finch. MIT licensed.");
+    res.set(
+        "LegalCopyright",
+        "Copyright (c) 2026 Gareth Finch. MIT licensed.",
+    );
     if let Err(e) = res.compile() {
         // Not fatal. A missing resource compiler on someone else's machine
         // should cost them an icon, not a build.

@@ -56,6 +56,13 @@ auto_close_brackets = true
 # checker that cannot resolve a project's imports reports most of its lines,
 # which makes the file unreadable at \"all\".
 underline_diagnostics = \"errors\"
+# Tidying applied when a file is written. Both land in the undo history, so
+# saving and pressing undo gets the whitespace back.
+trim_trailing_whitespace = false
+insert_final_newline = false
+# Honour a project's .editorconfig, which overrides the indent and save
+# settings above for files it covers.
+use_editorconfig = true
 
 [python]
 # Leave empty to auto-detect: a .venv in the project, else python on PATH.
@@ -436,6 +443,39 @@ impl Settings {
             array.push(id);
         }
         self.set("lsp", "disabled", value(array));
+    }
+
+    #[must_use]
+    pub fn trim_trailing_whitespace(&self) -> bool {
+        self.bool_at("editor", "trim_trailing_whitespace")
+            .unwrap_or(false)
+    }
+
+    pub fn set_trim_trailing_whitespace(&mut self, trim: bool) {
+        self.set("editor", "trim_trailing_whitespace", value(trim));
+    }
+
+    #[must_use]
+    pub fn insert_final_newline(&self) -> bool {
+        self.bool_at("editor", "insert_final_newline")
+            .unwrap_or(false)
+    }
+
+    pub fn set_insert_final_newline(&mut self, insert: bool) {
+        self.set("editor", "insert_final_newline", value(insert));
+    }
+
+    /// Whether a project's `.editorconfig` overrides these settings.
+    ///
+    /// On by default: a file in the project is a statement about that code,
+    /// and someone who put one there meant it.
+    #[must_use]
+    pub fn use_editorconfig(&self) -> bool {
+        self.bool_at("editor", "use_editorconfig").unwrap_or(true)
+    }
+
+    pub fn set_use_editorconfig(&mut self, use_it: bool) {
+        self.set("editor", "use_editorconfig", value(use_it));
     }
 
     pub fn set_auto_close_brackets(&mut self, close: bool) {

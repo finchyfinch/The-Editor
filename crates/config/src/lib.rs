@@ -6,6 +6,7 @@
 //! Editor must never silently delete settings written by a newer version.
 //! See PLAN.md §3.9.
 
+pub mod editorconfig;
 pub mod paths;
 pub mod session;
 pub mod settings;
