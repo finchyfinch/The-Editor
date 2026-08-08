@@ -91,10 +91,11 @@ pub struct EditorView {
     /// Set by the context menu, taken by the application next frame.
     context_action: Option<ContextAction>,
     /// The scroll offset at the end of the last frame.
-    ///
-    /// Frames are requested while this keeps changing, which is the only
-    /// reliable signal that egui's scroll easing is still running.
     last_offset: egui::Vec2,
+    /// When it last changed, so frames keep coming through the tail of the
+    /// easing rather than stopping the instant one frame happens to match the
+    /// last.
+    last_offset_change: Option<std::time::Instant>,
     /// Where the caret was painted last frame, in screen coordinates.
     ///
     /// Kept so the completion popup can be anchored under the caret. Only the
@@ -422,9 +423,20 @@ impl EditorView {
         // honest signal that there is more to come.
         let offset = scrolled.state.offset;
         if (offset - self.last_offset).length() > 0.01 {
+            self.last_offset_change = Some(std::time::Instant::now());
+            self.last_offset = offset;
+        }
+        // Both conditions are needed. The offset alone stops the moment two
+        // frames happen to agree, which during an ease is often -- and the
+        // remainder then waits for whatever wakes the loop next, arriving as
+        // the small jump at the end of every scroll. The settle window carries
+        // it through to a genuine stop.
+        if self
+            .last_offset_change
+            .is_some_and(|t| t.elapsed() < SCROLL_SETTLE)
+        {
             ui.ctx().request_repaint();
         }
-        self.last_offset = offset;
 
         changed
     }
@@ -1701,6 +1713,14 @@ pub enum ContextAction {
     FindUses,
     Paste,
 }
+
+/// How long to keep drawing frames after the view last moved.
+///
+/// Covers the tail of egui's scroll easing, where the per-frame movement is
+/// small enough that individual frames can match the previous one. Measured
+/// from the last actual movement, not from the last wheel event, so it always
+/// spans the end of the animation however long the gesture was.
+const SCROLL_SETTLE: std::time::Duration = std::time::Duration::from_millis(350);
 
 /// The character range of whole lines `first..=last`, including the trailing
 /// newline of the last one where there is one.

@@ -60,6 +60,12 @@ underline_diagnostics = \"errors\"
 [python]
 # Leave empty to auto-detect: a .venv in the project, else python on PATH.
 interpreter = \"\"
+
+[lsp]
+# Language servers to leave alone, by id: \"ruff\", \"pyright\", \"pylsp\",
+# \"rust-analyzer\", \"taplo\". A type checker whose findings you do not trust is
+# worse than none, and this turns one off without uninstalling it.
+disabled = []
 ";
 
 /// Defaults, in one place so the accessors and the documentation above cannot
@@ -403,6 +409,33 @@ impl Settings {
 
     pub fn set_underline_diagnostics(&mut self, level: UnderlineDiagnostics) {
         self.set("editor", "underline_diagnostics", value(level.as_str()));
+    }
+
+    /// Server ids the user has switched off.
+    #[must_use]
+    pub fn disabled_servers(&self) -> Vec<String> {
+        self.item_at("lsp", "disabled")
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_server_enabled(&mut self, id: &str, enabled: bool) {
+        let mut disabled = self.disabled_servers();
+        disabled.retain(|d| d != id);
+        if !enabled {
+            disabled.push(id.to_owned());
+        }
+        disabled.sort();
+        let mut array = toml_edit::Array::new();
+        for id in disabled {
+            array.push(id);
+        }
+        self.set("lsp", "disabled", value(array));
     }
 
     pub fn set_auto_close_brackets(&mut self, close: bool) {

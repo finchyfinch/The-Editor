@@ -89,6 +89,26 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **Language servers are now told how to behave.** The Editor never answered
+  `workspace/configuration`, so every server fell back on its own defaults —
+  and basedpyright's default is its strictest mode, which reports import cycles
+  and treats a great deal as an error. On a project using libraries whose stubs
+  do not describe them fully, that is hundreds of findings that are true of the
+  stubs and false of the code. Servers are now asked for `standard` type
+  checking, `openFilesOnly`, and no import-cycle reporting.
+- **Individual servers can be switched off** in Settings → Python, or via
+  `[lsp] disabled` in the settings file. A checker whose findings you do not
+  trust is worth less than none.
+- **The Problems panel shows only the file you are looking at** by default,
+  with an "All open files" toggle. Every tab's problems in one list buries the
+  ones belonging to the line under the caret.
+- **Settings hints wrap** instead of running off the edge of the panel.
+- **Scrolling: another attempt at the jump at the end.** Watching the scroll
+  offset was not enough on its own — during an ease, two consecutive frames can
+  match, at which point the frames stopped and the remainder waited for
+  something else to wake the loop. Frames now continue for a short window
+  measured from the last actual movement.
+
 - **The completion popup blocked every keyboard shortcut in the application.**
   It was listed as modal, so while a suggestion was on screen — which, while
   typing, is most of the time — Ctrl+F, Ctrl+S and F5 all did nothing. It

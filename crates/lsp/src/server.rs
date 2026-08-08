@@ -54,10 +54,44 @@ pub enum Event {
     Response { id: i64, result: Value },
     /// A request that failed.
     Error { id: i64, message: String },
+    /// A request *from* the server, which must be answered or it waits.
+    Request {
+        id: i64,
+        method: String,
+        params: Value,
+    },
     /// Something the server logged.
     Log(String),
     /// The process ended.
     Exited { restarting: bool },
+}
+
+/// What The Editor asks a Python server to do.
+///
+/// basedpyright's own default is its "recommended" mode, which turns on rules
+/// pyright leaves off — import-cycle reporting among them — and treats a great
+/// deal as an error. On a real project using libraries whose stubs do not
+/// describe them fully, that produces hundreds of findings that are true of the
+/// stubs and false of the code, and a Problems panel nobody reads is worth less
+/// than none.
+///
+/// `standard` is pyright's own default and the level its documentation
+/// describes. `openFilesOnly` keeps a server from reporting on files the user
+/// has not opened.
+fn configuration_for(section: &str) -> Value {
+    // Servers ask for a dotted section and expect just that subtree back.
+    let analysis = json!({
+        "typeCheckingMode": "standard",
+        "diagnosticMode": "openFilesOnly",
+        "diagnosticSeverityOverrides": {
+            "reportImportCycles": "none",
+        },
+    });
+    match section {
+        "python" | "basedpyright" | "pyright" => json!({ "analysis": analysis }),
+        "python.analysis" | "basedpyright.analysis" | "pyright.analysis" => analysis,
+        _ => Value::Null,
+    }
 }
 
 /// Whether a capabilities object advertises a capability.
@@ -188,7 +222,9 @@ impl Server {
                     },
                     "definition": { "dynamicRegistration": false },
                 },
-                "workspace": { "workspaceFolders": true },
+                // Declared so servers ask rather than assuming their own
+                // defaults; see `configuration_for`.
+                "workspace": { "workspaceFolders": true, "configuration": true },
             },
         });
         self.request(id, "initialize", params)?;
@@ -232,6 +268,40 @@ impl Server {
     pub fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
         let id = self.take_id();
         self.request(id, method, params)
+    }
+
+    /// Answer a request the server made of us.
+    ///
+    /// Only `workspace/configuration` is answered with anything; everything
+    /// else gets `null`, which the protocol allows and every server copes with.
+    /// The point is to answer *at all* — an unanswered request leaves some
+    /// servers waiting indefinitely.
+    fn answer(&self, id: i64, method: &str, params: &Value) {
+        let result = if method == "workspace/configuration" {
+            let sections = params
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Value::Array(
+                sections
+                    .iter()
+                    .map(|item| {
+                        item.get("section")
+                            .and_then(Value::as_str)
+                            .map_or(Value::Null, configuration_for)
+                    })
+                    .collect(),
+            )
+        } else {
+            Value::Null
+        };
+
+        let _ = self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }));
     }
 
     /// Send a notification, which expects no reply.
@@ -294,6 +364,13 @@ impl Server {
                 Event::Ready { capabilities } => {
                     self.ready = true;
                     self.capabilities = capabilities.clone();
+                }
+                Event::Request { id, method, params } => {
+                    // Answered here rather than passed up: none of these are
+                    // decisions the application makes, and a server left
+                    // waiting on one stops answering anything else.
+                    self.answer(*id, method, params);
+                    continue;
                 }
                 Event::Exited { .. } => {
                     self.on_exit(&mut events);
@@ -485,9 +562,16 @@ fn parse(text: &str, server_id: &str) -> Vec<Event> {
             }
             return events;
         }
-        // A request *from* the server. Not answered yet; the ones that matter
-        // (configuration, registration) are all optional, and a server must
-        // cope with a client that declines.
+        // A request from the server. It has to be answered: a server that asks
+        // for its configuration and never hears back falls through to its own
+        // defaults, which for basedpyright means its strictest mode.
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            return vec![Event::Request {
+                id,
+                method: method.to_owned(),
+                params: message.get("params").cloned().unwrap_or(Value::Null),
+            }];
+        }
         return Vec::new();
     }
 
@@ -782,17 +866,50 @@ mod tests {
     }
 
     #[test]
-    fn a_request_from_the_server_is_ignored_rather_than_misread_as_a_response() {
+    fn a_request_from_the_server_is_recognised_rather_than_misread_as_a_response() {
         // `workspace/configuration` has both an id and a method. Treating it as
-        // a response would route it to whatever request happens to share the id.
+        // a response would route it to whatever request happens to share the id;
+        // ignoring it, which is what this used to do, leaves the server to fall
+        // back on its own defaults.
         let message = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "workspace/configuration",
-            "params": { "items": [] }
+            "params": { "items": [{ "section": "python.analysis" }] }
         })
         .to_string();
-        assert!(parse(&message, "test").is_empty());
+        let events = parse(&message, "test");
+        assert!(
+            matches!(events.as_slice(), [Event::Request { id: 1, method, .. }] if method == "workspace/configuration"),
+            "got {events:?}"
+        );
+    }
+
+    /// basedpyright's own default is its strictest mode, which on a project
+    /// using libraries whose stubs are incomplete reports hundreds of findings
+    /// that are true of the stubs and false of the code.
+    #[test]
+    fn python_servers_are_asked_for_the_standard_type_checking_mode() {
+        let analysis = configuration_for("python.analysis");
+        assert_eq!(analysis["typeCheckingMode"], "standard");
+        assert_eq!(analysis["diagnosticMode"], "openFilesOnly");
+        assert_eq!(
+            analysis["diagnosticSeverityOverrides"]["reportImportCycles"],
+            "none"
+        );
+
+        // Asked for by the parent section, the same settings arrive nested.
+        assert_eq!(
+            configuration_for("basedpyright")["analysis"]["typeCheckingMode"],
+            "standard"
+        );
+    }
+
+    #[test]
+    fn a_section_we_have_nothing_to_say_about_is_answered_with_null() {
+        // The protocol requires one entry per requested item; skipping one
+        // shifts every later answer onto the wrong section.
+        assert_eq!(configuration_for("editor.wibble"), Value::Null);
     }
 
     #[test]

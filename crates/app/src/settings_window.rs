@@ -205,6 +205,23 @@ impl SettingsWindow {
 
         ui.add_space(12.0);
         heading(ui, "Analysis");
+
+        ui.small(
+            "A server whose findings you do not trust is worth less than none. \
+             Switching one off here stops it being started; the others carry on.",
+        );
+        ui.add_space(4.0);
+        let disabled = settings.disabled_servers();
+        for spec in editor_lsp::registry::ALL {
+            let mut enabled = !disabled.iter().any(|d| d == spec.id);
+            let label = format!("{} \u{2014} {}", spec.name, spec.provides);
+            if ui.checkbox(&mut enabled, label).changed() {
+                settings.set_server_enabled(spec.id, enabled);
+                action = Action::Changed;
+            }
+        }
+        ui.add_space(8.0);
+
         if running_servers.is_empty() {
             ui.label("No language server is running. Syntax is still checked by The Editor.");
         } else {
@@ -223,6 +240,10 @@ fn heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
 }
 
+/// How wide a hint may be before it wraps. Narrower than the window, so the
+/// text does not reflow every time the window is resized a little.
+const HINT_WIDTH: f32 = 380.0;
+
 /// A row of label plus control, so every page lines up the same way.
 fn row(
     ui: &mut egui::Ui,
@@ -239,9 +260,18 @@ fn row(
         changed = add(ui);
     });
     if !hint.is_empty() {
-        ui.horizontal(|ui| {
+        // Indented under the control and wrapped. `ui.horizontal` lays out on
+        // one infinitely wide line, so a hint of any length ran off the panel
+        // and out of the window instead of folding onto a second line.
+        ui.horizontal_top(|ui| {
             ui.add_space(174.0);
-            ui.small(hint);
+            ui.allocate_ui_with_layout(
+                egui::vec2(HINT_WIDTH, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(hint).small()).wrap());
+                },
+            );
         });
     }
     ui.add_space(6.0);

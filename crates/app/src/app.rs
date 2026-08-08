@@ -216,6 +216,8 @@ pub(crate) struct EditorApp {
     pending_recent: Option<PathBuf>,
     /// A file or folder awaiting a yes/no before it is moved to the trash.
     pending_delete: Option<PathBuf>,
+    /// Whether the Problems panel shows every file or only the open one.
+    problems_all_files: bool,
     /// Results of the last Find Uses, and where in them the user is.
     uses: UseResults,
     /// Go to File (Ctrl+P).
@@ -291,6 +293,7 @@ impl EditorApp {
             recent: Vec::new(),
             pending_recent: None,
             pending_delete: None,
+            problems_all_files: false,
             uses: UseResults::default(),
             file_picker: FilePicker::default(),
             completion: completion::Popup::default(),
@@ -821,7 +824,21 @@ impl EditorApp {
     ///
     /// Returns the location to jump to when a row is clicked.
     fn problems_ui(&mut self, ui: &mut egui::Ui) -> Option<(PathBuf, usize, usize)> {
-        let files = self.lsp.diagnostics().all();
+        // Only the file being looked at, unless asked otherwise. A panel
+        // listing every open tab's problems buries the ones belonging to the
+        // line under the caret, which is what it is being consulted about.
+        let here = self
+            .active
+            .and_then(|i| self.docs.get(i))
+            .and_then(|d| d.doc.path())
+            .map(Path::to_path_buf);
+        let files: Vec<(PathBuf, Vec<editor_lsp::diagnostics::Diagnostic>)> = self
+            .lsp
+            .diagnostics()
+            .all()
+            .into_iter()
+            .filter(|(path, _)| self.problems_all_files || here.as_ref() == Some(path))
+            .collect();
 
         // The what-is-missing notice sits at the bottom and is drawn first, so
         // it keeps its place while the list above it scrolls. It shows whether
@@ -830,6 +847,18 @@ impl EditorApp {
         if self.lsp.running().is_empty() && self.missing_tools_ui(ui) {
             self.toolchains = Some(editor_lsp::registry::find_all(&self.tool_search_path()));
         }
+
+        ui.horizontal(|ui| {
+            let mut all = self.problems_all_files;
+            if ui
+                .checkbox(&mut all, "All open files")
+                .on_hover_text("Off shows only the file you are looking at")
+                .changed()
+            {
+                self.problems_all_files = all;
+            }
+        });
+        ui.separator();
 
         if files.is_empty() {
             ui.vertical_centered(|ui| {
@@ -1504,6 +1533,7 @@ impl EditorApp {
     /// the same reason the highlighter is driven from the change outbox.
     fn sync_language_servers(&mut self) {
         let extra_path = self.tool_search_path();
+        self.lsp.set_disabled(self.settings.disabled_servers());
         self.lsp
             .set_root(self.tree.root().map(Path::to_path_buf), extra_path);
 

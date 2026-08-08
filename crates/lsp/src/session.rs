@@ -166,10 +166,39 @@ pub struct Lsp {
     /// Request ids are allocated per server, so the server id has to be part of
     /// the key or two servers would collide on id 1.
     pending: HashMap<(&'static str, i64), Pending>,
+    /// Server ids the user has switched off. Checked before starting one, so a
+    /// disabled server is never spawned rather than started and ignored.
+    disabled: Vec<String>,
 }
 
 impl Lsp {
     /// Point at a project. Stops everything running for the previous one.
+    /// Switch servers off by id. Anything already running for a newly
+    /// disabled server is stopped.
+    pub fn set_disabled(&mut self, disabled: Vec<String>) {
+        if self.disabled == disabled {
+            return;
+        }
+        self.disabled = disabled;
+        let stopping: Vec<&'static str> = self
+            .servers
+            .keys()
+            .filter(|id| self.disabled.iter().any(|d| d == *id))
+            .copied()
+            .collect();
+        for id in stopping {
+            if let Some(mut server) = self.servers.remove(id) {
+                server.stop();
+            }
+            // Its findings go with it: a server that is not running is not
+            // there to correct them.
+            self.diagnostics.clear_server(id);
+            self.documents
+                .values_mut()
+                .for_each(|d| d.told.retain(|t| *t != id));
+        }
+    }
+
     pub fn set_root(&mut self, root: Option<PathBuf>, extra_path: Vec<PathBuf>) {
         if self.root == root && self.extra_path == extra_path {
             return;
@@ -436,6 +465,11 @@ impl Lsp {
         if self.servers.contains_key(spec.id) {
             return Some(spec.id);
         }
+        // Checked before anything else, so a switched-off server is never
+        // spawned rather than started and then ignored.
+        if self.disabled.iter().any(|d| d == spec.id) {
+            return None;
+        }
         if self.missing.iter().any(|s| s.id == spec.id) {
             return None; // already looked, still not there
         }
@@ -502,6 +536,8 @@ impl Lsp {
                         tracing::debug!(server = id, request, "request failed: {message}");
                     }
                     Event::Ready { .. } => {}
+                    // Answered by the server wrapper before it gets here.
+                    Event::Request { .. } => {}
                     Event::Response {
                         id: request,
                         result,
