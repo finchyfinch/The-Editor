@@ -248,6 +248,8 @@ pub(crate) struct EditorApp {
     debug_view: DebugView,
     /// The project-wide search panel.
     search: ProjectSearch,
+    /// The rename prompt: what the symbol is called, and the new name.
+    rename: Option<(String, String)>,
     /// Results of the last Find Uses, and where in them the user is.
     uses: UseResults,
     /// Go to File (Ctrl+P).
@@ -335,6 +337,7 @@ impl EditorApp {
             debug: None,
             debug_view: DebugView::default(),
             search: ProjectSearch::default(),
+            rename: None,
             uses: UseResults::default(),
             file_picker: FilePicker::default(),
             completion: completion::Popup::default(),
@@ -1125,6 +1128,173 @@ impl EditorApp {
                 caret >= start && caret <= end.max(start)
             })
             .map(|d| (path.to_path_buf(), d.line, d.column))
+    }
+
+    /// F2: ask for a new name for the symbol under the caret.
+    fn begin_rename(&mut self) {
+        let Some(name) = self.symbol_under_caret() else {
+            self.info("Put the caret on a name first");
+            return;
+        };
+        self.rename = Some((name.clone(), name));
+    }
+
+    /// The rename prompt.
+    fn rename_ui(&mut self, ctx: &egui::Context) {
+        let Some((original, draft)) = self.rename.as_mut() else {
+            return;
+        };
+        let original = original.clone();
+        let mut go = false;
+        let mut cancel = false;
+
+        egui::Modal::new(egui::Id::new("rename_symbol")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Rename");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.weak("Rename");
+                ui.monospace(&original);
+                ui.weak("to:");
+            });
+            let field = ui.add(
+                egui::TextEdit::singleline(draft)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+            field.request_focus();
+            ui.add_space(4.0);
+            ui.small("Every use across the project is changed. One undo step per file.");
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui.button("Rename").clicked() {
+                    go = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                go = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+        });
+
+        let new_name = self
+            .rename
+            .as_ref()
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        if cancel {
+            self.rename = None;
+            return;
+        }
+        if !go {
+            return;
+        }
+        self.rename = None;
+
+        let new_name = new_name.trim().to_owned();
+        if new_name.is_empty() || new_name == original {
+            return;
+        }
+        self.request_rename(&new_name);
+    }
+
+    fn request_rename(&mut self, new_name: &str) {
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            return;
+        };
+        let Some(path) = entry.doc.path().map(Path::to_path_buf) else {
+            self.info("Save the file before renaming");
+            return;
+        };
+        if entry.doc.is_dirty() {
+            // The server reads the file from disk. Renaming against a stale
+            // copy puts every edit on the wrong line, silently.
+            self.info("Save the file first: rename works from what is on disk");
+            return;
+        }
+        let (line, column) = entry.doc.line_col(entry.view.selection.head);
+        let (line, column) = (line as u32 - 1, column as u32 - 1);
+
+        if !self.lsp.rename(&path, line, column, new_name) {
+            self.error(
+                "No language server can rename here. Renaming by find-and-replace \
+                 is how the wrong things get renamed, so there is no fallback.",
+            );
+        }
+    }
+
+    /// Apply a rename the server worked out, across every file it touches.
+    ///
+    /// Open documents go through the normal transaction path, so the change is
+    /// undoable and reaches the highlighter. Closed ones are rewritten on disk:
+    /// loading twenty files to change one line in each, only to close them
+    /// again, is the worse trade.
+    fn apply_rename(&mut self, files: Vec<editor_lsp::session::FileEdit>) {
+        if files.is_empty() {
+            self.info("Nothing to rename here");
+            return;
+        }
+        let count = files.len();
+        let mut failures = Vec::new();
+
+        for file in files {
+            let open = self
+                .docs
+                .iter()
+                .position(|d| d.doc.path() == Some(file.path.as_path()));
+            match open {
+                Some(index) => self.apply_rename_to_open(index, &file),
+                None => {
+                    if let Err(e) = apply_rename_to_disk(&file) {
+                        failures.push(format!("{}: {e}", file.path.display()));
+                    }
+                }
+            }
+        }
+
+        self.tree.refresh();
+        if failures.is_empty() {
+            self.info(format!("Renamed across {count} file(s)"));
+        } else {
+            self.error(format!("Rename partly failed: {}", failures.join("; ")));
+        }
+    }
+
+    fn apply_rename_to_open(&mut self, index: usize, file: &editor_lsp::session::FileEdit) {
+        let Some(entry) = self.docs.get_mut(index) else {
+            return;
+        };
+        // One transaction per file, so a rename is one undo step there rather
+        // than one per occurrence.
+        let mut edits = Vec::new();
+        for edit in &file.edits {
+            let start = entry
+                .doc
+                .offset_at(edit.start_line as usize, edit.start_column as usize);
+            let end = entry
+                .doc
+                .offset_at(edit.end_line as usize, edit.end_column as usize);
+            edits.push(editor_core::edit::Edit::replace(
+                start..end.max(start),
+                edit.text.clone(),
+            ));
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let before = entry.view.selection;
+        entry.doc.break_undo_run();
+        entry
+            .doc
+            .apply(&editor_core::edit::Transaction::new(edits), before, before);
+        entry.doc.break_undo_run();
+        entry.view.set_caret(before.head.min(entry.doc.len_chars()));
     }
 
     /// Start a project-wide search over the open folder.
@@ -2056,6 +2226,7 @@ impl EditorApp {
                     }
                 }
                 editor_lsp::session::Notice::DiagnosticsChanged(_) => {}
+                editor_lsp::session::Notice::Rename(files) => self.apply_rename(files),
                 editor_lsp::session::Notice::Completions(items) => {
                     // Matched against the word as it is *now*, not as it was
                     // when the request went out; the popup decides whether the
@@ -2852,6 +3023,7 @@ impl EditorApp {
             CommandId::FindUses => {
                 self.ask_about_symbol(editor_lsp::session::Query::References);
             }
+            CommandId::RenameSymbol => self.begin_rename(),
             CommandId::NextUse => self.step_use(1),
             CommandId::PreviousUse => self.step_use(-1),
             CommandId::CommandPalette => self.palette.open(),
@@ -3632,7 +3804,8 @@ impl eframe::App for EditorApp {
         // as modal blocked every other shortcut in the application -- Ctrl+F,
         // Ctrl+S, F5 -- for as long as a suggestion was on screen, which while
         // typing is most of the time.
-        let modal_open = self.file_picker.is_open()
+        let modal_open = self.rename.is_some()
+            || self.file_picker.is_open()
             || self.settings_form.is_open()
             || self.pending_delete.is_some()
             || self.palette.is_open()
@@ -3838,6 +4011,7 @@ impl eframe::App for EditorApp {
         self.shortcuts_window(&ctx);
         self.toolchains_window(&ctx);
         self.settings_form_ui(&ctx);
+        self.rename_ui(&ctx);
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.
         self.completion_draw(&ctx);
@@ -4081,6 +4255,37 @@ fn shorten_middle(text: &str, max: usize) -> String {
     let head: String = chars.iter().take(keep).collect();
     let tail: String = chars.iter().skip(chars.len() - keep).collect();
     format!("{head}\u{2026}{tail}")
+}
+
+/// Apply a rename to a file that is not open, on disk.
+///
+/// The edits arrive sorted last-first, so each replacement is stated in
+/// coordinates that the ones already applied have not disturbed.
+fn apply_rename_to_disk(file: &editor_lsp::session::FileEdit) -> Result<(), String> {
+    let text = std::fs::read_to_string(&file.path).map_err(|e| e.to_string())?;
+    let mut rope = ropey::Rope::from_str(&text);
+
+    for edit in &file.edits {
+        let start = offset_of(&rope, edit.start_line as usize, edit.start_column as usize);
+        let end = offset_of(&rope, edit.end_line as usize, edit.end_column as usize);
+        if end < start || end > rope.len_chars() {
+            return Err("the server described an edit outside the file".to_owned());
+        }
+        rope.remove(start..end);
+        rope.insert(start, &edit.text);
+    }
+
+    std::fs::write(&file.path, rope.to_string()).map_err(|e| e.to_string())
+}
+
+/// A zero-based line and column as a character offset, clamped to that line.
+fn offset_of(rope: &ropey::Rope, line: usize, column: usize) -> usize {
+    if line >= rope.len_lines() {
+        return rope.len_chars();
+    }
+    let start = rope.line_to_char(line);
+    let len = rope.line(line).len_chars();
+    (start + column).min(start + len).min(rope.len_chars())
 }
 
 /// Whether a file failed to parse, as opposed to merely having problems.
@@ -4331,6 +4536,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::TriggerCompletion),
             MenuEntry::Item(CommandId::GoToDefinition),
             MenuEntry::Item(CommandId::FindUses),
+            MenuEntry::Item(CommandId::RenameSymbol),
             MenuEntry::Item(CommandId::NextUse),
             MenuEntry::Item(CommandId::PreviousUse),
         ],

@@ -109,11 +109,35 @@ impl Completion {
     }
 }
 
+/// One file's worth of a rename, as ranges to replace.
+///
+/// Whole files rather than a live document: a rename can touch twenty files,
+/// most of them closed, and reconciling ranges against documents the editor has
+/// not loaded is far more ways to be wrong than reading the file, applying the
+/// server's ranges, and writing it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdit {
+    pub path: PathBuf,
+    /// Sorted **last-first**, so applying them cannot disturb the others.
+    pub edits: Vec<TextEdit>,
+}
+
+/// One replacement within a file, in the protocol's zero-based coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdit {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub text: String,
+}
+
 /// A request sent and not yet answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
     Locations(Query),
     Completions,
+    Rename,
 }
 
 /// What happened that the application should react to.
@@ -131,6 +155,9 @@ pub enum Notice {
     },
     /// Suggestions came back for the position last asked about.
     Completions(Vec<Completion>),
+    /// A rename came back, as the files it would change. Empty means the
+    /// server declined -- renaming a keyword, or a symbol it cannot resolve.
+    Rename(Vec<FileEdit>),
     /// A server died. `restarting` is false once it has given up.
     ServerDied {
         id: &'static str,
@@ -435,6 +462,39 @@ impl Lsp {
         false
     }
 
+    /// Ask a server to rename the symbol at a position.
+    ///
+    /// Returns false if nothing could be asked. Rename is the one feature here
+    /// with no parse-tree fallback: renaming by textual match is how people
+    /// rename the wrong things, and a wrong rename is silent until something
+    /// breaks much later.
+    pub fn rename(&mut self, path: &Path, line: u32, column: u32, new_name: &str) -> bool {
+        let Some(document) = self.documents.get(path) else {
+            return false;
+        };
+        let told = document.told.clone();
+        let uri = server::path_to_uri(path);
+
+        for id in told {
+            let Some(server) = self.servers.get_mut(id) else {
+                continue;
+            };
+            if !server.is_ready() || !server.supports("renameProvider") {
+                continue;
+            }
+            let params = json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": column },
+                "newName": new_name,
+            });
+            if let Ok(request) = server.send_request("textDocument/rename", params) {
+                self.pending.insert((id, request), Pending::Rename);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Tell the servers a file is closed, and forget its diagnostics.
     pub fn close(&mut self, path: &Path) {
         // Diagnostics go first and unconditionally. A server can publish for a
@@ -551,6 +611,9 @@ impl Lsp {
                         Some(Pending::Completions) => {
                             notices.push(Notice::Completions(parse_completions(&result)));
                         }
+                        Some(Pending::Rename) => {
+                            notices.push(Notice::Rename(parse_workspace_edit(&result)));
+                        }
                         None => {}
                     },
                 }
@@ -601,6 +664,85 @@ impl Drop for Lsp {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Read a `WorkspaceEdit` into per-file edits.
+///
+/// The protocol offers two shapes -- `changes`, a map of URI to edits, and
+/// `documentChanges`, an array carrying document versions -- and servers pick
+/// either, so both are read.
+///
+/// Each file's edits are sorted last-first, because applying them in document
+/// order shifts every range after the first. That is the easiest way to corrupt
+/// a file during a rename, and it fails quietly: the result is still valid text,
+/// just wrong.
+fn parse_workspace_edit(result: &serde_json::Value) -> Vec<FileEdit> {
+    fn edits_of(value: &serde_json::Value) -> Vec<TextEdit> {
+        let mut out: Vec<TextEdit> = value
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|e| {
+                        let range = e.get("range")?;
+                        let (start, end) = (range.get("start")?, range.get("end")?);
+                        Some(TextEdit {
+                            start_line: u32::try_from(start.get("line")?.as_u64()?).ok()?,
+                            start_column: u32::try_from(start.get("character")?.as_u64()?).ok()?,
+                            end_line: u32::try_from(end.get("line")?.as_u64()?).ok()?,
+                            end_column: u32::try_from(end.get("character")?.as_u64()?).ok()?,
+                            text: e.get("newText")?.as_str()?.to_owned(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by(|a, b| {
+            b.start_line
+                .cmp(&a.start_line)
+                .then(b.start_column.cmp(&a.start_column))
+        });
+        out
+    }
+
+    let mut files: Vec<FileEdit> = Vec::new();
+
+    if let Some(changes) = result.get("changes").and_then(|c| c.as_object()) {
+        for (uri, edits) in changes {
+            if let Some(path) = server::uri_to_path(uri) {
+                let edits = edits_of(edits);
+                if !edits.is_empty() {
+                    files.push(FileEdit { path, edits });
+                }
+            }
+        }
+    }
+
+    if let Some(changes) = result.get("documentChanges").and_then(|c| c.as_array()) {
+        for change in changes {
+            // A create/rename/delete file operation, which renaming a symbol
+            // does not produce and which this deliberately does not perform.
+            let Some(uri) = change
+                .get("textDocument")
+                .and_then(|d| d.get("uri"))
+                .and_then(|u| u.as_str())
+            else {
+                continue;
+            };
+            if let Some(path) = server::uri_to_path(uri)
+                && let Some(edits) = change.get("edits")
+            {
+                let edits = edits_of(edits);
+                if !edits.is_empty() {
+                    files.push(FileEdit { path, edits });
+                }
+            }
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
+    files
 }
 
 /// The most suggestions kept from one response.
@@ -775,6 +917,79 @@ mod tests {
     fn a_query_only_goes_to_a_server_that_advertises_it() {
         assert_eq!(Query::Definition.capability(), "definitionProvider");
         assert_eq!(Query::References.capability(), "referencesProvider");
+    }
+
+    /// Applying a rename's edits in document order shifts every range after
+    /// the first. The file stays valid text and is quietly wrong, which is the
+    /// worst way for a refactor to fail.
+    #[test]
+    fn a_files_edits_come_back_last_first() {
+        let uri = server::path_to_uri(Path::new("/p/main.py"));
+        let edit = |line: u64, col: u64| {
+            json!({
+                "range": {
+                    "start": { "line": line, "character": col },
+                    "end": { "line": line, "character": col + 3 }
+                },
+                "newText": "new"
+            })
+        };
+        let result = json!({ "changes": { uri: [edit(1, 0), edit(9, 4), edit(9, 20)] } });
+
+        let files = parse_workspace_edit(&result);
+        assert_eq!(files.len(), 1);
+        let lines: Vec<(u32, u32)> = files[0]
+            .edits
+            .iter()
+            .map(|e| (e.start_line, e.start_column))
+            .collect();
+        assert_eq!(lines, [(9, 20), (9, 4), (1, 0)]);
+    }
+
+    #[test]
+    fn both_shapes_of_workspace_edit_are_understood() {
+        // Servers pick either; handling one silently renames nothing for the
+        // other half of them.
+        let uri = server::path_to_uri(Path::new("/p/main.py"));
+        let edit = json!({
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 3 }
+            },
+            "newText": "new"
+        });
+
+        let via_changes = json!({ "changes": { uri.clone(): [edit.clone()] } });
+        assert_eq!(parse_workspace_edit(&via_changes).len(), 1, "changes");
+
+        let via_documents = json!({
+            "documentChanges": [
+                { "textDocument": { "uri": uri, "version": 3 }, "edits": [edit] }
+            ]
+        });
+        assert_eq!(
+            parse_workspace_edit(&via_documents).len(),
+            1,
+            "documentChanges"
+        );
+    }
+
+    #[test]
+    fn a_file_creation_in_the_middle_of_a_rename_is_skipped() {
+        // `documentChanges` may carry create/rename/delete operations. Renaming
+        // a symbol does not produce them, and acting on one would be a
+        // considerably larger surprise than ignoring it.
+        let result = json!({
+            "documentChanges": [{ "kind": "create", "uri": "file:///p/new.py" }]
+        });
+        assert!(parse_workspace_edit(&result).is_empty());
+    }
+
+    #[test]
+    fn a_server_that_declines_yields_no_files_rather_than_an_error() {
+        // Renaming a keyword, or a symbol the server cannot resolve.
+        assert!(parse_workspace_edit(&serde_json::Value::Null).is_empty());
+        assert!(parse_workspace_edit(&json!({})).is_empty());
     }
 
     #[test]

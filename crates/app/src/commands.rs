@@ -52,6 +52,7 @@ pub(crate) enum CommandId {
     TriggerCompletion,
     GoToDefinition,
     FindUses,
+    RenameSymbol,
     NextUse,
     PreviousUse,
     // Run
@@ -127,6 +128,7 @@ impl CommandId {
         Self::TriggerCompletion,
         Self::GoToDefinition,
         Self::FindUses,
+        Self::RenameSymbol,
         Self::NextUse,
         Self::PreviousUse,
         Self::Run,
@@ -363,6 +365,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Edit",
         "Find Uses",
         Some(shift(Key::F12)),
+    ),
+    cmd(
+        CommandId::RenameSymbol,
+        "Edit",
+        "Rename Symbol",
+        Some(plain(Key::F2)),
     ),
     cmd(CommandId::NextUse, "Edit", "Next Use", Some(plain(Key::F8))),
     cmd(
