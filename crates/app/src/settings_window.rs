@@ -177,10 +177,16 @@ impl SettingsWindow {
                     .desired_width(340.0)
                     .hint_text("Leave empty to detect automatically"),
             );
-            // Written on blur or Enter rather than per keystroke: a half-typed
-            // path is not a setting, and rewriting the file on every character
-            // would also spam the disk.
-            let committed = field.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Written on blur rather than per keystroke: a half-typed path is
+            // not a setting, and rewriting the file on every character would
+            // also spam the disk.
+            //
+            // Blur alone covers Enter, because a single-line TextEdit gives up
+            // focus when Enter is pressed in it. The `|| key_pressed(Enter)`
+            // that used to be here read the key whether or not this field had
+            // it — the same mistake the find bar made, where it silently moved
+            // the caret and rewrote the document.
+            let committed = field.lost_focus();
             if committed && draft.trim() != settings.python_interpreter() {
                 settings.set_python_interpreter(draft.trim());
                 action = Action::Changed;

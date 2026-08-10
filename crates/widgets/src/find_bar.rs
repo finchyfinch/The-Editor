@@ -130,6 +130,10 @@ impl FindBar {
         self.refresh(doc);
 
         let mut action = Action::None;
+        // Whether one of this bar's own text fields owns the keyboard. Enter
+        // means "next match" only then; see the guard at the end of this
+        // function for why that matters.
+        let mut typing_here = false;
 
         egui::Frame::new()
             .fill(ui.visuals().panel_fill)
@@ -152,6 +156,12 @@ impl FindBar {
                             .hint_text("Find")
                             .desired_width(240.0),
                     );
+                    // `lost_focus` as well as `has_focus`: a single-line
+                    // TextEdit surrenders focus on Enter, during its own draw,
+                    // so by the time we ask it no longer has it. Testing only
+                    // `has_focus` would stop Enter finding the next match at
+                    // all -- the very key this field exists to answer.
+                    typing_here |= find.has_focus() || find.lost_focus();
                     if std::mem::take(&mut self.focus_find) {
                         find.request_focus();
                     }
@@ -240,7 +250,7 @@ impl FindBar {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.add_space(22.0);
-                        ui.add(
+                        let replace = ui.add(
                             egui::TextEdit::singleline(&mut self.replacement)
                                 .hint_text(if self.query.regex {
                                     "Replace (use $1 for captures)"
@@ -249,6 +259,7 @@ impl FindBar {
                                 })
                                 .desired_width(240.0),
                         );
+                        typing_here |= replace.has_focus() || replace.lost_focus();
 
                         let has_matches = !self.matches.is_empty() && self.error.is_none();
                         if ui
@@ -276,7 +287,28 @@ impl FindBar {
             self.close();
             return Action::FocusEditor;
         }
-        let (enter, shift) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+        // Enter steps to the next match, but only when the keyboard is in one
+        // of this bar's own fields.
+        //
+        // It used to be read unconditionally, and the bar is drawn before the
+        // editor. So: leave a query in the box, click back into the code, press
+        // Enter to split a line -- and the bar would jump the caret to the next
+        // match, selecting it, and the editor would then insert the newline
+        // there, on top of the selection. A keystroke meant for one place
+        // silently rewrote another and deleted the matched word, with no clue
+        // beyond the Find box not being empty. Clearing the box on blur is not
+        // the answer either; a query is worth keeping between searches.
+        let shift = ui.input(|i| i.modifiers.shift);
+        let wanted = if shift {
+            egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::NONE
+        };
+        // Consumed rather than peeked at, so the editor cannot act on the same
+        // keystroke even if both somehow believe they have focus. The modifier
+        // is chosen above rather than tried in turn because `consume_key`
+        // matches logically -- asking for NONE would also swallow Shift+Enter.
+        let enter = typing_here && ui.input_mut(|i| i.consume_key(wanted, egui::Key::Enter));
         if enter && let Some(range) = self.step(caret, if shift { -1 } else { 1 }) {
             action = Action::Reveal(range);
         }
