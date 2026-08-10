@@ -69,6 +69,10 @@ one `Ctrl+Z`, not eight. Undo drops the extra carets, because the history has
 one caret position per step and stale carets would put the next keystroke
 somewhere unrelated.
 
+**Python method parameters.** Typing the `(` of a `def` inside a class fills
+in `self` and leaves the caret ready for the next argument. `@classmethod`
+gets `cls`; `@staticmethod` gets neither, and so does a plain function.
+
 **Rename** (`F2`) asks the language server, so it renames the *symbol* rather
 than the text — a variable called `id` will not take the `id` out of
 `identity`. It needs the file saved first, because the server reads from disk.

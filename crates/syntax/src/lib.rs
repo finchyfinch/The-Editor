@@ -9,6 +9,7 @@ pub mod brackets;
 pub mod errors;
 pub mod highlight;
 pub mod indent;
+pub mod methods;
 pub mod symbols;
 pub mod templates;
 pub mod theme;

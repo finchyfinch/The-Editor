@@ -24,6 +24,7 @@ use editor_core::word;
 use editor_syntax::LanguageId;
 use editor_syntax::highlight::Highlighter;
 use editor_syntax::indent::{self, IndentOptions};
+use editor_syntax::methods;
 use editor_syntax::theme::SyntaxTheme;
 use eframe::egui;
 
@@ -76,6 +77,17 @@ impl EditorOptions {
 /// several views (split panes), each with its own cursor.
 #[derive(Debug, Default)]
 pub struct EditorView {
+    /// Distinguishes this view's scroll area from every other one.
+    ///
+    /// egui keys scroll state by widget id, and the id used to be a constant,
+    /// so every tab shared one scroll position: scroll in one, switch to
+    /// another, and it had moved. Per-view rather than per-file because that
+    /// is what a scroll position belongs to — the same document in two split
+    /// panes should scroll independently too.
+    ///
+    /// Claimed on the first draw rather than in `Default`, so this stays a
+    /// derived `Default` and a new field cannot be forgotten.
+    scroll_id: Option<u64>,
     pub selection: Selection,
     /// Extra carets, beyond the primary one in `selection`.
     ///
@@ -523,8 +535,16 @@ impl EditorView {
 
         // Salted, so it cannot collide with the tab bar's scroll area above it
         // in the same panel. See the note in `tab_bar`.
+        // A process-wide counter, not anything derived from the document: an
+        // untitled buffer has no path, two views of one file must still
+        // differ, and a reused number would hand a new tab an old tab's
+        // scroll position.
+        let scroll_id = *self.scroll_id.get_or_insert_with(|| {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        });
         let scrolled = egui::ScrollArea::both()
-            .id_salt("editor_view")
+            .id_salt(("editor_view", scroll_id))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Claim the whole document; the scroll area decides what of it
@@ -1164,6 +1184,24 @@ impl EditorView {
         {
             self.set_head(self.selection.head + 1, false);
             return false;
+        }
+
+        // `def name(` inside a class wants `self` next, near enough always.
+        // Only for a single caret: eight carets each starting a method is not
+        // a thing anybody does, and working out the answer per caret in a
+        // document the other carets are also editing is not worth it.
+        if c == '('
+            && opts.language == LanguageId::Python
+            && self.selection.is_empty()
+            && self.secondary.is_empty()
+            && let Some(first) = methods::first_parameter(doc.text(), self.selection.head)
+        {
+            let parameter = first.as_str();
+            let changed = self.insert(doc, &format!("({parameter})"));
+            // Caret after the parameter, before the `)`, so the next thing
+            // typed is the comma and the argument that follows it.
+            self.selection = Selection::at(self.selection.head.saturating_sub(1));
+            return changed;
         }
 
         if let Some(closer) = indent::auto_close(opts.language, c)
@@ -2371,6 +2409,89 @@ mod tests {
             Selection::at(text.chars().count()),
         );
         doc
+    }
+
+    // ---- Python method parameters ----------------------------------------
+
+    fn python() -> EditorOptions {
+        EditorOptions {
+            language: LanguageId::Python,
+            ..EditorOptions::default()
+        }
+    }
+
+    /// Typing the `(` of a method should leave `(self)` with the caret ready
+    /// for a comma -- not `()` with the caret between them.
+    #[test]
+    fn opening_a_methods_bracket_inserts_self() {
+        let mut doc = doc_with("class A:\n    def greet");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+
+        assert!(view.type_text(&mut doc, python(), "("));
+        assert_eq!(doc.text().to_string(), "class A:\n    def greet(self)");
+        assert_eq!(
+            view.selection.head,
+            doc.len_chars() - 1,
+            "caret sits before the closing bracket"
+        );
+    }
+
+    #[test]
+    fn a_classmethod_gets_cls_and_a_staticmethod_gets_an_empty_pair() {
+        let mut doc = doc_with("class A:\n    @classmethod\n    def make");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        view.type_text(&mut doc, python(), "(");
+        assert!(doc.text().to_string().ends_with("def make(cls)"));
+
+        let mut doc = doc_with("class A:\n    @staticmethod\n    def helper");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        view.type_text(&mut doc, python(), "(");
+        assert!(
+            doc.text().to_string().ends_with("def helper()"),
+            "got {:?}",
+            doc.text().to_string()
+        );
+    }
+
+    #[test]
+    fn a_plain_function_still_gets_an_empty_pair() {
+        let mut doc = doc_with("def greet");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        view.type_text(&mut doc, python(), "(");
+        assert_eq!(doc.text().to_string(), "def greet()");
+    }
+
+    /// The rule must not reach into any other language, where `self` is either
+    /// spelled differently or means nothing at all.
+    #[test]
+    fn other_languages_are_untouched() {
+        let mut doc = doc_with("impl A {\n    fn greet");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        view.type_text(
+            &mut doc,
+            EditorOptions {
+                language: LanguageId::Rust,
+                ..EditorOptions::default()
+            },
+            "(",
+        );
+        assert_eq!(doc.text().to_string(), "impl A {\n    fn greet()");
+    }
+
+    /// One undo takes back the whole thing, not just the bracket.
+    #[test]
+    fn inserting_self_is_a_single_undo_step() {
+        let mut doc = doc_with("class A:\n    def greet");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        view.type_text(&mut doc, python(), "(");
+        assert!(view.undo(&mut doc));
+        assert_eq!(doc.text().to_string(), "class A:\n    def greet");
     }
 
     // ---- accessibility ---------------------------------------------------

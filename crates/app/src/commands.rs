@@ -580,10 +580,47 @@ pub(crate) fn triggered(ctx: &eframe::egui::Context) -> Option<CommandId> {
         .collect();
     candidates.sort_by_key(|cmd| std::cmp::Reverse(specificity(cmd)));
 
+    // A focused text field owns the keys that mean something inside text.
+    // Asked once, before the loop, because it does not change mid-frame.
+    let in_text_field = ctx.text_edit_focused();
+
     candidates.into_iter().find_map(|cmd| {
         let sc = cmd.shortcut?;
+        if in_text_field && edits_text(sc) {
+            // Left in the queue rather than consumed, so the field itself gets
+            // it later in the frame.
+            return None;
+        }
         ctx.input_mut(|i| i.consume_shortcut(&sc)).then_some(cmd.id)
     })
+}
+
+/// Whether this shortcut means something inside a text field.
+///
+/// Ctrl+A in the Find box selects the query; it does not select the whole
+/// document. Ctrl+Z there undoes what was typed into the box, not the last
+/// edit to the file -- which was the more dangerous half of the same bug,
+/// because the document changed while you were looking at a text field.
+///
+/// Derived from the shortcut rather than flagged per command on purpose. A
+/// flag has to be remembered, and the way this class of bug returns is somebody
+/// binding a new command to one of these and not thinking about text fields.
+/// Deriving it means the binding cannot be added without inheriting the rule.
+///
+/// The clipboard trio is absent because those bindings are already non-global
+/// -- egui synthesises Cut/Copy/Paste events from the platform and the focused
+/// widget handles them, which is the same principle arrived at earlier.
+fn edits_text(shortcut: KeyboardShortcut) -> bool {
+    let command_only = shortcut.modifiers == Modifiers::COMMAND;
+    let command_shift = shortcut.modifiers == Modifiers::COMMAND.plus(Modifiers::SHIFT);
+    match shortcut.logical_key {
+        // Select all, undo.
+        Key::A | Key::Z if command_only => true,
+        // Redo, in both of its usual spellings.
+        Key::Z if command_shift => true,
+        Key::Y if command_only => true,
+        _ => false,
+    }
 }
 
 /// How many modifiers a binding demands. More is more specific.
