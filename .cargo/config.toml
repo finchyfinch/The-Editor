@@ -7,8 +7,12 @@ xtest = ["test", "--workspace"]
 # The Editor itself.
 editor = ["run", "--package", "the-editor"]
 
-# The M2 rendering spike. See crates/spike/src/main.rs.
-spike = ["run", "--release", "--package", "editor-spike"]
+# Note on disk: cargo never garbage-collects target/. Every change to a
+# compilation flag -- a profile setting, a feature, a new dependency --
+# produces artefacts under a fresh hash and leaves the old ones there for
+# good. Over this project that reached 13.8 GB, about 5 GB of which was dead.
+# There is no built-in sweep, so run `cargo clean` every so often; a full
+# rebuild costs about 100 seconds and the folder settles back to ~4 GB.
 
 # Link the C runtime statically on Windows.
 #

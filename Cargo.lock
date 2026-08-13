@@ -914,14 +914,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "editor-spike"
-version = "1.0.0"
-dependencies = [
- "eframe",
- "ropey",
-]
-
-[[package]]
 name = "editor-syntax"
 version = "1.0.0"
 dependencies = [

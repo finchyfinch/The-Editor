@@ -1,5 +1,11 @@
 # Spike — virtualised rope rendering
 
+> **The spike itself has been removed.** It answered its question and M2 is
+> done;  went with it, and this file is kept as the record of
+> what it was for and what it found. The performance budgets it was a
+> stand-in for are now measured continuously by
+> `cargo bench -p editor-widgets` — see `crates/widgets/benches/budgets.rs`.
+
 **Question.** Can a custom egui widget paint a large file backed by a
 `ropey::Rope` inside the 60 fps frame budget, by laying out only the rows that
 are actually on screen? And does editing that rope stay fast enough that typing

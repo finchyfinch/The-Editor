@@ -10,7 +10,6 @@ members = [
     "crates/search",
     "crates/config",
     "crates/widgets",
-    "crates/spike",
 ]
 
 [workspace.package]
@@ -74,6 +73,12 @@ panic = "unwind"          # must stay `unwind`: the panic hook performs an emerg
 # dependencies (rope, tree-sitter, rendering) even in dev builds.
 [profile.dev.package."*"]
 opt-level = 2
+# No debug info for dependencies. The backtraces this project actually reads
+# are its own; a frame inside ropey or egui is identified by symbol name
+# either way, and the line number inside somebody else's crate has never once
+# been the thing that mattered. On Windows this was 902 MB of .pdb files in
+# target/debug/deps alone.
+debug = false
 
 [profile.dev]
 opt-level = 1
