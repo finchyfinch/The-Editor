@@ -31,11 +31,13 @@ use crate::debugger::{self, Breakpoints, DebugView};
 use crate::docs_window::DocsWindow;
 use crate::file_picker::FilePicker;
 use crate::new_file;
+use crate::packages_panel::PackagesPanel;
 use crate::palette::Palette;
 use crate::project_search::ProjectSearch;
 use crate::recovery;
 use crate::runner::Runner;
 use crate::settings_window;
+use crate::symbol_picker::SymbolPicker;
 use crate::terminal::Terminal;
 use crate::venv_dialog;
 use crate::watcher::Watcher;
@@ -293,6 +295,8 @@ pub(crate) struct EditorApp {
     debug_view: DebugView,
     /// The integrated shell.
     terminal: Terminal,
+    /// What is installed in the project's Python environment.
+    packages: PackagesPanel,
     /// The project-wide search panel.
     search: ProjectSearch,
     /// The rename prompt: what the symbol is called, and the new name.
@@ -301,6 +305,7 @@ pub(crate) struct EditorApp {
     uses: UseResults,
     /// Go to File (Ctrl+P).
     file_picker: FilePicker,
+    symbol_picker: SymbolPicker,
     /// The completion popup, and the request behind it.
     completion: completion::Popup,
     /// Document version the popup was last synced against, so the word under
@@ -324,6 +329,7 @@ enum DockTab {
     Debug,
     Search,
     Terminal,
+    Packages,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -414,10 +420,12 @@ impl EditorApp {
             debug: None,
             debug_view: DebugView::default(),
             terminal: Terminal::default(),
+            packages: PackagesPanel::default(),
             search: ProjectSearch::default(),
             rename: None,
             uses: UseResults::default(),
             file_picker: FilePicker::default(),
+            symbol_picker: SymbolPicker::default(),
             completion: completion::Popup::default(),
             completion_version: None,
             lsp: editor_lsp::session::Lsp::default(),
@@ -1401,6 +1409,107 @@ impl EditorApp {
             .apply(&editor_core::edit::Transaction::new(edits), before, before);
         entry.doc.break_undo_run();
         entry.view.set_caret(before.head.min(entry.doc.len_chars()));
+    }
+
+    /// Ctrl+Shift+O: list what this file declares.
+    ///
+    /// From the parse tree rather than from a language server, so it works with
+    /// nothing installed — the same choice as Go to Definition and Find Uses.
+    fn open_symbol_picker(&mut self) {
+        let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) else {
+            self.info("Open a file first");
+            return;
+        };
+        let Some(tree) = entry.highlighter.as_ref().and_then(|h| h.tree()) else {
+            self.info("No outline: this file has no grammar");
+            return;
+        };
+        let symbols = editor_syntax::symbols::outline(tree, entry.doc.text());
+        if symbols.is_empty() {
+            self.info("Nothing is declared in this file");
+            return;
+        }
+        self.symbol_picker.open(symbols);
+    }
+
+    /// Select `range` in the active document and scroll it into view.
+    fn reveal_in_active(&mut self, range: std::ops::Range<usize>) {
+        if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
+            let end = range.end.min(entry.doc.len_chars());
+            entry.view.select_range(range.start.min(end), end);
+            entry.view.focus();
+        }
+    }
+
+    /// The interpreter the packages panel and the runner should use.
+    fn interpreter(&self) -> Option<editor_proc::interpreter::Interpreter> {
+        editor_proc::interpreter::resolve(&self.settings.python_interpreter(), self.tree.root())
+    }
+
+    /// Ask pip what is installed, if there is an interpreter to ask.
+    fn refresh_packages(&mut self) {
+        match self.interpreter() {
+            Some(interpreter) => self.packages.refresh(&interpreter.path),
+            None => self.info("Select a Python interpreter first"),
+        }
+    }
+
+    /// Carry out what the packages panel asked for.
+    ///
+    /// Installs and removals go to the console, which is where the user can
+    /// read pip's own account of what happened. The listing is refreshed when
+    /// that run finishes rather than immediately, because pip has not done
+    /// anything yet.
+    fn apply_packages_action(&mut self, action: crate::packages_panel::Action) {
+        use crate::packages_panel::Action;
+        match action {
+            Action::None => {}
+            Action::Run(change) => {
+                let Some(interpreter) = self.interpreter() else {
+                    self.info("Select a Python interpreter first");
+                    return;
+                };
+                let cwd = self
+                    .tree
+                    .root()
+                    .map(Path::to_path_buf)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let config = editor_proc::packages::command(&interpreter.path, &cwd, &change);
+                self.dock = DockTab::Output;
+                self.show_output = true;
+                if let Err(e) = self.runner.start(config, true) {
+                    self.error(format!("{e:#}"));
+                }
+            }
+            Action::Freeze => self.freeze_requirements(),
+            Action::OpenRequirements => {
+                if let Some(path) = crate::packages_panel::requirements_file(self.tree.root()) {
+                    self.open_path(&path, false);
+                }
+            }
+        }
+    }
+
+    /// Write `pip freeze` to the project's requirements file.
+    fn freeze_requirements(&mut self) {
+        let Some(interpreter) = self.interpreter() else {
+            self.info("Select a Python interpreter first");
+            return;
+        };
+        let Some(root) = self.tree.root().map(Path::to_path_buf) else {
+            self.info("Open a folder first: there is nowhere to write the file");
+            return;
+        };
+        let path = root.join("requirements.txt");
+        match editor_proc::packages::freeze_to(&interpreter.path, &path) {
+            Ok(count) => {
+                self.tree.refresh();
+                self.sync_watched_files();
+                self.info(format!("Wrote {count} requirements to requirements.txt"));
+            }
+            Err(e) => self.error(format!("Could not freeze: {e}")),
+        }
     }
 
     /// Open a shell in the project, if one is not already running.
@@ -3560,6 +3669,12 @@ impl EditorApp {
                 self.show_output = true;
                 self.open_terminal();
             }
+            CommandId::ShowPackages => {
+                self.dock = DockTab::Packages;
+                self.show_output = true;
+                self.packages.opened();
+                self.refresh_packages();
+            }
             CommandId::FindInProject => {
                 self.dock = DockTab::Search;
                 self.show_output = true;
@@ -3581,6 +3696,7 @@ impl EditorApp {
                 self.ask_about_symbol(editor_lsp::session::Query::References);
             }
             CommandId::RenameSymbol => self.begin_rename(),
+            CommandId::GoToSymbol => self.open_symbol_picker(),
             CommandId::AddCursorAtNextMatch => {
                 let added = self
                     .active_mut()
@@ -4387,7 +4503,8 @@ impl eframe::App for EditorApp {
         // as modal blocked every other shortcut in the application -- Ctrl+F,
         // Ctrl+S, F5 -- for as long as a suggestion was on screen, which while
         // typing is most of the time.
-        let modal_open = self.first_run
+        let modal_open = self.symbol_picker.is_open()
+            || self.first_run
             || !self.recovered.is_empty()
             || self.rename.is_some()
             || self.file_picker.is_open()
@@ -4454,6 +4571,14 @@ impl eframe::App for EditorApp {
             let mut debug_action = debugger::Action::None;
             let mut search_action = crate::project_search::Action::None;
             let mut start_terminal = false;
+            let mut open_packages = false;
+            let mut packages_action = crate::packages_panel::Action::None;
+            // Read before the closure borrows self for the panel.
+            let python = self
+                .interpreter()
+                .map(|i| i.path)
+                .filter(|_| self.dock == DockTab::Packages);
+            let requirements = crate::packages_panel::requirements_file(self.tree.root());
             // Read before the closure borrows self for the panel.
             let terminal_cwd = self.tree.root().map(Path::to_path_buf);
             let mut problem_clicked = None;
@@ -4527,6 +4652,13 @@ impl eframe::App for EditorApp {
                             self.dock = DockTab::Terminal;
                             start_terminal = true;
                         }
+                        if ui
+                            .selectable_label(self.dock == DockTab::Packages, "PACKAGES")
+                            .clicked()
+                        {
+                            self.dock = DockTab::Packages;
+                            open_packages = true;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
                                 self.show_output = false;
@@ -4543,6 +4675,11 @@ impl eframe::App for EditorApp {
                             let cwd = terminal_cwd.clone();
                             start_terminal |= self.terminal.ui(ui, cwd.as_deref());
                         }
+                        DockTab::Packages => {
+                            packages_action =
+                                self.packages
+                                    .ui(ui, python.as_deref(), requirements.as_deref());
+                        }
                         DockTab::Debug => {
                             let running = self.debug.is_some();
                             let paused = self
@@ -4557,6 +4694,11 @@ impl eframe::App for EditorApp {
             if start_terminal {
                 self.open_terminal();
             }
+            if open_packages {
+                self.packages.opened();
+                self.refresh_packages();
+            }
+            self.apply_packages_action(packages_action);
 
             match search_action {
                 crate::project_search::Action::None => {}
@@ -4615,6 +4757,9 @@ impl eframe::App for EditorApp {
         self.toolchains_window(&ctx);
         self.settings_form_ui(&ctx);
         self.recovery_prompt(&ctx);
+        if let Some(range) = self.symbol_picker.ui(&ctx) {
+            self.reveal_in_active(range);
+        }
         self.first_run_ui(&ctx);
         self.manual.ui(&ctx, "user_manual", "User Manual", MANUAL);
         self.licences
@@ -4631,6 +4776,11 @@ impl eframe::App for EditorApp {
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
         self.search.poll();
+        if self.packages.poll() {
+            // pip's update check talks to the network and takes seconds; keep
+            // the loop turning gently rather than spinning on it.
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
         if self.terminal.poll() {
             // A shell produces output between frames; keep the loop
             // turning while it does, and stop when it goes quiet.
@@ -5196,6 +5346,8 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::FindUses),
             MenuEntry::Item(CommandId::RenameSymbol),
             MenuEntry::Item(CommandId::AddCursorAtNextMatch),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::GoToSymbol),
             MenuEntry::Item(CommandId::NextUse),
             MenuEntry::Item(CommandId::PreviousUse),
         ],
@@ -5241,6 +5393,8 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
         "Tools",
         &[
             MenuEntry::Item(CommandId::CommandPalette),
+            MenuEntry::Separator,
+            MenuEntry::Item(CommandId::ShowPackages),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::OpenSettings),
         ],

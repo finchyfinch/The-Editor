@@ -855,7 +855,7 @@ Linux or macOS, which remains the single largest piece of unknown work.
 
 | # | Milestone | State | What is missing |
 |---|---|---|---|
-| M1 | Shell & layout | Substantially done | Tab drag-reorder and overflow dropdown; Ctrl+Tab most-recently-used cycling; native macOS menu bar via `muda` |
+| M1 | Shell & layout | Substantially done | Native macOS menu bar via `muda`. Tab overflow and most-recently-used Ctrl+Tab cycling are done. |
 | M2 | Editor core | **Done** | — |
 | M3 | Syntax highlighting | Done for 9 languages | HTML injections (embedded `<script>`/`<style>`); shebang and manual language override; the user-editable TOML theme format |
 | M4 | Editing intelligence | Indent engine done | `.editorconfig`; trim-trailing-whitespace and final-newline on save; re-indent on paste; bracket-match highlighting; code folding |
@@ -914,18 +914,37 @@ Measured against PyCharm and VS Code rather than against §3. None of these were
 considered when the plan was written; several are more valuable than things
 that were.
 
+**Since built**, and struck from this list: the integrated terminal, rename and
+refactor, crash-recovery autosave, and the accessibility pass. Two more that
+appeared here in an earlier revision turned out to exist already —
+most-recently-used Ctrl+Tab cycling and tab overflow — which is its own lesson
+about reviewing from memory rather than from the code.
+
 | | Why it matters | Rough size |
 |---|---|---|
-| **Version control** | The largest omission by a distance. Change markers in the gutter, a diff view, blame, staging and committing, branch switching. "Not using GitHub" removes the *hosting*, not git — and after editing, this is the thing an IDE is used for most. | 3–4 wk |
-| **Integrated terminal** | The run console is a PTY already, so a general shell in the same dock is mostly UI. Currently every `pip install`, `git commit` or `pytest -k` means leaving the editor. | 1 wk |
-| **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. A headline PyCharm feature for Python and the natural partner to the debugger just built. | 2–3 wk |
-| **Rename / refactor** | `textDocument/rename` across the project. The request machinery exists and is unused. Renaming by find-and-replace is how people break code. | 1 wk |
-| **Autosave and local history** | The panic hook has an emergency-save scaffold that nothing fills. PyCharm's local history rescues people weekly; we can currently lose an unsaved buffer to a crash. | 1–1.5 wk |
+| **Version control** | Still the largest omission by a distance, and now the one everything else waits behind. There is no git support at all: the only mentions of it in the codebase are ignore lists. Change markers in the gutter, a diff view, blame, staging and committing, branch switching. "Not using GitHub" removes the *hosting*, not git. It is also the prerequisite for reviewing what a coding agent changed, and for the local history that crash recovery only half covers. Start with the read-only half — gutter markers and a diff view — which is about a third of the work and most of the daily value. | 3–4 wk |
+| **Package and requirements management** | Show what is installed and at what version, what is out of date, install, upgrade, remove; freeze to `requirements.txt` and keep it in step. The venv dialog can already install *from* a requirements file but cannot produce one. Everything runs through the existing PTY console, so it is a table and four pip commands rather than new machinery. | 1–1.5 wk |
+| **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. "Run Tests" currently just runs the open file. A headline PyCharm feature for Python and the natural partner to the debugger. | 2–3 wk |
+| **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
+| **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |
+| **Outline / breadcrumbs / go to symbol** | `documentSymbol` gives all three. Navigating a 3,000-line file is currently scrolling. | 0.5 wk |
+| **Code folding** | The ranges are already computed in `syntax::brackets::fold_ranges` and thrown away — nothing calls it. Gutter chevrons and hiding the folded lines is the whole job. | 2 d |
 | **Auto-import** | Type `Path`, get `from pathlib import Path`. High value in Python specifically, and a code action the servers already offer. | 1 wk |
-| **Split panes** | Two files side by side, or two places in one file. Structural — the editor pane assumes a single active document — so best done before more is built on that assumption. | 1.5–2 wk |
-| **Outline / breadcrumbs** | `documentSymbol` gives a structure view and a breadcrumb bar for free. Navigating a 3,000-line file is currently scrolling. | 0.5 wk |
-| **Accessibility** | The editor is a custom widget that reports nothing to a screen reader. egui supports AccessKit; we have never wired it. Retrofitting this later is far harder than doing it now, and §3.11 only ever covered colour. | 1–2 wk |
+| **Split panes** | Two files side by side, or two places in one file. Structural — the editor pane assumes a single active document — so cheaper now than after more is built on that assumption. | 1.5–2 wk |
 | **Diff / merge viewer** | Needed by version control, and useful on its own for comparing two files. | 1 wk |
+| **A project-wide "changed on disk" signal** | The reload bar only appears for the *active* tab, so a tool that rewrites a dozen files is discovered one tab at a time as you switch between them. A count in the status bar and a "reload all unmodified" action. Small, and it is what makes working alongside a coding agent bearable. | 1 d |
+
+#### On coding-agent integration
+
+Claude Code and its like are command-line tools, and the integrated terminal
+already runs them in the project with the virtual environment on `PATH`. When
+one of them edits a file the watcher notices and offers to reload it, which is
+the half that matters and works today.
+
+What is missing is not a chat panel — that would duplicate a working CLI and
+tie the editor to one vendor's interface. It is being able to see what an agent
+changed and undo part of it, which is version control, plus the project-wide
+change signal above. Both are already on this list on their own merits.
 
 Deliberately out of scope, recorded so the decision is not re-litigated: remote
 development over SSH or containers, Jupyter notebooks, database tools, and

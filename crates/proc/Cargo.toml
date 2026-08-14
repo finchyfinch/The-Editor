@@ -11,6 +11,9 @@ description = "Child process and PTY management, run configurations, ANSI and ou
 [dependencies]
 anyhow.workspace = true
 portable-pty = "0.9.0"
+# Reading pip's --format=json listings.
+serde = { workspace = true }
+serde_json = "1.0.151"
 shell-words = "1.1.1"
 vte = "0.15.0"
 

@@ -58,6 +58,7 @@ A few that are worth knowing about:
 | `Ctrl+Shift+D` | Duplicate the line |
 | `Ctrl+Shift+K` | Delete the line |
 | `Alt+Up` / `Alt+Down` | Move the line up or down |
+| `Ctrl+R` | Go to a symbol in this file |
 | `Ctrl+F` | Find, in this file |
 | `Ctrl+Shift+F` | Find across the project |
 | `F12` | Go to the definition |
@@ -147,6 +148,18 @@ one of them is noisier than it is helpful on a particular project.
 **Completion** appears as you type, and on `Ctrl+Space`. With no server running
 it falls back to the words already in the file, which is less clever and still
 better than nothing.
+
+### Packages
+
+**Tools > Packages** lists what is installed in the project's environment, with
+its version and — once pip has finished asking — whichever have a newer
+release. Install by name, upgrade or remove a package, and freeze everything to
+`requirements.txt`. Every change runs in the Output panel so you see pip work
+and read its own errors rather than a summary of them.
+
+The update check talks to the network and can take twenty seconds on a large
+environment. The installed list appears immediately and the newer versions fill
+in when they arrive.
 
 ### Virtual environments
 

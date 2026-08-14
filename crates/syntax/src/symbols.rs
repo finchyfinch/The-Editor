@@ -226,6 +226,87 @@ pub fn identifiers(tree: &Tree, text: &Rope, skip: Option<Range<usize>>) -> Vec<
 }
 
 /// What kind of thing this identifier names, from the node that defines it.
+/// One entry in a file's outline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outline {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// Where the name itself is, so jumping to it puts the caret on the name
+    /// rather than on the `def` keyword before it.
+    pub range: Range<usize>,
+    /// How deeply nested the declaration is, for indenting the list. A method
+    /// inside a class is 1; a function inside that is 2.
+    pub depth: usize,
+}
+
+/// Every declaration in the file, in the order they appear.
+///
+/// Functions, classes and modules only. A `documentSymbol` request would also
+/// return constants and fields; those are the entries that make an outline
+/// long enough that nobody reads it, and the reason to open one is almost
+/// always to reach a function.
+///
+/// Nesting is counted from the declarations themselves rather than from
+/// indentation, so it is right in a brace language and right in Python without
+/// two rules.
+#[must_use]
+pub fn outline(tree: &Tree, text: &Rope) -> Vec<Outline> {
+    let mut found = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    walk_outline(&mut cursor, text, 0, &mut found);
+    found.sort_by_key(|o| o.range.start);
+    found
+}
+
+fn walk_outline(
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    text: &Rope,
+    depth: usize,
+    found: &mut Vec<Outline>,
+) {
+    let node = cursor.node();
+    // A declaration's own name node, when it has one worth listing.
+    let listed = introduces_a_name(node.kind())
+        .then(|| node.child_by_field_name("name"))
+        .flatten()
+        .map(|name| (name, declaration_kind(node.kind())))
+        .filter(|(_, kind)| *kind != SymbolKind::Unknown);
+
+    let mut child_depth = depth;
+    if let Some((name, kind)) = listed {
+        let range = byte_range_to_chars(text, name.start_byte(), name.end_byte());
+        found.push(Outline {
+            name: text.slice(range.clone()).chars().collect(),
+            kind,
+            range,
+            depth,
+        });
+        child_depth = depth + 1;
+    }
+
+    if cursor.goto_first_child() {
+        loop {
+            walk_outline(cursor, text, child_depth, found);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
+    }
+}
+
+/// The kind of thing a declaration node declares, or `Unknown` for the ones an
+/// outline should leave out.
+fn declaration_kind(kind: &str) -> SymbolKind {
+    match kind {
+        "function_definition" | "function_item" | "function_signature_item" => SymbolKind::Function,
+        "class_definition" | "struct_item" | "enum_item" | "trait_item" | "union_item"
+        | "impl_item" => SymbolKind::Class,
+        "mod_item" => SymbolKind::Module,
+        _ => SymbolKind::Unknown,
+    }
+}
+
 fn kind_of(node: Node<'_>) -> SymbolKind {
     if !defines(node) {
         return SymbolKind::Unknown;
@@ -627,5 +708,75 @@ yy = 2
         with_tree(LanguageId::Python, source, |tree, text| {
             assert_eq!(definitions(tree, text, "parse").len(), 1);
         });
+    }
+
+    fn outline_of(language: crate::LanguageId, source: &str) -> Vec<Outline> {
+        let text = Rope::from_str(source);
+        let highlighter = crate::highlight::Highlighter::new(language, &text).expect("grammar");
+        let tree = highlighter.tree().expect("tree").clone();
+        outline(&tree, &text)
+    }
+
+    #[test]
+    fn a_python_outline_lists_classes_and_their_methods_in_order() {
+        let got = outline_of(
+            crate::LanguageId::Python,
+            "import os\n\n\nclass Widget:\n    def __init__(self):\n        pass\n\n    \
+             def scaled(self, f):\n        def helper():\n            pass\n        \
+             return helper\n\n\ndef main():\n    pass\n",
+        );
+        let names: Vec<&str> = got.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Widget", "__init__", "scaled", "helper", "main"],
+            "in the order they appear"
+        );
+
+        assert_eq!(got[0].kind, SymbolKind::Class);
+        assert_eq!(got[1].kind, SymbolKind::Function);
+        // Depth is counted from the declarations, not from indentation.
+        assert_eq!(got[0].depth, 0, "the class is top level");
+        assert_eq!(got[1].depth, 1, "a method is inside it");
+        assert_eq!(got[3].depth, 2, "a function inside a method");
+        assert_eq!(got[4].depth, 0, "and back out again");
+    }
+
+    #[test]
+    fn a_rust_outline_lists_items() {
+        let got = outline_of(
+            crate::LanguageId::Rust,
+            "struct Widget {\n    size: u32,\n}\n\nimpl Widget {\n    \
+             fn scaled(&self) -> u32 {\n        self.size\n    }\n}\n\nfn main() {}\n",
+        );
+        let names: Vec<&str> = got.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"Widget"), "got {names:?}");
+        assert!(names.contains(&"scaled"), "got {names:?}");
+        assert!(names.contains(&"main"), "got {names:?}");
+    }
+
+    /// The range points at the name, so jumping lands the caret on it rather
+    /// than on the keyword before it.
+    #[test]
+    fn the_range_covers_the_name_itself() {
+        let source = "def greet():\n    pass\n";
+        let got = outline_of(crate::LanguageId::Python, source);
+        assert_eq!(got.len(), 1);
+        assert_eq!(&source[got[0].range.clone()], "greet");
+    }
+
+    /// Constants and fields are what make an outline too long to read.
+    #[test]
+    fn variables_and_fields_are_left_out() {
+        let got = outline_of(
+            crate::LanguageId::Python,
+            "TOTAL = 1\n\nclass A:\n    size = 0\n\n    def f(self):\n        x = 2\n",
+        );
+        let names: Vec<&str> = got.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["A", "f"], "got {names:?}");
+    }
+
+    #[test]
+    fn a_file_with_no_declarations_has_an_empty_outline() {
+        assert!(outline_of(crate::LanguageId::Python, "x = 1\ny = 2\n").is_empty());
     }
 }

@@ -49,6 +49,7 @@ pub(crate) enum CommandId {
     MoveLineUp,
     MoveLineDown,
     GoToFile,
+    GoToSymbol,
     TriggerCompletion,
     GoToDefinition,
     FindUses,
@@ -69,6 +70,7 @@ pub(crate) enum CommandId {
     DebugStepOut,
     ShowOutput,
     ShowTerminal,
+    ShowPackages,
     ShowProblems,
     SelectInterpreter,
     CreateVenv,
@@ -129,6 +131,7 @@ impl CommandId {
         Self::MoveLineUp,
         Self::MoveLineDown,
         Self::GoToFile,
+        Self::GoToSymbol,
         Self::TriggerCompletion,
         Self::GoToDefinition,
         Self::FindUses,
@@ -148,6 +151,7 @@ impl CommandId {
         Self::DebugStepOut,
         Self::ShowOutput,
         Self::ShowTerminal,
+        Self::ShowPackages,
         Self::ShowProblems,
         Self::SelectInterpreter,
         Self::CreateVenv,
@@ -354,6 +358,10 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         Some(alt(Key::ArrowDown)),
     ),
     cmd(CommandId::GoToFile, "File", "Go to File", ctrl(Key::P)),
+    // Ctrl+R, as Sublime Text has it. Ctrl+Shift+O, which is VS Code's, is
+    // already Open Folder here and that is the more frequently reached for of
+    // the two.
+    cmd(CommandId::GoToSymbol, "Edit", "Go to Symbol", ctrl(Key::R)),
     cmd(
         CommandId::TriggerCompletion,
         "Edit",
@@ -403,6 +411,7 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Terminal",
         Some(KeyboardShortcut::new(Modifiers::COMMAND, Key::Backtick)),
     ),
+    cmd(CommandId::ShowPackages, "Tools", "Packages", None),
     // The bindings every debugger uses, except for start: F5 is already Run,
     // and quietly changing what F5 does depending on state would be worse than
     // a second key. Alt+F5 both starts and continues, which is one idea.
