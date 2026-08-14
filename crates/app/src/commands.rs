@@ -50,6 +50,9 @@ pub(crate) enum CommandId {
     MoveLineDown,
     GoToFile,
     GoToSymbol,
+    ToggleFold,
+    FoldAll,
+    UnfoldAll,
     TriggerCompletion,
     GoToDefinition,
     FindUses,
@@ -132,6 +135,9 @@ impl CommandId {
         Self::MoveLineDown,
         Self::GoToFile,
         Self::GoToSymbol,
+        Self::ToggleFold,
+        Self::FoldAll,
+        Self::UnfoldAll,
         Self::TriggerCompletion,
         Self::GoToDefinition,
         Self::FindUses,
@@ -362,6 +368,25 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
     // already Open Folder here and that is the more frequently reached for of
     // the two.
     cmd(CommandId::GoToSymbol, "Edit", "Go to Symbol", ctrl(Key::R)),
+    // The three VS Code uses, which are also PyCharm's on Windows.
+    cmd(
+        CommandId::ToggleFold,
+        "View",
+        "Toggle Fold",
+        ctrl_shift(Key::OpenBracket),
+    ),
+    cmd(
+        CommandId::FoldAll,
+        "View",
+        "Fold All",
+        ctrl_shift(Key::Minus),
+    ),
+    cmd(
+        CommandId::UnfoldAll,
+        "View",
+        "Unfold All",
+        ctrl_shift(Key::Plus),
+    ),
     cmd(
         CommandId::TriggerCompletion,
         "Edit",

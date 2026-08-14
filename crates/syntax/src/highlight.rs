@@ -214,7 +214,7 @@ impl Highlighter {
         match changes {
             [] => {}
             [change] => t.apply_change(change, text),
-            _ => t.parse_within(text, TYPING_BUDGET),
+            _ => t.reparse_within(text, TYPING_BUDGET),
         }
     }
 
@@ -224,8 +224,7 @@ impl Highlighter {
     /// reload that came out half-highlighted would stay that way.
     pub fn refresh(&mut self, text: &Rope) {
         if let Self::Tree(t) = self {
-            t.tree = None;
-            t.parse_within(text, IDLE_BUDGET);
+            t.reparse_within(text, IDLE_BUDGET);
         }
     }
 
@@ -302,6 +301,22 @@ impl TreeHighlighter {
     /// an edited tree still reports positions that line up with the text, so
     /// the colours lag by a keystroke, whereas no tree at all means no colours,
     /// no bracket matching and no structure until the next successful parse.
+    /// Parse the whole text again, reusing nothing.
+    ///
+    /// The old tree has to be *discarded*, not merely ignored. `parse_within`
+    /// hands whatever is in `self.tree` to tree-sitter as the tree to reuse,
+    /// and a tree that has not had `edit` applied to it says "nothing changed"
+    /// — so the parser reuses all of it and returns a tree describing the text
+    /// as it was. That is what happened to every multi-edit transaction
+    /// (multi-cursor typing, replace-all, a rename applied across files)
+    /// between the parse-budget change and this one: the highlighting, the
+    /// bracket matching, the syntax errors and the outline were all reading a
+    /// tree for text that no longer existed.
+    fn reparse_within(&mut self, text: &Rope, budget: Duration) {
+        self.tree = None;
+        self.parse_within(text, budget);
+    }
+
     fn parse_within(&mut self, text: &Rope, budget: Duration) {
         let deadline = Instant::now() + budget;
         // Called by tree-sitter as it works; the only thing it can do is say
@@ -922,5 +937,52 @@ mod tests {
         let mut ini = Highlighter::Ini;
         assert!(!ini.is_stale());
         assert!(!ini.catch_up(&Rope::from_str("[a]\nb = 1\n")));
+    }
+
+    /// A multi-edit transaction — multi-cursor typing, a replace-all, a rename
+    /// applied across a file — must leave a tree describing the text as it now
+    /// is.
+    ///
+    /// This is a regression test with a story. `update` used to hand its full
+    /// reparse the existing tree as the one to reuse, and a tree that has not
+    /// had `edit` applied says "nothing changed", so tree-sitter reused all of
+    /// it and returned a tree for the old text. Everything downstream — the
+    /// colours, the bracket match, the syntax errors, the outline — then
+    /// described a file that was no longer there, silently.
+    #[test]
+    fn a_multi_edit_transaction_leaves_a_tree_for_the_new_text() {
+        use editor_core::edit::{Change, Edit, Transaction};
+
+        let before = "def a():\n    pass\n";
+        let mut text = Rope::from_str(before);
+        let mut highlighter =
+            Highlighter::new(LanguageId::Python, &text).expect("Python has a grammar");
+        assert_eq!(
+            crate::symbols::outline(highlighter.tree().expect("a tree"), &text).len(),
+            1
+        );
+
+        // Two edits at once, as multi-cursor produces: rename `a` and add a
+        // second definition.
+        let tx = Transaction::new(vec![
+            Edit::replace(4..5, "renamed".to_owned()),
+            Edit::insert(
+                before.chars().count(),
+                "\n\ndef b():\n    pass\n".to_owned(),
+            ),
+        ]);
+        let applied = editor_core::edit::apply(&mut text, &tx);
+        assert!(applied.changes.len() > 1, "this test needs a multi-edit");
+
+        let changes: Vec<Change> = applied.changes;
+        highlighter.update(&changes, &text);
+
+        let outline = crate::symbols::outline(highlighter.tree().expect("a tree"), &text);
+        let names: Vec<&str> = outline.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["renamed", "b"],
+            "the tree must describe the text as it is now"
+        );
     }
 }

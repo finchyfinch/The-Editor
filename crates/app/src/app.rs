@@ -3697,6 +3697,28 @@ impl EditorApp {
             }
             CommandId::RenameSymbol => self.begin_rename(),
             CommandId::GoToSymbol => self.open_symbol_picker(),
+            CommandId::ToggleFold => {
+                let folded = self
+                    .active
+                    .and_then(|i| self.docs.get_mut(i))
+                    .is_some_and(|entry| entry.view.toggle_fold_at_caret(&entry.doc));
+                if !folded {
+                    self.info("Nothing to fold here");
+                }
+            }
+            CommandId::FoldAll | CommandId::UnfoldAll => {
+                let collapse = id == CommandId::FoldAll;
+                let changed = self
+                    .active_mut()
+                    .is_some_and(|entry| entry.view.fold_all(collapse));
+                if !changed {
+                    self.info(if collapse {
+                        "Nothing to fold in this file"
+                    } else {
+                        "Nothing is folded"
+                    });
+                }
+            }
             CommandId::AddCursorAtNextMatch => {
                 let added = self
                     .active_mut()
@@ -5355,6 +5377,10 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
     (
         "View",
         &[
+            MenuEntry::Item(CommandId::ToggleFold),
+            MenuEntry::Item(CommandId::FoldAll),
+            MenuEntry::Item(CommandId::UnfoldAll),
+            MenuEntry::Separator,
             MenuEntry::Item(CommandId::ToggleExplorer),
             MenuEntry::Item(CommandId::ShowOutput),
             MenuEntry::Item(CommandId::ShowTerminal),

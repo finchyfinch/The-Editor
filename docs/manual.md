@@ -59,6 +59,7 @@ A few that are worth knowing about:
 | `Ctrl+Shift+K` | Delete the line |
 | `Alt+Up` / `Alt+Down` | Move the line up or down |
 | `Ctrl+R` | Go to a symbol in this file |
+| `Ctrl+Shift+[` | Fold or unfold the block around the caret |
 | `Ctrl+F` | Find, in this file |
 | `Ctrl+Shift+F` | Find across the project |
 | `F12` | Go to the definition |
@@ -79,6 +80,12 @@ than the text — a variable called `id` will not take the `id` out of
 `identity`. It needs the file saved first, because the server reads from disk.
 There is no find-and-replace fallback: that is how the wrong things get
 renamed.
+
+**Folding.** A chevron appears beside every line that opens something
+foldable — a class, a function, an `if`. Click it, or press `Ctrl+Shift+[` to
+fold whatever the caret is inside. **View > Fold All** and **Unfold All** do
+the whole file. Folds follow their code as you edit above them, and a fold
+whose code is deleted goes with it.
 
 ### When a file changes underneath you
 

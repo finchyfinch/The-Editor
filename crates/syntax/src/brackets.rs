@@ -107,12 +107,17 @@ fn ends_are_brackets(node: &Node<'_>, text: &Rope) -> Option<BracketPair> {
 /// is a function body, a block, an object, an element, without naming any of
 /// them.
 ///
-/// Two refinements, both learned by looking at the output. The root is
+/// Three refinements, all learned by looking at the output. The root is
 /// excluded, or the first line of every file offers to fold the whole file
-/// away. And where several nodes start on one line the *narrowest* wins: a
-/// `def` line begins both the definition and, in Python, the body block that
-/// runs past the end of the `if` inside it, and folding at `if True:` should
+/// away. Where several nodes start on one line the *narrowest* wins: a `def`
+/// line begins both the definition and, in Python, the body block that runs
+/// past the end of the `if` inside it, and folding at `if True:` should
 /// collapse the `if`, not everything after it.
+///
+/// And Python's `block` is skipped, because it is the body of the `def` or
+/// `if` above it and starts on the body's first statement: folding it would
+/// leave a chevron beside `x = 1` and hide only what came after. Fold the
+/// header instead.
 #[must_use]
 pub fn fold_ranges(tree: &Tree, text: &Rope) -> Vec<FoldRange> {
     let mut found: Vec<FoldRange> = Vec::new();
@@ -127,7 +132,19 @@ pub fn fold_ranges(tree: &Tree, text: &Rope) -> Vec<FoldRange> {
         let first = text.char_to_line(start.min(text.len_chars()));
         let last = text.char_to_line(end.saturating_sub(1).min(text.len_chars()));
 
-        if last > first && node.child_count() > 0 && node.id() != root {
+        // Python's `block` is the body of the `def`, `if` or `for` above it,
+        // and it starts on the body's first statement rather than on the
+        // header. Folding it would put a chevron beside `x = 1` and hide only
+        // what came after, so the header is the fold anyone means.
+        //
+        // Named rather than inferred. The obvious inference — "starts after
+        // its parent and ends with it" — is wrong, because the *last* child of
+        // any block also ends where the block ends: it dropped the fold for
+        // every final method in a class. In Rust a `block` shares its header's
+        // line and is deduplicated anyway, so naming it costs nothing there.
+        let is_a_body = node.kind() == "block";
+
+        if last > first && node.child_count() > 0 && node.id() != root && !is_a_body {
             found.push(FoldRange { first, last });
         }
 

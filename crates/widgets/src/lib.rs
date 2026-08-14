@@ -13,6 +13,7 @@ pub mod console;
 pub mod editor_view;
 pub mod file_tree;
 pub mod find_bar;
+mod folding;
 pub mod icon;
 pub mod tab_bar;
 pub mod theme;

@@ -100,9 +100,26 @@ pub struct EditorView {
     /// Where an Alt+drag column selection started. Kept because the first frame
     /// of the drag overwrites the selection it began from.
     column_anchor: Option<usize>,
-    /// Copied from the options each frame, because  is called from
+    /// Copied from the options each frame, because `blink_on` is called from
     /// the paint pass where the options are no longer to hand.
     reduce_motion: bool,
+    /// First lines of the folds that are currently closed.
+    ///
+    /// Identified by line rather than by node: the tree is rebuilt on every
+    /// edit and its node ids with it, so anything held across an edit has to
+    /// be a position.
+    collapsed: std::collections::BTreeSet<usize>,
+    /// Every foldable range, recomputed when the document changes.
+    folds: Vec<editor_syntax::brackets::FoldRange>,
+    /// Document version `folds` was computed from, so the tree is walked on
+    /// edits rather than on frames.
+    folds_version: Option<u64>,
+    /// Line count as of the last rebuild, so collapsed folds can be moved with
+    /// the lines they were put on.
+    folds_line_count: usize,
+    /// Which line each visible row shows. The identity while nothing is
+    /// folded, which is almost always.
+    fold_map: crate::folding::FoldMap,
     /// Column the caret is "trying" to be in while moving vertically, so that
     /// crossing a short line and coming back returns to the original column
     /// instead of clinging to the short line's end.
@@ -518,13 +535,23 @@ impl EditorView {
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
         let space_width = ui.fonts_mut(|f| f.glyph_width(&font, ' '));
         let line_count = doc.text().len_lines();
+        self.sync_folds(doc, highlighter.as_deref());
+        // Rows, not lines, from here on. The two are the same number unless
+        // something is folded.
+        let row_count = self.fold_map.visible_rows();
 
         // A column of its own for breakpoints, at the very left. Drawing them
         // over the line numbers -- which is what happened first -- makes them
         // invisible against the digits, so a breakpoint appeared not to have
         // been set at all.
         let breakpoint_width = row_height;
+        // A column for the fold chevrons, between the line numbers and the
+        // text. Always reserved, even in a file with nothing to fold: a column
+        // that appears and disappears would shift the whole document sideways
+        // as you type.
+        let fold_width = row_height;
         let gutter_width = breakpoint_width
+            + fold_width
             + if opts.show_line_numbers {
                 space_width * (line_count.to_string().len() as f32 + 2.0) + 12.0
             } else {
@@ -553,7 +580,7 @@ impl EditorView {
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(
                         (gutter_width + widest).max(ui.available_width()),
-                        row_height * line_count as f32,
+                        row_height * row_count as f32,
                     ),
                     egui::Sense::click_and_drag(),
                 );
@@ -730,9 +757,21 @@ impl EditorView {
         // editor does it and the first thing anyone tries. Handled before the
         // caret moves, so the click does not also jump the caret to line 1.
         if response.clicked() && pos.x < rect.left() + row_height {
-            let line = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
+            let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
+            let line = self.fold_map.line_at(row);
             if line < doc.line_count() {
                 self.toggle_breakpoint = Some(line);
+            }
+            return false;
+        }
+
+        // The fold column sits at the right-hand edge of the gutter, just
+        // before the text.
+        if response.clicked() && pos.x >= text_left - row_height && pos.x < text_left {
+            let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
+            let line = self.fold_map.line_at(row);
+            if self.folds.iter().any(|f| f.first == line) {
+                self.toggle_fold(line);
             }
             return false;
         }
@@ -856,9 +895,8 @@ impl EditorView {
         text_left: f32,
         row_height: f32,
     ) -> usize {
-        let line_count = doc.text().len_lines();
-        let line = (((pos.y - rect.top()) / row_height).floor().max(0.0) as usize)
-            .min(line_count.saturating_sub(1));
+        let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
+        let line = self.fold_map.line_at(row);
 
         // Lay the line out and ask the galley, rather than assuming every
         // glyph is one character wide.
@@ -1752,14 +1790,23 @@ impl EditorView {
             .saturating_sub(OVERSCAN_ROWS);
         let last = ((((visible.bottom() - rect.top()) / row_height).ceil() as usize)
             + OVERSCAN_ROWS)
-            .min(line_count);
+            .min(self.fold_map.visible_rows());
 
         // Highlight exactly the rows about to be painted, and nothing else.
         // This is where "cost tracks the viewport, not the file" is enforced.
+        //
+        // The byte range runs from the first visible line to the last. With a
+        // fold in between that also covers the hidden lines, which costs a
+        // little work and keeps the range contiguous -- asking for several
+        // disjoint ranges would cost more than the lines are worth.
         let spans = highlighter.map_or_else(Vec::new, |h| {
-            let from = doc.text().line_to_byte(first.min(line_count));
-            let to = doc.text().line_to_byte(last.min(line_count));
-            h.spans(doc.text(), from..to, syntax)
+            let from = doc
+                .text()
+                .line_to_byte(self.fold_map.line_at(first).min(line_count));
+            let to = doc
+                .text()
+                .line_to_byte(self.fold_map.line_at(last).min(line_count));
+            h.spans(doc.text(), from..to.max(from), syntax)
         });
 
         let painter = ui.painter_at(ui.clip_rect());
@@ -1777,7 +1824,7 @@ impl EditorView {
 
         // Current-line stripe, under everything else.
         if self.selection.is_empty() {
-            let y = rect.top() + caret_line as f32 * row_height;
+            let y = rect.top() + self.fold_map.row_at(caret_line) as f32 * row_height;
             painter.rect_filled(
                 egui::Rect::from_min_size(
                     egui::pos2(text_left, y),
@@ -1792,8 +1839,9 @@ impl EditorView {
         // it is unmistakable which is which.
         if let Some(line) = self.paused_line
             && line < doc.line_count()
+            && !self.fold_map.is_hidden(line)
         {
-            let y = rect.top() + line as f32 * row_height;
+            let y = rect.top() + self.fold_map.row_at(line) as f32 * row_height;
             painter.rect_filled(
                 egui::Rect::from_min_size(
                     egui::pos2(text_left, y),
@@ -1811,7 +1859,10 @@ impl EditorView {
             if *line < first || *line >= last {
                 continue;
             }
-            let y = rect.top() + *line as f32 * row_height + row_height / 2.0;
+            if self.fold_map.is_hidden(*line) {
+                continue;
+            }
+            let y = rect.top() + self.fold_map.row_at(*line) as f32 * row_height + row_height / 2.0;
             let centre = egui::pos2(rect.left() + row_height / 2.0, y);
             let radius = row_height * 0.26;
             let colour = egui::Color32::from_rgb(0xd0, 0x45, 0x45);
@@ -1828,8 +1879,9 @@ impl EditorView {
         let mut caret_rect = None;
         let mut extra_carets: Vec<egui::Rect> = Vec::new();
 
-        for line in first..last {
-            let y = rect.top() + line as f32 * row_height;
+        for row in first..last {
+            let line = self.fold_map.line_at(row);
+            let y = rect.top() + row as f32 * row_height;
             let line_start = doc.line_start(line);
             let text = doc.line_text(line);
 
@@ -1944,6 +1996,24 @@ impl EditorView {
                 }
             }
 
+            // A chevron for a line that opens a fold: pointing down when the
+            // fold is open, right when it is closed, which is the direction
+            // every file manager and outline view has used for decades.
+            if self.folds.iter().any(|f| f.first == line) {
+                let closed = self.collapsed.contains(&line);
+                painter.text(
+                    egui::pos2(text_left - row_height * 0.5, y + row_height / 2.0),
+                    egui::Align2::CENTER_CENTER,
+                    if closed { "\u{25b8}" } else { "\u{25be}" },
+                    font.clone(),
+                    if closed {
+                        visuals.strong_text_color()
+                    } else {
+                        visuals.weak_text_color()
+                    },
+                );
+            }
+
             if opts.show_line_numbers {
                 let is_caret_line = line == caret_line;
                 // A gutter glyph for the worst diagnostic on this line, so
@@ -2050,7 +2120,7 @@ impl EditorView {
             // the one case that needs scrolling was the one case that could not
             // ask for it, so jumping to a search match or a definition outside
             // the visible range moved the caret and left the view behind.
-            let y = rect.top() + caret_line as f32 * row_height;
+            let y = rect.top() + self.fold_map.row_at(caret_line) as f32 * row_height;
             let x = caret_rect.map_or(text_left, |r| r.left());
             let target = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1.5, row_height));
             // A couple of rows of context either side, so the target does not
@@ -2123,6 +2193,108 @@ impl EditorView {
                 node.set_read_only();
             }
         });
+    }
+
+    /// Recompute the foldable ranges when the document has changed, and keep
+    /// the collapsed set pointing at the right lines.
+    ///
+    /// Walking the tree is not free on a large file, so it happens on edits
+    /// rather than on frames — the version check is what makes folding cost
+    /// nothing while you are only scrolling.
+    fn sync_folds(&mut self, doc: &Document, highlighter: Option<&Highlighter>) {
+        let version = doc.version();
+        let line_count = doc.line_count();
+
+        if self.folds_version != Some(version) {
+            // Move the collapsed folds with the lines they were put on, before
+            // rebuilding against the new tree. Same approximation as the
+            // breakpoint gutter: derived from the change in line count rather
+            // than from the edit itself.
+            if self.folds_version.is_some() && line_count != self.folds_line_count {
+                let delta = line_count as isize - self.folds_line_count as isize;
+                let caret_line = doc.line_of(self.selection.head);
+                self.collapsed = crate::folding::shift(
+                    &self.collapsed,
+                    caret_line.saturating_sub(delta.unsigned_abs()),
+                    delta,
+                );
+            }
+            self.folds = highlighter
+                .and_then(Highlighter::tree)
+                .map(|tree| editor_syntax::brackets::fold_ranges(tree, doc.text()))
+                .unwrap_or_default();
+            // A fold whose header is no longer a fold has gone; keeping it
+            // would hide lines that nothing offers to unhide.
+            self.collapsed
+                .retain(|line| self.folds.iter().any(|f| f.first == *line));
+            self.folds_version = Some(version);
+            self.folds_line_count = line_count;
+            self.rebuild_fold_map(line_count);
+        } else if self.fold_map.visible_rows() > line_count
+            || (self.fold_map.is_identity() && !self.collapsed.is_empty())
+        {
+            // The document is the same but the map is not: a fold was toggled.
+            self.rebuild_fold_map(line_count);
+        }
+    }
+
+    fn rebuild_fold_map(&mut self, line_count: usize) {
+        self.fold_map = crate::folding::FoldMap::new(line_count, &self.folds, &self.collapsed);
+    }
+
+    /// Open or close the fold that starts at `line`.
+    fn toggle_fold(&mut self, line: usize) {
+        if !self.collapsed.remove(&line) {
+            self.collapsed.insert(line);
+        }
+        // Rebuilt now rather than next frame, so the click and the change land
+        // together.
+        let lines = self.folds_line_count;
+        self.rebuild_fold_map(lines);
+        self.touch();
+    }
+
+    /// Close every fold in the file, or open every one.
+    ///
+    /// Returns false when there was nothing to do, so the caller can say so.
+    pub fn fold_all(&mut self, collapse: bool) -> bool {
+        if self.folds.is_empty() {
+            return false;
+        }
+        let before = self.collapsed.len();
+        if collapse {
+            self.collapsed = self.folds.iter().map(|f| f.first).collect();
+        } else {
+            self.collapsed.clear();
+        }
+        if self.collapsed.len() == before {
+            return false;
+        }
+        let lines = self.folds_line_count;
+        self.rebuild_fold_map(lines);
+        self.touch();
+        true
+    }
+
+    /// Fold or unfold the innermost fold containing the caret.
+    ///
+    /// Returns false when the caret is not inside anything foldable.
+    pub fn toggle_fold_at_caret(&mut self, doc: &Document) -> bool {
+        let caret = doc.line_of(self.selection.head);
+        // Innermost: the fold that starts latest while still containing the
+        // caret. Folding the outermost would collapse the whole file from
+        // inside one function, which is never what was meant.
+        let Some(fold) = self
+            .folds
+            .iter()
+            .filter(|f| f.first <= caret && caret <= f.last)
+            .max_by_key(|f| f.first)
+        else {
+            return false;
+        };
+        let line = fold.first;
+        self.toggle_fold(line);
+        true
     }
 
     fn blink_on(&self) -> bool {
@@ -2492,6 +2664,130 @@ mod tests {
         view.type_text(&mut doc, python(), "(");
         assert!(view.undo(&mut doc));
         assert_eq!(doc.text().to_string(), "class A:\n    def greet");
+    }
+
+    // ---- folding ---------------------------------------------------------
+
+    /// Drive `sync_folds` the way `render` does, without a window.
+    fn with_folds(source: &str) -> (Document, EditorView, Highlighter) {
+        let doc = doc_with(source);
+        let highlighter =
+            Highlighter::new(LanguageId::Python, doc.text()).expect("Python has a grammar");
+        let mut view = EditorView::default();
+        view.sync_folds(&doc, Some(&highlighter));
+        (doc, view, highlighter)
+    }
+
+    const NESTED: &str =
+        "class A:\n    def f(self):\n        x = 1\n        y = 2\n\n\ndef g():\n    pass\n";
+
+    #[test]
+    fn a_file_with_structure_has_folds_and_starts_unfolded() {
+        let (doc, view, _h) = with_folds(NESTED);
+        assert!(!view.folds.is_empty(), "there is something to fold");
+        assert!(view.collapsed.is_empty());
+        assert!(view.fold_map.is_identity());
+        assert_eq!(view.fold_map.visible_rows(), doc.line_count());
+    }
+
+    #[test]
+    fn folding_at_the_caret_takes_the_innermost_fold() {
+        let (doc, mut view, _h) = with_folds(NESTED);
+        // Caret on `x = 1`, inside both the class and the method.
+        view.set_caret(doc.offset_at(2, 8));
+        assert!(view.toggle_fold_at_caret(&doc));
+
+        // The method, not the class: folding the outermost from inside one
+        // function would collapse the whole file.
+        let folded = *view.collapsed.iter().next().expect("something folded");
+        assert_eq!(folded, 1, "the `def f` line, not the `class A` line");
+        assert!(view.fold_map.is_hidden(2));
+        assert!(!view.fold_map.is_hidden(1), "the header stays visible");
+        assert!(!view.fold_map.is_hidden(6), "`def g` is untouched");
+    }
+
+    #[test]
+    fn toggling_twice_returns_to_where_it_started() {
+        let (doc, mut view, _h) = with_folds(NESTED);
+        let before = view.fold_map.visible_rows();
+        view.set_caret(doc.offset_at(2, 8));
+        assert!(view.toggle_fold_at_caret(&doc));
+        assert!(view.fold_map.visible_rows() < before);
+        assert!(view.toggle_fold_at_caret(&doc));
+        assert_eq!(view.fold_map.visible_rows(), before);
+        assert!(view.fold_map.is_identity());
+    }
+
+    #[test]
+    fn folding_all_and_unfolding_all_report_whether_anything_changed() {
+        let (_doc, mut view, _h) = with_folds(NESTED);
+        assert!(view.fold_all(true), "there was something to fold");
+        assert!(!view.fold_all(true), "and now there is not");
+        assert!(view.fold_all(false), "unfolding undoes it");
+        assert!(!view.fold_all(false), "and there is nothing left to unfold");
+        assert!(view.fold_map.is_identity());
+    }
+
+    #[test]
+    fn a_caret_outside_any_fold_reports_nothing_to_fold() {
+        let (doc, mut view, _h) = with_folds("x = 1\ny = 2\n");
+        view.set_caret(0);
+        assert!(!view.toggle_fold_at_caret(&doc));
+    }
+
+    /// The fold has to move with the lines it was put on, or an edit above it
+    /// silently collapses a different function.
+    #[test]
+    fn a_fold_moves_when_lines_are_inserted_above_it() {
+        let (mut doc, mut view, mut highlighter) = with_folds(NESTED);
+        view.set_caret(doc.offset_at(6, 0));
+        assert!(view.toggle_fold_at_caret(&doc), "fold `def g`");
+        assert_eq!(view.collapsed.iter().next().copied(), Some(6));
+
+        // Two blank lines at the very top, as typing above would produce.
+        view.set_caret(0);
+        doc.apply(
+            &Transaction::insert(0, "\n\n"),
+            Selection::at(0),
+            Selection::at(2),
+        );
+        let changes = doc.take_changes();
+        highlighter.update(&changes, doc.text());
+        view.sync_folds(&doc, Some(&highlighter));
+
+        assert_eq!(
+            view.collapsed.iter().next().copied(),
+            Some(8),
+            "the fold followed its function down the file"
+        );
+        assert!(view.fold_map.is_hidden(9), "and still hides its body");
+    }
+
+    /// Rebuilding after an edit must not leave a collapsed entry pointing at a
+    /// fold that no longer exists, which would hide lines nothing can unhide.
+    #[test]
+    fn a_fold_whose_code_was_deleted_is_forgotten() {
+        let (mut doc, mut view, mut highlighter) = with_folds(NESTED);
+        view.set_caret(doc.offset_at(6, 0));
+        view.toggle_fold_at_caret(&doc);
+        assert!(!view.collapsed.is_empty());
+
+        // Replace the whole file with something that has no folds at all.
+        let end = doc.len_chars();
+        doc.apply(
+            &editor_core::edit::Transaction::new(vec![editor_core::edit::Edit::replace(
+                0..end,
+                "a = 1\n".to_owned(),
+            )]),
+            Selection::at(0),
+            Selection::at(0),
+        );
+        let changes = doc.take_changes();
+        highlighter.update(&changes, doc.text());
+        view.sync_folds(&doc, Some(&highlighter));
+
+        assert!(view.collapsed.is_empty(), "the fold went with its code");
+        assert!(view.fold_map.is_identity());
     }
 
     // ---- accessibility ---------------------------------------------------

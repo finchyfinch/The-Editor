@@ -858,7 +858,7 @@ Linux or macOS, which remains the single largest piece of unknown work.
 | M1 | Shell & layout | Substantially done | Native macOS menu bar via `muda`. Tab overflow and most-recently-used Ctrl+Tab cycling are done. |
 | M2 | Editor core | **Done** | — |
 | M3 | Syntax highlighting | Done for 9 languages | HTML injections (embedded `<script>`/`<style>`); shebang and manual language override; the user-editable TOML theme format |
-| M4 | Editing intelligence | Indent engine done | `.editorconfig`; trim-trailing-whitespace and final-newline on save; re-indent on paste; bracket-match highlighting; code folding |
+| M4 | Editing intelligence | Indent engine done | Re-indent on paste. `.editorconfig`, save-time tidying, bracket matching and code folding are done. |
 | M5 | Search | In-file done | Project-wide search and replace on the ripgrep engine — the crate holds the query engine and a file walk so far; go-to-symbol |
 | M6 | Language servers | Mostly done | Hover, rename, code actions, format-on-save. Diagnostics, Go to Definition, Find Uses and the completion popup are done; all four have a parse-tree fallback for when no server can answer |
 | M7 | Run & console | Running done | Install Packages / Show Installed Packages; run configurations in `.ide/run.toml` |
@@ -915,7 +915,8 @@ considered when the plan was written; several are more valuable than things
 that were.
 
 **Since built**, and struck from this list: the integrated terminal, rename and
-refactor, crash-recovery autosave, and the accessibility pass. Two more that
+refactor, crash-recovery autosave, the accessibility pass, package and
+requirements management, go to symbol, and code folding. Two more that
 appeared here in an earlier revision turned out to exist already —
 most-recently-used Ctrl+Tab cycling and tab overflow — which is its own lesson
 about reviewing from memory rather than from the code.
@@ -928,7 +929,6 @@ about reviewing from memory rather than from the code.
 | **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
 | **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |
 | **Outline / breadcrumbs / go to symbol** | `documentSymbol` gives all three. Navigating a 3,000-line file is currently scrolling. | 0.5 wk |
-| **Code folding** | The ranges are already computed in `syntax::brackets::fold_ranges` and thrown away — nothing calls it. Gutter chevrons and hiding the folded lines is the whole job. | 2 d |
 | **Auto-import** | Type `Path`, get `from pathlib import Path`. High value in Python specifically, and a code action the servers already offer. | 1 wk |
 | **Split panes** | Two files side by side, or two places in one file. Structural — the editor pane assumes a single active document — so cheaper now than after more is built on that assumption. | 1.5–2 wk |
 | **Diff / merge viewer** | Needed by version control, and useful on its own for comparing two files. | 1 wk |
