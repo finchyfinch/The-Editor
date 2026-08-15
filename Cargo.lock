@@ -935,6 +935,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor-vcs"
+version = "1.0.0"
+dependencies = [
+ "editor-proc",
+]
+
+[[package]]
 name = "editor-widgets"
 version = "1.0.0"
 dependencies = [
@@ -945,6 +952,7 @@ dependencies = [
  "editor-proc",
  "editor-search",
  "editor-syntax",
+ "editor-vcs",
  "eframe",
  "ropey",
  "trash",
@@ -3546,6 +3554,7 @@ dependencies = [
  "editor-proc",
  "editor-search",
  "editor-syntax",
+ "editor-vcs",
  "editor-widgets",
  "eframe",
  "notify",

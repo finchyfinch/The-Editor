@@ -32,11 +32,15 @@ impl Severity {
     /// A glyph, so severity is not conveyed by colour alone — PLAN.md §3.11.
     #[must_use]
     pub fn glyph(self) -> &'static str {
+        // Every one of these is checked against the bundled fonts by
+        // `editor_widgets::glyphs`. The two that are not here any more —
+        // `\u{2717}` for an error and `\u{25cf}` for a hint — shipped as empty
+        // boxes, because the fonts egui bundles do not have them.
         match self {
-            Self::Error => "\u{2717}",
+            Self::Error => "\u{2716}",
             Self::Warning => "\u{26a0}",
             Self::Information => "\u{2139}",
-            Self::Hint => "\u{25cf}",
+            Self::Hint => "\u{25aa}",
         }
     }
 

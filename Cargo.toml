@@ -9,6 +9,7 @@ members = [
     "crates/proc",
     "crates/search",
     "crates/config",
+    "crates/vcs",
     "crates/widgets",
 ]
 
@@ -31,6 +32,7 @@ editor-debug = { path = "crates/debug" }
 editor-proc = { path = "crates/proc" }
 editor-search = { path = "crates/search" }
 editor-config = { path = "crates/config" }
+editor-vcs = { path = "crates/vcs" }
 editor-widgets = { path = "crates/widgets" }
 
 # Shared external crates are hoisted here as they are adopted, so every crate

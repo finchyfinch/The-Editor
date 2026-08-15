@@ -14,9 +14,6 @@
 //! spans for exactly the rows it is about to draw, so a 50,000-line file costs
 //! the same per frame as a 50-line one.
 //!
-//! Not here yet: find/replace (M5), multi-cursor, code folding, and word-wise
-//! motion.
-
 use editor_core::document::Document;
 use editor_core::edit::Transaction;
 use editor_core::selection::Selection;
@@ -26,6 +23,7 @@ use editor_syntax::highlight::Highlighter;
 use editor_syntax::indent::{self, IndentOptions};
 use editor_syntax::methods;
 use editor_syntax::theme::SyntaxTheme;
+use editor_vcs::diff::LineStatus;
 use eframe::egui;
 
 /// Rows painted above and below the viewport, so a fast scroll never exposes a
@@ -33,6 +31,13 @@ use eframe::egui;
 const OVERSCAN_ROWS: usize = 4;
 /// Caret blink period.
 const BLINK_MS: u128 = 530;
+/// How wide the change bar is drawn.
+///
+/// Narrow on purpose. It is a signal in peripheral vision, not something to be
+/// read; anything wider competes with the code for attention it does not need.
+const CHANGE_BAR_WIDTH: f32 = 3.0;
+/// The change column: the bar, plus the gap that keeps it off the breakpoints.
+const CHANGE_COLUMN: f32 = CHANGE_BAR_WIDTH + 2.0;
 
 /// Appearance and behaviour knobs, supplied from settings.
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +145,9 @@ pub struct EditorView {
     paused_line: Option<usize>,
     /// A gutter click asking to toggle a breakpoint, taken by the application.
     toggle_breakpoint: Option<usize>,
+    /// How this buffer differs from the committed version, supplied by the
+    /// application each frame. Sorted by line, one entry per changed line.
+    changes: Vec<(usize, LineStatus)>,
     /// The bracket pair around the caret, recomputed as the caret moves.
     bracket_pair: Option<editor_syntax::brackets::BracketPair>,
     /// Set by the context menu, taken by the application next frame.
@@ -509,6 +517,17 @@ impl EditorView {
         self.toggle_breakpoint.take()
     }
 
+    /// How this buffer differs from the committed version, for the gutter.
+    ///
+    /// Supplied per frame, like the diagnostics and for the same reason: this
+    /// is a fact about the file and the repository, not about the view.
+    /// An empty list means no repository, no baseline yet, or no changes —
+    /// which all draw the same, because an empty gutter is what each of them
+    /// honestly looks like.
+    pub fn set_changes(&mut self, changes: Vec<(usize, LineStatus)>) {
+        self.changes = changes;
+    }
+
     /// Ranges to highlight as search results, and which of them is current.
     ///
     /// Set once per frame before drawing; cleared when the find bar closes.
@@ -550,7 +569,12 @@ impl EditorView {
         // that appears and disappears would shift the whole document sideways
         // as you type.
         let fold_width = row_height;
-        let gutter_width = breakpoint_width
+        // A narrow column at the very left for the change bars. Its own column,
+        // rather than a stripe drawn over the breakpoint dots: a bar behind a
+        // dot is a bar you cannot see, and a bar you can click is a breakpoint
+        // you set by accident.
+        let gutter_width = CHANGE_COLUMN
+            + breakpoint_width
             + fold_width
             + if opts.show_line_numbers {
                 space_width * (line_count.to_string().len() as f32 + 2.0) + 12.0
@@ -753,10 +777,16 @@ impl EditorView {
 
         response.request_focus();
 
+        // The change column is at the very left and takes no clicks: in this
+        // slice the marks are something to read, not something to act on.
+        if response.clicked() && pos.x < rect.left() + CHANGE_COLUMN {
+            return false;
+        }
+
         // A click in the breakpoint column sets one, which is how every other
         // editor does it and the first thing anyone tries. Handled before the
         // caret moves, so the click does not also jump the caret to line 1.
-        if response.clicked() && pos.x < rect.left() + row_height {
+        if response.clicked() && pos.x < rect.left() + CHANGE_COLUMN + row_height {
             let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
             let line = self.fold_map.line_at(row);
             if line < doc.line_count() {
@@ -1854,7 +1884,39 @@ impl EditorView {
             );
         }
 
-        // Breakpoints, in their own column at the far left.
+        // Change bars, in the leftmost column. Drawn from the marks the
+        // application supplies; nothing here knows about git.
+        //
+        // Walked rather than indexed because the marks are per *line* and the
+        // gutter is per *row*, and with a fold in the way those disagree. A
+        // fold hiding changed lines still shows a bar, on the line that is
+        // standing in for them — otherwise collapsing a function would quietly
+        // hide the fact that you had changed it.
+        for (line, status) in &self.changes {
+            let row = self.fold_map.row_at(*line);
+            if row < first || row >= last {
+                continue;
+            }
+            let y = rect.top() + row as f32 * row_height;
+            let colour = change_colour(&visuals, *status);
+            let bar = match status {
+                // A deletion has no lines of its own, so it gets a short mark
+                // at the join rather than a full-height bar. Full height would
+                // claim the line below was deleted, which is the opposite of
+                // what happened to it.
+                LineStatus::DeletedAbove => egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), y),
+                    egui::vec2(CHANGE_BAR_WIDTH, (row_height * 0.3).max(2.0)),
+                ),
+                _ => egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), y),
+                    egui::vec2(CHANGE_BAR_WIDTH, row_height),
+                ),
+            };
+            painter.rect_filled(bar, 0.0, colour);
+        }
+
+        // Breakpoints, in their own column beside the change bars.
         for (line, verified) in &self.breakpoints {
             if *line < first || *line >= last {
                 continue;
@@ -1863,7 +1925,7 @@ impl EditorView {
                 continue;
             }
             let y = rect.top() + self.fold_map.row_at(*line) as f32 * row_height + row_height / 2.0;
-            let centre = egui::pos2(rect.left() + row_height / 2.0, y);
+            let centre = egui::pos2(rect.left() + CHANGE_COLUMN + row_height / 2.0, y);
             let radius = row_height * 0.26;
             let colour = egui::Color32::from_rgb(0xd0, 0x45, 0x45);
             if *verified {
@@ -2004,7 +2066,11 @@ impl EditorView {
                 painter.text(
                     egui::pos2(text_left - row_height * 0.5, y + row_height / 2.0),
                     egui::Align2::CENTER_CENTER,
-                    if closed { "\u{25b8}" } else { "\u{25be}" },
+                    if closed {
+                        crate::glyphs::FOLD_CLOSED
+                    } else {
+                        crate::glyphs::FOLD_OPEN
+                    },
                     font.clone(),
                     if closed {
                         visuals.strong_text_color()
@@ -2028,7 +2094,7 @@ impl EditorView {
                     .min_by_key(|d| d.severity)
                 {
                     painter.text(
-                        egui::pos2(rect.left() + row_height + 2.0, y),
+                        egui::pos2(rect.left() + CHANGE_COLUMN + row_height + 2.0, y),
                         egui::Align2::LEFT_TOP,
                         worst.severity.glyph(),
                         font.clone(),
@@ -2434,6 +2500,34 @@ pub fn severity_colour(
         Severity::Warning => visuals.warn_fg_color,
         Severity::Information | Severity::Hint => visuals.weak_text_color(),
     }
+}
+
+/// Theme-aware colour for a gutter change bar.
+///
+/// Public for the same reason [`severity_colour`] is: anything else that
+/// explains these marks — a legend, a diff view — has to agree with them.
+///
+/// Fixed colours rather than the theme's, because these three have to be
+/// distinguishable from each other at three pixels wide, and a palette that
+/// merely contrasts with the background does not guarantee that. They are
+/// lightened on a dark background so all three stay legible either way.
+#[must_use]
+pub fn change_colour(visuals: &egui::Visuals, status: LineStatus) -> egui::Color32 {
+    let (light, dark) = match status {
+        LineStatus::Added => (
+            egui::Color32::from_rgb(0x2d, 0x8c, 0x4a),
+            egui::Color32::from_rgb(0x4b, 0xb5, 0x6b),
+        ),
+        LineStatus::Changed => (
+            egui::Color32::from_rgb(0x1a, 0x6f, 0xb8),
+            egui::Color32::from_rgb(0x54, 0xa2, 0xe0),
+        ),
+        LineStatus::DeletedAbove => (
+            egui::Color32::from_rgb(0xc0, 0x3a, 0x3a),
+            egui::Color32::from_rgb(0xe0, 0x66, 0x66),
+        ),
+    };
+    if visuals.dark_mode { dark } else { light }
 }
 
 fn char_at(doc: &Document, offset: usize) -> Option<char> {

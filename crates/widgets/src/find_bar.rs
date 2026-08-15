@@ -143,9 +143,9 @@ impl FindBar {
                     ui.spacing_mut().item_spacing.x = 4.0;
 
                     let toggle = ui.small_button(if self.show_replace {
-                        "\u{25be}"
+                        crate::glyphs::TREE_OPEN
                     } else {
-                        "\u{25b8}"
+                        crate::glyphs::TREE_CLOSED
                     });
                     if toggle.on_hover_text("Toggle replace").clicked() {
                         self.show_replace = !self.show_replace;
@@ -204,7 +204,7 @@ impl FindBar {
                     ui.separator();
 
                     if ui
-                        .small_button(crate::icon::pick(ui, &["\u{2191}", "\u{25b2}", "^"]))
+                        .small_button(crate::icon::pick(ui, &["\u{2b06}", "\u{2191}", "^"]))
                         .on_hover_text("Previous (Shift+Enter)")
                         .clicked()
                         && let Some(range) = self.step(caret, -1)
@@ -212,7 +212,7 @@ impl FindBar {
                         action = Action::Reveal(range);
                     }
                     if ui
-                        .small_button(crate::icon::pick(ui, &["\u{2193}", "\u{25bc}", "v"]))
+                        .small_button(crate::icon::pick(ui, &["\u{2b07}", "\u{2193}", "v"]))
                         .on_hover_text("Next (Enter)")
                         .clicked()
                         && let Some(range) = self.step(caret, 1)

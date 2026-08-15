@@ -28,6 +28,7 @@ use eframe::egui;
 use crate::commands::{self, CommandId};
 use crate::completion;
 use crate::debugger::{self, Breakpoints, DebugView};
+use crate::diff_view;
 use crate::docs_window::DocsWindow;
 use crate::file_picker::FilePicker;
 use crate::new_file;
@@ -230,6 +231,9 @@ pub(crate) struct EditorApp {
     /// Watches the open folder. `None` when no folder is open, or when the
     /// platform refused to watch it.
     watcher: Option<Watcher>,
+    /// What git says about the project: the branch, and how each open buffer
+    /// differs from the committed version.
+    git: editor_vcs::tracker::Tracker,
     /// Whether the window had focus last frame, so returning to it can be
     /// told from merely still having it.
     was_focused: bool,
@@ -244,6 +248,13 @@ pub(crate) struct EditorApp {
     recovered: Vec<recovery::Recovered>,
     manual: DocsWindow,
     licences: DocsWindow,
+    /// The buffer against what was committed. Its own window rather than a
+    /// dock tab: it is consulted and closed, not lived in.
+    diff_view: diff_view::DiffView,
+    /// The sections the diff window is showing, with the file and buffer
+    /// version they were built from. Held so an open window does not re-diff
+    /// the file on every frame it is on screen.
+    diff_cache: Option<(PathBuf, u64, Vec<editor_vcs::unified::Section>)>,
     /// True until the welcome has been dismissed. Set when there was no
     /// settings file to load, which is the only honest signal that nobody has
     /// used this before.
@@ -395,6 +406,15 @@ impl EditorApp {
             watcher: Watcher::new(Some(cc.egui_ctx.clone()))
                 .inspect_err(|e| tracing::warn!("no filesystem watcher: {e}"))
                 .ok(),
+            git: {
+                // Every answer from the git worker has to wake the loop, or it
+                // arrives into an idle application and sits there unpainted
+                // until the next keystroke. PLAN.md §2.5.
+                let ctx = cc.egui_ctx.clone();
+                editor_vcs::tracker::Tracker::new(std::sync::Arc::new(move || {
+                    ctx.request_repaint();
+                }))
+            },
             was_focused: true,
             from_command_line: open,
             recovery: recovery::Recovery::new(&paths_for_recovery),
@@ -402,6 +422,8 @@ impl EditorApp {
             recovered,
             manual: DocsWindow::default(),
             licences: DocsWindow::default(),
+            diff_view: diff_view::DiffView::default(),
+            diff_cache: None,
             first_run,
             started: Some(started),
             dirty_seen: Vec::new(),
@@ -602,7 +624,11 @@ impl EditorApp {
         if index >= self.docs.len() {
             return;
         }
-        self.docs.remove(index);
+        let closed = self.docs.remove(index);
+        // The committed copy and the diff were held for a buffer that is gone.
+        if let Some(path) = closed.doc.path() {
+            self.git.forget(path);
+        }
 
         self.active = match self.active {
             _ if self.docs.is_empty() => None,
@@ -974,6 +1000,11 @@ impl EditorApp {
             self.tree.set_root(folder);
             return;
         }
+
+        // A different folder is a different repository, or none. Asked for here
+        // rather than per file: discovery is one subprocess and the answer is
+        // what decides whether any of the rest is worth doing.
+        self.git.set_project(Some(&folder));
 
         if let Some(watcher) = self.watcher.as_mut()
             && let Err(e) = watcher.set_root(&folder)
@@ -2823,6 +2854,74 @@ impl EditorApp {
         }
     }
 
+    /// The diff window, and the comparison it needs to draw.
+    ///
+    /// The sections are rebuilt only when the buffer's version moves, because
+    /// the window stays open while you edit and a diff per frame of a large
+    /// file is the one cost this feature could easily have.
+    fn diff_window(&mut self, ctx: &egui::Context) {
+        if !self.diff_view.is_open() {
+            self.diff_cache = None;
+            return;
+        }
+        let Some(path) = self.diff_view.path().map(Path::to_path_buf) else {
+            return;
+        };
+
+        // The diff is of a *buffer*. Closing the tab takes away the thing being
+        // compared, so the window goes with it.
+        let Some(version) = self
+            .docs
+            .iter()
+            .find(|entry| entry.doc.path() == Some(path.as_path()))
+            .map(|entry| entry.doc.version())
+        else {
+            self.diff_view.close();
+            self.diff_cache = None;
+            return;
+        };
+
+        let fresh = self
+            .diff_cache
+            .as_ref()
+            .is_some_and(|(cached, at, _)| cached == &path && *at == version);
+
+        let known = self.git.baseline_state(&path);
+        if !fresh && known == editor_vcs::tracker::Known::Ready {
+            let text = self
+                .docs
+                .iter()
+                .find(|entry| entry.doc.path() == Some(path.as_path()))
+                .map(|entry| entry.doc.text().to_string())
+                .unwrap_or_default();
+            let committed = self.git.baseline(&path).unwrap_or_default().to_owned();
+            let sections = editor_vcs::unified::unified(
+                &editor_vcs::diff::lines(&committed),
+                &editor_vcs::diff::lines(&text),
+                editor_vcs::unified::DEFAULT_CONTEXT,
+            );
+            self.diff_cache = Some((path.clone(), version, sections));
+        }
+
+        let state = if !self.git.has_repo() {
+            diff_view::State::NoRepository
+        } else {
+            match known {
+                editor_vcs::tracker::Known::Waiting => diff_view::State::Waiting,
+                editor_vcs::tracker::Known::Absent => diff_view::State::NotTracked,
+                editor_vcs::tracker::Known::Ready => match &self.diff_cache {
+                    Some((_, _, sections)) if !sections.is_empty() => {
+                        diff_view::State::Changed(sections)
+                    }
+                    _ => diff_view::State::Unchanged,
+                },
+            }
+        };
+
+        let branch = self.git.branch().map(str::to_owned);
+        self.diff_view.ui(ctx, branch.as_deref(), state);
+    }
+
     /// Offer back the unsaved work of a session that did not shut down.
     ///
     /// Modal, unlike the disk-change bar. This one is about work that exists
@@ -3504,6 +3603,9 @@ impl EditorApp {
                 // their files changed.
                 self.watcher = Watcher::new(Some(ctx.clone())).ok();
                 self.sync_watched_files();
+                // No folder, no project: the branch and the gutter marks were
+                // facts about a repository that is no longer open.
+                self.git.set_project(None);
             }
             CommandId::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
 
@@ -3619,6 +3721,15 @@ impl EditorApp {
                 self.show_output = true;
                 self.dock = DockTab::Problems;
             }
+            CommandId::ShowDiff => match self.active_doc().and_then(|e| e.doc.path()) {
+                Some(path) => {
+                    let path = path.to_path_buf();
+                    self.diff_view.open(path);
+                }
+                // An unsaved buffer has nothing committed to compare with, and
+                // saying so beats an empty window that looks like a failure.
+                None => self.error("Save this file before comparing it with the repository"),
+            },
             CommandId::CreateVenv => match self.tree.root() {
                 Some(root) => self.venv_dialog.open(root.to_path_buf()),
                 None => self.error("Open a folder before creating a virtual environment"),
@@ -3953,6 +4064,7 @@ impl EditorApp {
         let checkers = self.checker_summary();
         let has_run = self.runner.output().line_count() > 1;
         let run_label = self.runner.label().to_owned();
+        let branch = self.git.branch().map(str::to_owned);
 
         let row = ui.text_style_height(&egui::TextStyle::Body);
 
@@ -3998,7 +4110,7 @@ impl EditorApp {
                     if summary.is_some() {
                         ui.separator();
                         let text = if diagnostic_counts.is_empty() {
-                            "\u{2713} No problems".to_owned()
+                            format!("{} No problems", editor_widgets::glyphs::OK)
                         } else {
                             format!(
                                 "{} {}  {} {}",
@@ -4032,12 +4144,25 @@ impl EditorApp {
                         }
                     }
 
+                    // The branch, when the project is a repository. Absent
+                    // rather than empty when it is not: a blank space labelled
+                    // "branch" invites the question of which one.
+                    //
+                    // Labelled rather than given a branch icon, because the
+                    // bundled fonts have no glyph for one and an unlabelled
+                    // name reads as another of the values beside it.
+                    if let Some(branch) = &branch {
+                        ui.separator();
+                        ui.weak(format!("Branch: {branch}"))
+                            .on_hover_text("The branch this project is on");
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // The theme indicator is a control, not a label — one
                         // of the three ways PLAN.md §3.11 requires it to be
                         // reachable.
                         if ui
-                            .button(format!("\u{25d0} {theme_label}"))
+                            .button(format!("{} {theme_label}", editor_widgets::glyphs::THEME))
                             .on_hover_text("Change theme")
                             .clicked()
                         {
@@ -4117,6 +4242,28 @@ impl EditorApp {
             });
             let diagnostics = self.lsp.diagnostics();
 
+            // How the active buffer differs from the committed version. Read
+            // here, before `entry` is borrowed mutably, because the tracker and
+            // the documents are separate fields and the closure below would
+            // otherwise borrow both at once.
+            //
+            // Only the active tab: the marks are only ever drawn for the file
+            // on screen, and diffing the others would be work for nobody.
+            let changes = active_path
+                .as_ref()
+                .zip(self.active.and_then(|i| self.docs.get(i)))
+                .map(|(path, entry)| {
+                    self.git
+                        .marks(
+                            path,
+                            entry.doc.version(),
+                            entry.doc.text().len_bytes(),
+                            || entry.doc.text().to_string(),
+                        )
+                        .to_vec()
+                })
+                .unwrap_or_default();
+
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
                 opts.language = entry.language;
                 // The parse tree was brought up to date by `sync_highlighters`
@@ -4145,6 +4292,7 @@ impl EditorApp {
                 entry
                     .view
                     .set_debug_state(breakpoints_here.clone(), paused_line);
+                entry.view.set_changes(changes);
 
                 // Editing a preview tab promotes it: the file is being worked
                 // on, so it must not be replaced by the next explorer click.
@@ -4487,6 +4635,7 @@ impl eframe::App for EditorApp {
         self.open_from_command_line();
         self.runner.set_context(&ctx);
         self.poll_watcher();
+        self.git.poll();
         self.check_disk_on_focus(&ctx);
         self.autosave(&ctx);
         self.poll_debugger(&ctx);
@@ -4787,6 +4936,7 @@ impl eframe::App for EditorApp {
         self.manual.ui(&ctx, "user_manual", "User Manual", MANUAL);
         self.licences
             .ui(&ctx, "third_party", "Third-Party Licences", THIRD_PARTY);
+        self.diff_window(&ctx);
         self.rename_ui(&ctx);
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.
@@ -5196,9 +5346,11 @@ fn toolbar_glyphs(id: CommandId) -> &'static [&'static str] {
         CommandId::NewFile => &["\u{2795}", "+"],
         CommandId::OpenFile => &["\u{1f4c2}", "Op"],
         CommandId::Save => &["\u{1f4be}", "Sv"],
-        CommandId::SaveAll => &["\u{1f5c3}", "SA"],
-        CommandId::Undo => &["\u{21b6}", "Un"],
-        CommandId::Redo => &["\u{21b7}", "Re"],
+        // Not `\u{1f5c3}`, `\u{21b6}` or `\u{21b7}`: the bundled fonts have
+        // none of the three, so these three buttons were the text fallbacks.
+        CommandId::SaveAll => &["\u{1f5c4}", "SA"],
+        CommandId::Undo => &["\u{27f2}", "Un"],
+        CommandId::Redo => &["\u{27f3}", "Re"],
         CommandId::Find => &["\u{1f50d}", "Fi"],
         CommandId::Run => &["\u{25b6}", "\u{25b8}", "Run"],
         CommandId::RunStop => &["\u{25a0}", "Stop"],

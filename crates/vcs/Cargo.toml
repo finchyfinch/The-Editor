@@ -1,0 +1,15 @@
+[package]
+name = "editor-vcs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Git: what the repository says about the files being edited"
+
+[dependencies]
+editor-proc = { version = "1.0.0", path = "../proc" }
+
+[lints]
+workspace = true

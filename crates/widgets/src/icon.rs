@@ -10,6 +10,13 @@
 //! here. Every glyph in the interface is chosen through [`pick`], which asks
 //! the font what it has and falls back until something can be drawn. The last
 //! candidate should always be plain ASCII, which nothing can fail to render.
+//!
+//! Asking the font is itself the hard part; see [`drawable`] for why the
+//! obvious way of doing it is wrong, and what this does instead.
+//!
+//! Symbols that are *not* chosen through [`pick`] — because they are drawn
+//! straight into a painter, or produced by a crate with no access to a `Ui` —
+//! are named in [`crate::glyphs`], where a test checks every one of them.
 
 use eframe::egui;
 
@@ -25,11 +32,48 @@ pub fn pick<'a>(ui: &egui::Ui, candidates: &[&'a str]) -> &'a str {
         if i == last {
             return candidate;
         }
-        if ui.fonts_mut(|f| f.has_glyphs(&font, candidate)) {
+        if drawable(ui, &font, candidate) {
             return candidate;
         }
     }
     ""
+}
+
+/// Whether `text` will be drawn as itself rather than as empty boxes.
+///
+/// The obvious API for this is `Fonts::has_glyphs`, and in epaint 0.36 it is
+/// wrong in both directions: it reports plain `'a'` as absent from the
+/// monospace family, and `'\u{26a0}'` as present there but absent from the
+/// proportional one — the exact opposite of what the application draws. Every
+/// icon in the toolbar consequently fell through to its ASCII fallback, which
+/// is how a carefully chosen set of symbols became `Un`, `Re` and `SA`.
+///
+/// So this asks the one source that cannot disagree with the screen: what was
+/// rasterised. A character the fonts do not have is drawn with the replacement
+/// glyph, so it lands on the *same rectangle of the font atlas* as `U+FFFD`.
+/// Two characters sharing a `uv_rect` are the same picture, and a symbol whose
+/// picture is the replacement box is precisely what must be rejected.
+pub fn drawable(ui: &egui::Ui, font: &egui::FontId, text: &str) -> bool {
+    let tofu = atlas_rect(ui, font, char::REPLACEMENT_CHARACTER);
+    text.chars().all(|c| {
+        c == char::REPLACEMENT_CHARACTER
+            || atlas_rect(ui, font, c).is_some_and(|rect| Some(rect) != tofu)
+    })
+}
+
+/// Where in the font atlas `c` is drawn from, if it is drawn at all.
+fn atlas_rect(
+    ui: &egui::Ui,
+    font: &egui::FontId,
+    c: char,
+) -> Option<impl PartialEq + Copy + use<>> {
+    let galley =
+        ui.fonts_mut(|f| f.layout_no_wrap(c.to_string(), font.clone(), egui::Color32::WHITE));
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map(|glyph| glyph.uv_rect)
 }
 
 #[cfg(test)]

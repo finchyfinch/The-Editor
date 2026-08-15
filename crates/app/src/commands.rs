@@ -75,6 +75,7 @@ pub(crate) enum CommandId {
     ShowTerminal,
     ShowPackages,
     ShowProblems,
+    ShowDiff,
     SelectInterpreter,
     CreateVenv,
     // View
@@ -159,6 +160,7 @@ impl CommandId {
         Self::ShowTerminal,
         Self::ShowPackages,
         Self::ShowProblems,
+        Self::ShowDiff,
         Self::SelectInterpreter,
         Self::CreateVenv,
         Self::ToggleExplorer,
@@ -487,6 +489,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "View",
         "Problems",
         ctrl_shift(Key::M),
+    ),
+    cmd(
+        CommandId::ShowDiff,
+        "View",
+        "Changes Since Last Commit",
+        ctrl_shift(Key::G),
     ),
     cmd(
         CommandId::SelectInterpreter,

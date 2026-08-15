@@ -21,6 +21,7 @@ editor-proc = { version = "1.0.0", path = "../proc" }
 editor-search.workspace = true
 editor-syntax.workspace = true
 editor-widgets.workspace = true
+editor-vcs = { version = "1.0.0", path = "../vcs" }
 
 anyhow.workspace = true
 eframe = { workspace = true, features = ["glow"] }

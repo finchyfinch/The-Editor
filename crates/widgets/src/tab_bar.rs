@@ -229,9 +229,9 @@ fn tab_ui(
     // state is never hidden underneath the mouse at the moment the user is
     // about to click the button that would discard it.
     let glyph = if tab.dirty && !hovered {
-        "\u{25cf}" // filled circle
+        crate::glyphs::DIRTY
     } else {
-        "\u{00d7}" // multiplication sign
+        crate::glyphs::CLOSE
     };
     if close.hovered() {
         painter.rect_filled(close_rect, 3, visuals.widgets.hovered.bg_fill);

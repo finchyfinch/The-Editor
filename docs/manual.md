@@ -60,6 +60,7 @@ A few that are worth knowing about:
 | `Alt+Up` / `Alt+Down` | Move the line up or down |
 | `Ctrl+R` | Go to a symbol in this file |
 | `Ctrl+Shift+[` | Fold or unfold the block around the caret |
+| `Ctrl+Shift+G` | Show this file's changes since the last commit |
 | `Ctrl+F` | Find, in this file |
 | `Ctrl+Shift+F` | Find across the project |
 | `F12` | Go to the definition |
@@ -86,6 +87,21 @@ foldable — a class, a function, an `if`. Click it, or press `Ctrl+Shift+[` to
 fold whatever the caret is inside. **View > Fold All** and **Unfold All** do
 the whole file. Folds follow their code as you edit above them, and a fold
 whose code is deleted goes with it.
+
+### What you have changed
+
+If the project is a git repository, a coloured bar appears in the far-left
+margin beside every line that differs from the last commit: green for a new
+line, blue for a changed one, and a short red mark at the join where lines were
+deleted. The status bar names the branch you are on.
+
+`Ctrl+Shift+G` shows the whole file against the committed version as a diff,
+with the line numbers from both sides so you can find anything you see in it.
+
+The comparison is against the last commit, not against the file on disk — so
+saving does not clear the marks, and committing does. Nothing here changes the
+repository: The Editor runs your `git`, which means your configuration, your
+hooks and your signing key, but for now it only ever reads.
 
 ### When a file changes underneath you
 

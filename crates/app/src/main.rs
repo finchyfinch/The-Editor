@@ -11,6 +11,7 @@ mod cli;
 mod commands;
 mod completion;
 mod debugger;
+mod diff_view;
 mod docs_window;
 mod file_picker;
 mod logging;

@@ -14,6 +14,7 @@ pub mod editor_view;
 pub mod file_tree;
 pub mod find_bar;
 mod folding;
+pub mod glyphs;
 pub mod icon;
 pub mod tab_bar;
 pub mod theme;

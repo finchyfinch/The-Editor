@@ -95,15 +95,26 @@ impl Completion {
     /// relying on colour alone.
     #[must_use]
     pub fn glyph(&self) -> &'static str {
+        // Drawn in a proportional label, where the bundled fonts are thinner
+        // than they look: `\u{25c7}`, `\u{25c8}`, `\u{25a6}`, `\u{25cf}` and
+        // `\u{25b8}` all drew as empty boxes here, however plausible they
+        // seem. Everything below is checked by `editor_widgets::glyphs`.
         match self.kind {
+            // Method, function.
             Some(2 | 3) => "\u{192}",
+            // Field, variable.
             Some(5) => "\u{25ab}",
             Some(6) => "\u{25aa}",
-            Some(7 | 22) => "\u{25c7}",
-            Some(8) => "\u{25c8}",
-            Some(9) => "\u{25a6}",
-            Some(14) => "\u{25b8}",
-            Some(21) => "\u{25cf}",
+            // Class, struct.
+            Some(7 | 22) => "\u{25ce}",
+            // Interface.
+            Some(8) => "\u{25cb}",
+            // Module.
+            Some(9) => "\u{25a0}",
+            // Keyword.
+            Some(14) => "\u{203a}",
+            // Constant.
+            Some(21) => "\u{2022}",
             _ => "\u{b7}",
         }
     }

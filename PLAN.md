@@ -900,6 +900,26 @@ cannot be reached.
   Close All and quitting.
 - `editor_proc::spawn::quiet`, so background children get no console window on
   Windows.
+- **A glyph audit, and a test that keeps it true.** egui's bundled fonts cover
+  less than they appear to, and `Fonts::has_glyph` — the API for asking which —
+  is wrong in both directions in epaint 0.36: it reports plain `a` as absent
+  from the monospace family and `⚠` as absent from the proportional one. So
+  `icon::pick` had been silently falling through to its ASCII fallbacks and the
+  toolbar read `Un Re SA Fi`, while the glyphs that do *not* go through it —
+  the error marker, the theme indicator, the dirty-tab dot, the explorer's
+  chevrons — drew as empty boxes. Both now ask what was actually rasterised: a
+  character the fonts lack lands on the same rectangle of the font atlas as
+  `U+FFFD`, and that comparison cannot disagree with the screen.
+  `editor_widgets::glyphs` names every symbol drawn outside `pick`, with the
+  font family it is drawn in, and a test checks all of them.
+- **`editor-vcs`**, and with it the read-only half of version control: change
+  markers in the gutter, the branch in the status bar, and **View → Changes
+  Since Last Commit** (`Ctrl+Shift+G`) showing the buffer against HEAD as a
+  unified diff. Git is *run*, not linked, so the user's own configuration,
+  credential helper, hooks and signing key all apply. The committed version of
+  a file is fetched once on a worker thread and diffed in process against the
+  buffer, which is what turns "a subprocess per keystroke" into "a subprocess
+  per file"; the cache is dropped whole when HEAD moves.
 
 ### Sequencing changes made along the way
 
@@ -916,15 +936,16 @@ that were.
 
 **Since built**, and struck from this list: the integrated terminal, rename and
 refactor, crash-recovery autosave, the accessibility pass, package and
-requirements management, go to symbol, and code folding. Two more that
+requirements management, go to symbol, code folding, and read-only version
+control (gutter change markers, the branch in the status bar, and a diff of the
+buffer against HEAD). Two more that
 appeared here in an earlier revision turned out to exist already —
 most-recently-used Ctrl+Tab cycling and tab overflow — which is its own lesson
 about reviewing from memory rather than from the code.
 
 | | Why it matters | Rough size |
 |---|---|---|
-| **Version control** | Still the largest omission by a distance, and now the one everything else waits behind. There is no git support at all: the only mentions of it in the codebase are ignore lists. Change markers in the gutter, a diff view, blame, staging and committing, branch switching. "Not using GitHub" removes the *hosting*, not git. It is also the prerequisite for reviewing what a coding agent changed, and for the local history that crash recovery only half covers. Start with the read-only half — gutter markers and a diff view — which is about a third of the work and most of the daily value. | 3–4 wk |
-| **Package and requirements management** | Show what is installed and at what version, what is out of date, install, upgrade, remove; freeze to `requirements.txt` and keep it in step. The venv dialog can already install *from* a requirements file but cannot produce one. Everything runs through the existing PTY console, so it is a table and four pip commands rather than new machinery. | 1–1.5 wk |
+| **Version control — the writing half** | The read-only half has landed (see below). What remains is a status and staging panel, commit and amend, log and blame, and branch switching. Everything after this reads from the same `editor-vcs` crate and the same worker thread, so the expensive part — deciding how the editor talks to git at all — is already paid for. | 2–3 wk |
 | **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. "Run Tests" currently just runs the open file. A headline PyCharm feature for Python and the natural partner to the debugger. | 2–3 wk |
 | **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
 | **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |

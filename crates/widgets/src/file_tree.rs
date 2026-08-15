@@ -183,7 +183,14 @@ impl FileTree {
         }
 
         let expanded = self.expanded.contains(path);
-        let arrow = if expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ ▸
+        // Not the triangles the editor's fold column uses: these are drawn in
+        // a proportional label, and the bundled proportional fonts have no
+        // `\u{25b8}` — it appeared here as an empty box beside every folder.
+        let arrow = if expanded {
+            crate::glyphs::TREE_OPEN
+        } else {
+            crate::glyphs::TREE_CLOSED
+        };
         let response = self.row(ui, depth, &format!("{arrow} \u{1f4c1} {label}"), path);
 
         {
