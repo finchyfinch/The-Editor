@@ -49,6 +49,36 @@ const HEAD_INTERVAL: Duration = Duration::from_secs(2);
 /// or vendored, where nobody is reading the gutter anyway.
 const MAX_TRACKED_BYTES: usize = 1 << 20;
 
+/// Something to do to the index or the working tree.
+///
+/// Paths are as git spells them: relative to the top level, forward slashes —
+/// which is exactly how they arrive from [`crate::status`], so a selection made
+/// in the panel can be handed straight back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Add these to the index.
+    Stage(Vec<String>),
+    /// Take these back out of it, leaving the files alone.
+    Unstage(Vec<String>),
+    /// Throw away the unstaged changes to these.
+    ///
+    /// Destroys work that exists nowhere else — see [`Repo::discard`]. The
+    /// tracker will do it when asked; asking is the caller's responsibility,
+    /// and the caller must have confirmed it with the user first.
+    Discard(Vec<String>),
+}
+
+impl Action {
+    /// A short description, for an error message that needs to say what failed.
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Stage(_) => "stage",
+            Self::Unstage(_) => "unstage",
+            Self::Discard(_) => "discard",
+        }
+    }
+}
+
 /// What the worker is asked to do.
 enum Request {
     /// Find the repository for a project folder, or forget the one we had.
@@ -57,6 +87,10 @@ enum Request {
     Baseline(PathBuf),
     /// Re-read the branch and the commit HEAD is on.
     Head,
+    /// Re-read the working tree's state.
+    Status,
+    /// Change the index or the working tree, then re-read the state.
+    Act(Action),
 }
 
 /// What the worker found.
@@ -76,6 +110,10 @@ enum Reply {
         branch: Option<String>,
         head: Option<String>,
     },
+    Status(Result<crate::status::Status, String>),
+    /// An action failed. Success says nothing here — the status that follows
+    /// it says everything worth saying.
+    Failed(String),
 }
 
 /// HEAD's version of one file, or the knowledge that there isn't one.
@@ -118,6 +156,16 @@ pub struct Tracker {
     last_head_check: Instant,
     baselines: HashMap<PathBuf, Baseline>,
     marks: HashMap<PathBuf, Marks>,
+    /// The working tree's state, as of the last time it was asked for.
+    status: crate::status::Status,
+    /// Whether a status has ever come back, so an empty list can be told from
+    /// a clean tree — they draw very differently.
+    status_known: bool,
+    /// A status request is out. Stops a panel that is open every frame from
+    /// queueing a subprocess every frame.
+    status_pending: bool,
+    /// Whatever git last said when an action failed, for the caller to show.
+    error: Option<String>,
     /// Whether the worker has answered anything at all. Distinguishes "no
     /// repository" from "have not looked yet", which look identical otherwise
     /// and mean opposite things to anything drawing a branch name.
@@ -153,6 +201,10 @@ impl Tracker {
             last_head_check: Instant::now() - HEAD_INTERVAL,
             baselines: HashMap::new(),
             marks: HashMap::new(),
+            status: crate::status::Status::default(),
+            status_known: false,
+            status_pending: false,
+            error: None,
             replied: false,
             requested: 0,
         }
@@ -168,6 +220,10 @@ impl Tracker {
         self.head = None;
         self.baselines.clear();
         self.marks.clear();
+        self.status = crate::status::Status::default();
+        self.status_known = false;
+        self.status_pending = false;
+        self.error = None;
         self.replied = false;
         self.requested = 0;
         let _ = self
@@ -207,9 +263,23 @@ impl Tracker {
                         self.baselines.clear();
                         self.marks.clear();
                         self.head = head;
+                        // And the working tree is now described against a
+                        // different commit too.
+                        self.refresh_status();
                     }
                     self.branch = branch;
                 }
+                Reply::Status(result) => {
+                    self.status_pending = false;
+                    match result {
+                        Ok(status) => {
+                            self.status = status;
+                            self.status_known = true;
+                        }
+                        Err(message) => self.error = Some(message),
+                    }
+                }
+                Reply::Failed(message) => self.error = Some(message),
             }
         }
 
@@ -231,6 +301,74 @@ impl Tracker {
     #[must_use]
     pub fn has_repo(&self) -> bool {
         self.repo.is_some()
+    }
+
+    /// The repository's top level.
+    ///
+    /// Not the same thing as the open folder, and the difference matters: git
+    /// reports every path relative to *this*, so joining one onto the project
+    /// folder points at nothing whenever the folder is a subdirectory of the
+    /// repository — which is the normal way to open one crate of a workspace.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.repo.as_ref().map(|repo| repo.root.as_path())
+    }
+
+    /// The working tree's state, as of the last answer.
+    ///
+    /// Empty both before the first answer and when the tree is clean;
+    /// [`Self::status_known`] separates them, because "nothing to commit" and
+    /// "have not looked" are different things to put on screen.
+    #[must_use]
+    pub fn status(&self) -> &crate::status::Status {
+        &self.status
+    }
+
+    /// Whether a status has ever come back.
+    #[must_use]
+    pub fn status_known(&self) -> bool {
+        self.status_known
+    }
+
+    /// Ask for the working tree's state again.
+    ///
+    /// Call when something might have changed it: a file saved, a panel opened,
+    /// the window regaining focus. Repeated calls while a request is already
+    /// out are free, so this is safe to call from a frame loop.
+    pub fn refresh_status(&mut self) {
+        if self.repo.is_none() || self.status_pending {
+            return;
+        }
+        self.status_pending = true;
+        let _ = self.requests.send(Request::Status);
+    }
+
+    /// Do something to the index or the working tree.
+    ///
+    /// The status is re-read afterwards by the worker, so the caller does not
+    /// have to ask — and cannot ask too early and get the state from before the
+    /// action, which is what makes a staging panel appear not to work.
+    ///
+    /// [`Action::Discard`] destroys work that exists nowhere else. Confirm with
+    /// the user before calling this with one.
+    pub fn act(&mut self, action: Action) {
+        if self.repo.is_none() {
+            return;
+        }
+        self.error = None;
+        self.status_pending = true;
+        let _ = self.requests.send(Request::Act(action));
+    }
+
+    /// Whatever git last complained about, if anything.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Acknowledge the error, so it stops being shown.
+    pub fn clear_error(&mut self) {
+        self.error = None;
     }
 
     /// What is known about HEAD's version of `path`.
@@ -352,6 +490,32 @@ fn worker(inbox: &Receiver<Request>, outbox: &Sender<Reply>, wake: &Waker) {
                     branch: repo.branch(),
                     head: repo.head_id(),
                 }
+            }
+            Request::Status => {
+                let Some(repo) = repo.as_ref() else { continue };
+                Reply::Status(repo.status())
+            }
+            Request::Act(action) => {
+                let Some(repo) = repo.as_ref() else { continue };
+                let outcome = match &action {
+                    Action::Stage(paths) => repo.stage(paths),
+                    Action::Unstage(paths) => repo.unstage(paths),
+                    Action::Discard(paths) => repo.discard(paths),
+                };
+                if let Err(message) = outcome {
+                    // Say what was being attempted. Git's own message is about
+                    // paths and refs and says nothing about which button was
+                    // pressed.
+                    let failure = format!("Could not {}: {message}", action.verb());
+                    if outbox.send(Reply::Failed(failure)).is_err() {
+                        return;
+                    }
+                    wake();
+                }
+                // The status follows either way. After a success it is the
+                // result; after a failure it is proof of what actually
+                // happened, which may be some of what was asked for.
+                Reply::Status(repo.status())
             }
         };
 
@@ -624,5 +788,268 @@ mod tests {
         tracker.forget(&manifest);
         assert!(!tracker.baselines.contains_key(&manifest));
         assert!(!tracker.marks.contains_key(&manifest));
+    }
+
+    // ---- status and staging ---------------------------------------------
+
+    /// A repository of its own, so staging tests cannot touch this project's.
+    ///
+    /// Deliberately not shared with `repo::tests::Fixture`: a test helper that
+    /// two modules reach into stops being obvious about what it sets up, and
+    /// this one wants a tracker pointed at it as well.
+    struct Sandbox {
+        root: PathBuf,
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Sandbox {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "the-editor-tracker-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("temporary directory");
+
+            let git = |args: &[&str]| {
+                let mut command = editor_proc::spawn::quiet("git");
+                command.current_dir(&root).args(args);
+                let output = command.output().expect("running git");
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init", "--quiet", "-b", "trial"]);
+            git(&["config", "user.email", "test@example.invalid"]);
+            git(&["config", "user.name", "Test"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            git(&["config", "core.autocrlf", "false"]);
+            std::fs::write(root.join("first.txt"), "one\ntwo\n").expect("write");
+            git(&["add", "."]);
+            git(&["commit", "--quiet", "-m", "initial"]);
+
+            // Discovered, because git spells the temporary directory its own
+            // way and the tracker will be comparing against that spelling.
+            let root = Repo::discover(&root).expect("a repository").root;
+            Self { root }
+        }
+
+        fn write(&self, name: &str, text: &str) {
+            std::fs::write(self.root.join(name), text).expect("write");
+        }
+
+        fn read(&self, name: &str) -> String {
+            std::fs::read_to_string(self.root.join(name)).expect("read")
+        }
+
+        /// A tracker pointed here, with its first status already in.
+        fn tracker(&self) -> Tracker {
+            let mut tracker = super::Tracker::new(Arc::new(|| {}));
+            tracker.set_project(Some(&self.root));
+            assert!(
+                wait_for(&mut tracker, |t| t.has_repo()),
+                "the sandbox should be found as a repository"
+            );
+            tracker.refresh_status();
+            assert!(
+                wait_for(&mut tracker, |t| t.status_known()),
+                "the first status never arrived"
+            );
+            tracker
+        }
+    }
+
+    #[test]
+    fn nothing_is_known_about_the_working_tree_before_it_is_asked_for() {
+        let tracker = tracker();
+        assert!(!tracker.status_known());
+        assert!(tracker.status().is_clean());
+        assert_eq!(tracker.error(), None);
+    }
+
+    #[test]
+    fn a_clean_tree_is_reported_as_clean_rather_than_unknown() {
+        let sandbox = Sandbox::new("clean");
+        let tracker = sandbox.tracker();
+        assert!(tracker.status_known(), "the answer arrived");
+        assert!(tracker.status().is_clean(), "and it was: nothing to do");
+    }
+
+    #[test]
+    fn an_edit_shows_up_once_the_status_is_refreshed() {
+        let sandbox = Sandbox::new("edit");
+        let mut tracker = sandbox.tracker();
+        assert!(tracker.status().is_clean());
+
+        sandbox.write("first.txt", "one\nCHANGED\n");
+        tracker.refresh_status();
+        assert!(
+            wait_for(&mut tracker, |t| !t.status().is_clean()),
+            "the edit should be reported"
+        );
+        assert_eq!(tracker.status().unstaged().count(), 1);
+    }
+
+    #[test]
+    fn staging_moves_a_file_across_and_the_status_follows_by_itself() {
+        let sandbox = Sandbox::new("stage");
+        let mut tracker = sandbox.tracker();
+        sandbox.write("first.txt", "one\nCHANGED\n");
+        tracker.refresh_status();
+        assert!(wait_for(&mut tracker, |t| t.status().unstaged().count() == 1));
+
+        tracker.act(Action::Stage(vec!["first.txt".to_owned()]));
+        // No `refresh_status` here on purpose: the worker re-reads the status
+        // after acting, because a caller that asks for itself can ask too early
+        // and get the state from *before* the action — which is exactly what
+        // makes a staging panel look like it does nothing.
+        assert!(
+            wait_for(&mut tracker, |t| t.status().staged().count() == 1),
+            "staging should be reflected without being asked for"
+        );
+        assert_eq!(tracker.status().unstaged().count(), 0);
+        assert_eq!(tracker.error(), None);
+    }
+
+    #[test]
+    fn unstaging_puts_it_back() {
+        let sandbox = Sandbox::new("unstage");
+        let mut tracker = sandbox.tracker();
+        sandbox.write("first.txt", "one\nCHANGED\n");
+        tracker.act(Action::Stage(vec!["first.txt".to_owned()]));
+        assert!(wait_for(&mut tracker, |t| t.status().staged().count() == 1));
+
+        tracker.act(Action::Unstage(vec!["first.txt".to_owned()]));
+        assert!(
+            wait_for(&mut tracker, |t| t.status().unstaged().count() == 1),
+            "unstaging should be reflected"
+        );
+        assert_eq!(tracker.status().staged().count(), 0);
+        assert_eq!(
+            sandbox.read("first.txt"),
+            "one\nCHANGED\n",
+            "and must not have touched the file"
+        );
+    }
+
+    #[test]
+    fn discarding_restores_the_committed_text() {
+        let sandbox = Sandbox::new("discard");
+        let mut tracker = sandbox.tracker();
+        sandbox.write("first.txt", "wrecked\n");
+        // The tree has to be seen as dirty *first*, or waiting for it to become
+        // clean afterwards is waiting for something that is already true and
+        // the test passes without the discard having happened at all.
+        tracker.refresh_status();
+        assert!(wait_for(&mut tracker, |t| !t.status().is_clean()));
+
+        tracker.act(Action::Discard(vec!["first.txt".to_owned()]));
+        assert!(
+            wait_for(&mut tracker, |t| t.status().is_clean()),
+            "discarding should leave nothing to report"
+        );
+        assert_eq!(sandbox.read("first.txt"), "one\ntwo\n");
+    }
+
+    /// Git's own message is the useful one, so it has to survive the trip.
+    #[test]
+    fn a_failed_action_reports_what_git_said() {
+        let sandbox = Sandbox::new("failure");
+        let mut tracker = sandbox.tracker();
+        tracker.act(Action::Discard(vec!["no-such-file.txt".to_owned()]));
+        assert!(
+            wait_for(&mut tracker, |t| t.error().is_some()),
+            "git refused, and the refusal should have been reported"
+        );
+        let message = tracker.error().expect("a message").to_owned();
+        assert!(
+            message.starts_with("Could not discard:"),
+            "it should say which action failed, got {message:?}"
+        );
+        assert!(
+            message.len() > "Could not discard:".len() + 1,
+            "and carry git's own words, got {message:?}"
+        );
+
+        tracker.clear_error();
+        assert_eq!(tracker.error(), None);
+    }
+
+    /// The whole reason the panel does not spawn git on every frame it is open.
+    #[test]
+    fn refreshing_repeatedly_queues_one_request_not_many() {
+        let sandbox = Sandbox::new("coalesce");
+        let mut tracker = sandbox.tracker();
+        for _ in 0..100 {
+            tracker.refresh_status();
+        }
+        assert!(
+            wait_for(&mut tracker, |t| !t.status_pending),
+            "the outstanding request should have completed"
+        );
+        // A second round is allowed once the first has landed; the guarantee is
+        // that a hundred calls in one frame do not become a hundred processes.
+        tracker.refresh_status();
+        assert!(tracker.status_pending);
+        tracker.refresh_status();
+        assert!(tracker.status_pending, "still just the one");
+    }
+
+    #[test]
+    fn a_tracker_with_no_repository_refuses_to_act() {
+        let mut tracker = tracker();
+        tracker.act(Action::Stage(vec!["anything".to_owned()]));
+        tracker.refresh_status();
+        tracker.poll();
+        assert!(!tracker.status_known());
+        assert_eq!(tracker.error(), None, "there was nothing to fail");
+    }
+
+    /// Opening one crate of a workspace is the normal case, and it makes the
+    /// project folder and the repository root two different directories. Every
+    /// path git reports is relative to the second, so anything joining them
+    /// onto the first points at nothing.
+    #[test]
+    fn opening_a_subdirectory_still_reports_the_repositorys_top_level() {
+        let sandbox = Sandbox::new("subdirectory");
+        let inner = sandbox.root.join("crates").join("thing");
+        std::fs::create_dir_all(&inner).expect("subdirectory");
+
+        let mut tracker = super::Tracker::new(Arc::new(|| {}));
+        tracker.set_project(Some(&inner));
+        assert!(wait_for(&mut tracker, |t| t.replied));
+
+        assert_eq!(
+            tracker.root(),
+            Some(sandbox.root.as_path()),
+            "the top level, not the folder that was opened"
+        );
+    }
+
+    #[test]
+    fn a_tracker_with_no_repository_has_no_root() {
+        let tracker = tracker();
+        assert_eq!(tracker.root(), None);
+    }
+
+    #[test]
+    fn changing_project_forgets_the_working_tree_too() {
+        let sandbox = Sandbox::new("forget-status");
+        let mut tracker = sandbox.tracker();
+        sandbox.write("first.txt", "changed\n");
+        tracker.refresh_status();
+        assert!(wait_for(&mut tracker, |t| !t.status().is_clean()));
+
+        tracker.set_project(None);
+        assert!(!tracker.status_known());
+        assert!(tracker.status().is_clean());
     }
 }

@@ -61,6 +61,7 @@ A few that are worth knowing about:
 | `Ctrl+R` | Go to a symbol in this file |
 | `Ctrl+Shift+[` | Fold or unfold the block around the caret |
 | `Ctrl+Shift+G` | Show this file's changes since the last commit |
+| `Ctrl+G` | Open the Source Control panel |
 | `Ctrl+F` | Find, in this file |
 | `Ctrl+Shift+F` | Find across the project |
 | `F12` | Go to the definition |
@@ -99,9 +100,25 @@ deleted. The status bar names the branch you are on.
 with the line numbers from both sides so you can find anything you see in it.
 
 The comparison is against the last commit, not against the file on disk — so
-saving does not clear the marks, and committing does. Nothing here changes the
-repository: The Editor runs your `git`, which means your configuration, your
-hooks and your signing key, but for now it only ever reads.
+saving does not clear the marks, and committing does.
+
+### Staging
+
+**Ctrl+G** opens the **Source Control** panel, which lists every file that
+differs from the last commit in three groups: conflicts first, then what is
+staged, then what is not. New files git has never seen sit with the unstaged
+ones, because staging them is the same decision.
+
+Each row has **Stage** or **Unstage**, and the buttons above do the whole list
+at once. Click a file's name to open it; double-click to see its changes.
+
+**Discard** throws the changes away, and asks first. It has to: unlike deleting
+a file, which goes to the recycle bin, discarded changes are not anywhere —
+not in the undo history, not in the recycle bin, and not in git. Untracked
+files are never touched by it.
+
+The Editor runs your own `git` throughout, so your configuration, your hooks
+and your signing key all apply. It does not yet commit; that is next.
 
 ### When a file changes underneath you
 

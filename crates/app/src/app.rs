@@ -31,6 +31,7 @@ use crate::debugger::{self, Breakpoints, DebugView};
 use crate::diff_view;
 use crate::docs_window::DocsWindow;
 use crate::file_picker::FilePicker;
+use crate::git_panel::{self, GitPanel};
 use crate::new_file;
 use crate::packages_panel::PackagesPanel;
 use crate::palette::Palette;
@@ -231,9 +232,11 @@ pub(crate) struct EditorApp {
     /// Watches the open folder. `None` when no folder is open, or when the
     /// platform refused to watch it.
     watcher: Option<Watcher>,
-    /// What git says about the project: the branch, and how each open buffer
-    /// differs from the committed version.
+    /// What git says about the project: the branch, how each open buffer
+    /// differs from the committed version, and what is staged.
     git: editor_vcs::tracker::Tracker,
+    /// The Source Control tab.
+    git_panel: GitPanel,
     /// Whether the window had focus last frame, so returning to it can be
     /// told from merely still having it.
     was_focused: bool,
@@ -278,6 +281,12 @@ pub(crate) struct EditorApp {
     pending_recent: Option<PathBuf>,
     /// A file or folder awaiting a yes/no before it is moved to the trash.
     pending_delete: Option<PathBuf>,
+    /// Paths awaiting a yes/no before their changes are thrown away.
+    ///
+    /// Unlike a delete this does not go to the recycle bin, and unlike
+    /// everything else in the git panel it cannot be undone by git either: the
+    /// text was never committed, never stashed, and is not in the reflog.
+    pending_discard: Option<Vec<String>>,
     /// Whether the Problems panel shows every file or only the open one.
     problems_all_files: bool,
     /// The diagnostic the caret is sitting on, so the Problems panel can pick
@@ -341,6 +350,7 @@ enum DockTab {
     Search,
     Terminal,
     Packages,
+    Git,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -415,6 +425,7 @@ impl EditorApp {
                     ctx.request_repaint();
                 }))
             },
+            git_panel: GitPanel::default(),
             was_focused: true,
             from_command_line: open,
             recovery: recovery::Recovery::new(&paths_for_recovery),
@@ -432,6 +443,7 @@ impl EditorApp {
             recent: Vec::new(),
             pending_recent: None,
             pending_delete: None,
+            pending_discard: None,
             problems_all_files: false,
             problem_at_caret: None,
             problem_revealed: None,
@@ -832,6 +844,9 @@ impl EditorApp {
                 // Save As gives the document a new path, and possibly one in a
                 // directory nothing is watching yet.
                 self.sync_watched_files();
+                // The working tree just changed on disk, and the panel is
+                // describing the state from before the save.
+                self.git.refresh_status();
                 self.info(format!("Saved {name}"));
             }
             Err(e) => self.error(format!("Save failed: {e:#}")),
@@ -3364,6 +3379,84 @@ impl EditorApp {
         }
     }
 
+    /// Carry out what the Source Control panel asked for.
+    ///
+    /// Everything except discarding happens immediately: staging and unstaging
+    /// move the index around and git can put either back. Discarding cannot be
+    /// put back by anything, so it goes through [`Self::discard_prompt`].
+    fn apply_git_action(&mut self, action: git_panel::Action) {
+        match action {
+            git_panel::Action::None => {}
+            git_panel::Action::Refresh => self.git.refresh_status(),
+            git_panel::Action::Stage(paths) => {
+                self.git.act(editor_vcs::tracker::Action::Stage(paths));
+            }
+            git_panel::Action::Unstage(paths) => {
+                self.git.act(editor_vcs::tracker::Action::Unstage(paths));
+            }
+            git_panel::Action::Discard(paths) => self.pending_discard = Some(paths),
+            git_panel::Action::Open(path) => self.open_path(&path, true),
+            git_panel::Action::Diff(path) => self.diff_view.open(path),
+        }
+    }
+
+    /// Confirm before throwing work away.
+    ///
+    /// Worded more bluntly than the delete prompt on purpose. A deleted file is
+    /// in the recycle bin; discarded changes are nowhere. The default is to
+    /// cancel, and Escape takes it.
+    fn discard_prompt(&mut self, ctx: &egui::Context) {
+        let Some(paths) = self.pending_discard.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+
+        egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading(if paths.len() == 1 {
+                "Discard changes to this file?"
+            } else {
+                "Discard changes to these files?"
+            });
+            ui.add_space(8.0);
+            ui.label("The changes are thrown away. This cannot be undone \u{2014} not by Undo, and not by git.");
+            ui.add_space(8.0);
+
+            // Every path, up to a point. A list that scrolls off the modal is
+            // a list nobody read before clicking.
+            const SHOWN: usize = 12;
+            for path in paths.iter().take(SHOWN) {
+                ui.weak(path);
+            }
+            if paths.len() > SHOWN {
+                ui.weak(format!("\u{2026} and {} more", paths.len() - SHOWN));
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    decision = Some(false);
+                }
+                if ui.button("Discard").clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+
+        match decision {
+            None => {}
+            Some(false) => self.pending_discard = None,
+            Some(true) => {
+                let paths = self.pending_discard.take().unwrap_or_default();
+                self.git.act(editor_vcs::tracker::Action::Discard(paths));
+            }
+        }
+    }
+
     fn delete_path(&mut self, path: &Path) {
         if let Err(e) = editor_widgets::file_tree::move_to_trash(path) {
             self.error(format!("Could not delete {}: {e}", path.display()));
@@ -3720,6 +3813,13 @@ impl EditorApp {
                 // surprising answer to "show me the problems".
                 self.show_output = true;
                 self.dock = DockTab::Problems;
+            }
+            CommandId::ShowSourceControl => {
+                self.dock = DockTab::Git;
+                self.show_output = true;
+                // Opening the panel is the moment its contents matter, and the
+                // status may be minutes old or never fetched.
+                self.git.refresh_status();
             }
             CommandId::ShowDiff => match self.active_doc().and_then(|e| e.doc.path()) {
                 Some(path) => {
@@ -4682,6 +4782,7 @@ impl eframe::App for EditorApp {
             || self.file_picker.is_open()
             || self.settings_form.is_open()
             || self.pending_delete.is_some()
+            || self.pending_discard.is_some()
             || self.palette.is_open()
             || self.new_file.is_open()
             || self.venv_dialog.is_open()
@@ -4744,7 +4845,15 @@ impl eframe::App for EditorApp {
             let mut search_action = crate::project_search::Action::None;
             let mut start_terminal = false;
             let mut open_packages = false;
+            let mut open_git = false;
             let mut packages_action = crate::packages_panel::Action::None;
+            let mut git_action = git_panel::Action::None;
+            // Read before the closure borrows self for the panel. The panel
+            // needs the repository root to turn git's relative paths back into
+            // ones the editor can open — the *repository's* root, not the open
+            // folder's, because opening one crate of a workspace makes those
+            // two different and every path in the panel relative to the former.
+            let git_root = self.git.root().map(Path::to_path_buf);
             // Read before the closure borrows self for the panel.
             let python = self
                 .interpreter()
@@ -4831,6 +4940,13 @@ impl eframe::App for EditorApp {
                             self.dock = DockTab::Packages;
                             open_packages = true;
                         }
+                        if ui
+                            .selectable_label(self.dock == DockTab::Git, "SOURCE CONTROL")
+                            .clicked()
+                        {
+                            self.dock = DockTab::Git;
+                            open_git = true;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
                                 self.show_output = false;
@@ -4852,6 +4968,21 @@ impl eframe::App for EditorApp {
                                 self.packages
                                     .ui(ui, python.as_deref(), requirements.as_deref());
                         }
+                        DockTab::Git => {
+                            let state = if self.git.has_repo() {
+                                if self.git.status_known() {
+                                    git_panel::State::Ready {
+                                        status: self.git.status(),
+                                        error: self.git.error(),
+                                    }
+                                } else {
+                                    git_panel::State::Waiting
+                                }
+                            } else {
+                                git_panel::State::NoRepository
+                            };
+                            git_action = self.git_panel.ui(ui, state, git_root.as_deref());
+                        }
                         DockTab::Debug => {
                             let running = self.debug.is_some();
                             let paused = self
@@ -4870,7 +5001,11 @@ impl eframe::App for EditorApp {
                 self.packages.opened();
                 self.refresh_packages();
             }
+            if open_git {
+                self.git.refresh_status();
+            }
             self.apply_packages_action(packages_action);
+            self.apply_git_action(git_action);
 
             match search_action {
                 crate::project_search::Action::None => {}
@@ -4948,6 +5083,7 @@ impl eframe::App for EditorApp {
         }
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
+        self.discard_prompt(&ctx);
         self.search.poll();
         if self.packages.poll() {
             // pip's update check talks to the network and takes seconds; keep

@@ -920,6 +920,17 @@ cannot be reached.
   a file is fetched once on a worker thread and diffed in process against the
   buffer, which is what turns "a subprocess per keystroke" into "a subprocess
   per file"; the cache is dropped whole when HEAD moves.
+- **A Source Control panel** (`Ctrl+G`): the working tree in three groups —
+  conflicts, staged, not staged — with stage, unstage and discard, and the
+  whole list at once. `git status --porcelain=v1 -z`, so a filename containing
+  a newline is read correctly rather than unescaped by a second parser.
+  Discarding is the one action in the editor that destroys work git cannot get
+  back, so the panel cannot do it: it reports the request and the application
+  confirms first, naming the files and saying plainly that neither Undo nor git
+  will help. The worker re-reads the status after every action rather than
+  letting the caller ask, because a caller that asks for itself can ask too
+  early and get the state from before the action — which is what makes a
+  staging panel look like it does nothing.
 
 ### Sequencing changes made along the way
 
@@ -945,7 +956,7 @@ about reviewing from memory rather than from the code.
 
 | | Why it matters | Rough size |
 |---|---|---|
-| **Version control — the writing half** | The read-only half has landed (see below). What remains is a status and staging panel, commit and amend, log and blame, and branch switching. Everything after this reads from the same `editor-vcs` crate and the same worker thread, so the expensive part — deciding how the editor talks to git at all — is already paid for. | 2–3 wk |
+| **Version control — committing and history** | Reading and staging have landed (see below). What remains is commit and amend, log and blame, and branch switching. Everything reads from the same `editor-vcs` crate and the same worker thread, so the expensive part — deciding how the editor talks to git at all — is already paid for. | 1.5–2 wk |
 | **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. "Run Tests" currently just runs the open file. A headline PyCharm feature for Python and the natural partner to the debugger. | 2–3 wk |
 | **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
 | **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |
