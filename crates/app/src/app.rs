@@ -1517,7 +1517,7 @@ impl EditorApp {
     /// Started in the project root with the virtual environment's directory
     /// ahead of `PATH`, so `python` and `pip` are the project's from the first
     /// command rather than after activating something.
-    fn open_terminal(&mut self) {
+    fn open_terminal(&mut self, ctx: &egui::Context) {
         if self.terminal.is_running() {
             return;
         }
@@ -1528,7 +1528,7 @@ impl EditorApp {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let extra = self.tool_search_path();
-        self.terminal.start(&cwd, &extra);
+        self.terminal.start(&cwd, &extra, ctx);
     }
 
     /// Start a project-wide search over the open folder.
@@ -3667,7 +3667,7 @@ impl EditorApp {
             CommandId::ShowTerminal => {
                 self.dock = DockTab::Terminal;
                 self.show_output = true;
-                self.open_terminal();
+                self.open_terminal(ctx);
             }
             CommandId::ShowPackages => {
                 self.dock = DockTab::Packages;
@@ -4485,6 +4485,7 @@ impl eframe::App for EditorApp {
         }
         self.report_startup();
         self.open_from_command_line();
+        self.runner.set_context(&ctx);
         self.poll_watcher();
         self.check_disk_on_focus(&ctx);
         self.autosave(&ctx);
@@ -4714,7 +4715,7 @@ impl eframe::App for EditorApp {
                 });
 
             if start_terminal {
-                self.open_terminal();
+                self.open_terminal(&ctx);
             }
             if open_packages {
                 self.packages.opened();

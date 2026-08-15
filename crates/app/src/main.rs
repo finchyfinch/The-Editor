@@ -24,6 +24,7 @@ mod runner;
 mod settings_window;
 mod symbol_picker;
 mod terminal;
+mod terminal_keys;
 mod venv_dialog;
 mod watcher;
 

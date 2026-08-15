@@ -13,6 +13,11 @@ use editor_widgets::console::Console;
 
 /// The run panel's state.
 pub(crate) struct Runner {
+    /// The interface to wake when a running program produces output.
+    ///
+    /// Set once, after the window exists. `None` only in tests, which drive
+    /// the runner directly and have nothing to wake.
+    wake: Option<eframe::egui::Context>,
     session: Option<Session>,
     output: AnsiSink,
     pub(crate) console: Console,
@@ -42,6 +47,7 @@ impl std::fmt::Debug for Runner {
 impl Default for Runner {
     fn default() -> Self {
         Self {
+            wake: None,
             session: None,
             output: AnsiSink::new(DEFAULT_SCROLLBACK),
             console: Console::default(),
@@ -128,6 +134,13 @@ impl Runner {
     ///
     /// # Errors
     /// If the process cannot be started.
+    /// Give the runner something to wake when output arrives.
+    pub(crate) fn set_context(&mut self, ctx: &eframe::egui::Context) {
+        if self.wake.is_none() {
+            self.wake = Some(ctx.clone());
+        }
+    }
+
     pub(crate) fn start(&mut self, config: RunConfig, clear_first: bool) -> anyhow::Result<()> {
         self.stop();
         // A new run started by hand abandons any sequence in progress.
@@ -143,7 +156,14 @@ impl Runner {
         self.output
             .push_line(&format!("  in {}", config.cwd.display()));
 
-        let session = Session::spawn(&config, 24, 120)?;
+        // Same reason as the terminal: without a wake the output sits in the
+        // channel until something else causes a frame, so a long compile looks
+        // stalled between bursts.
+        let wake = self.wake.clone().map(|ctx| {
+            let waker: editor_proc::pty::Waker = std::sync::Arc::new(move || ctx.request_repaint());
+            waker
+        });
+        let session = Session::spawn_with_wake(&config, 24, 120, wake)?;
         self.cwd = config.cwd.clone();
         self.label = config.label.clone();
         self.last = Some(config);

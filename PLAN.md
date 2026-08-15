@@ -937,14 +937,15 @@ about reviewing from memory rather than from the code.
 #### On coding-agent integration
 
 Claude Code and its like are command-line tools, and the integrated terminal
-already runs them in the project with the virtual environment on `PATH`. When
-one of them edits a file the watcher notices and offers to reload it, which is
-the half that matters and works today.
+runs them in the project with the virtual environment on `PATH`. It became a
+real terminal for this reason: a full-screen program needs cursor addressing,
+the alternate screen and raw keys, and a scrollback that understood colour gave
+it none of those while claiming through `TERM` that it did.
 
-What is missing is not a chat panel — that would duplicate a working CLI and
-tie the editor to one vendor's interface. It is being able to see what an agent
-changed and undo part of it, which is version control, plus the project-wide
-change signal above. Both are already on this list on their own merits.
+What is still missing is not a chat panel — that would duplicate a working CLI
+and tie the editor to one vendor's interface. It is being able to see what an
+agent changed and undo part of it, which is version control, plus the
+project-wide change signal above. Both are on this list on their own merits.
 
 Deliberately out of scope, recorded so the decision is not re-litigated: remote
 development over SSH or containers, Jupyter notebooks, database tools, and

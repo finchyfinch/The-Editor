@@ -118,6 +118,15 @@ still running.
 directory already on `PATH` — so `python` and `pip` are the project's from the
 first command, without activating anything.
 
+It is a real terminal, not a log of output: full-screen programs work, so
+`claude`, `vim`, `htop`, `git rebase -i` and `pytest --pdb` all run in it.
+Every key reaches the program, including the arrows, Tab, Escape and Ctrl+C —
+which means Ctrl+C interrupts rather than copying, as it does in every
+terminal. Scroll up for history; it sticks to the bottom while output arrives.
+
+The terminal takes its size from the panel, so drag the dock taller if a
+program needs more room.
+
 ### Debugging Python
 
 Set a breakpoint by clicking the left-hand gutter, or with `F9`. Press **F5**

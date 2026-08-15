@@ -1,33 +1,45 @@
-//! An integrated shell.
+//! An integrated terminal.
 //!
-//! The run console already drives a program under a pseudo-terminal and renders
-//! its ANSI output; a terminal is the same machinery pointed at a shell instead
-//! of at the file you are editing. Almost all of this is choosing the shell and
-//! keeping a scrollback.
+//! A real one, as of this version: a grid the program draws on, not a log of
+//! lines. [`editor_proc::screen::Screen`] holds the grid and interprets the
+//! escape sequences; this panel draws it, works out how many rows and columns
+//! fit, and turns key presses into the bytes a program is waiting for.
 //!
-//! Worth having because without it every `pip install`, `git commit` and
-//! `pytest -k` means leaving the editor — and the project's virtual environment
-//! is already known here, so the shell can start inside it.
+//! That distinction is the whole feature. The previous terminal was a
+//! scrollback that understood colour, which is right for a build log and wrong
+//! for anything interactive: it told programs `TERM=xterm-256color` and then
+//! ignored every sequence that moved the cursor, so a full-screen program drew
+//! its window into a list of lines and the result was unreadable. It also sent
+//! whole lines on Enter, so a program reading single keys never saw them.
 //!
 //! One session, not many. Tabs of terminals are a feature of a terminal
 //! emulator; what an editor needs is a place to run a command in the project.
 
 use std::path::{Path, PathBuf};
 
-use editor_proc::ansi::AnsiSink;
+use editor_proc::ansi::{Colour, Line};
 use editor_proc::pty::{Event, Session};
 use editor_proc::run_config::RunConfig;
+use editor_proc::screen::Screen;
 use eframe::egui;
 
-/// Lines of scrollback kept. A build that prints for a minute must not grow
-/// until the editor runs out of memory.
+use crate::terminal_keys;
+
+/// Rows of scrollback kept above the screen.
 const SCROLLBACK: usize = 5_000;
 
+/// The measurements every part of the drawing needs, worked out once a frame.
+struct Metrics {
+    font: egui::FontId,
+    row_height: f32,
+    cell_width: f32,
+}
+
+/// The size the session starts at, before the panel has been laid out once.
+const INITIAL_ROWS: usize = 24;
+const INITIAL_COLS: usize = 80;
+
 /// The shell to start, and what to call it.
-///
-/// PowerShell before `cmd` on Windows because it is what anyone doing anything
-/// beyond `dir` is already using; `$SHELL` elsewhere because a user who changed
-/// it meant it.
 #[must_use]
 fn shell() -> (PathBuf, Vec<String>, String) {
     if cfg!(windows) {
@@ -54,25 +66,22 @@ fn shell() -> (PathBuf, Vec<String>, String) {
 
 pub(crate) struct Terminal {
     session: Option<Session>,
-    output: AnsiSink,
-    input: String,
+    screen: Screen,
     label: String,
     /// Set when the panel opens, so typing can start without clicking first.
-    focus_input: bool,
-    follow: bool,
+    grab_focus: bool,
+    /// A note shown instead of the grid when there is no session.
+    message: Option<String>,
 }
 
 impl Default for Terminal {
     fn default() -> Self {
         Self {
             session: None,
-            // A sink has no meaningful default size, so it is stated here
-            // rather than derived.
-            output: AnsiSink::new(SCROLLBACK),
-            input: String::new(),
+            screen: Screen::new(INITIAL_ROWS, INITIAL_COLS, SCROLLBACK),
             label: String::new(),
-            focus_input: false,
-            follow: true,
+            grab_focus: false,
+            message: None,
         }
     }
 }
@@ -81,6 +90,7 @@ impl std::fmt::Debug for Terminal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Terminal")
             .field("running", &self.is_running())
+            .field("screen", &self.screen)
             .finish()
     }
 }
@@ -91,11 +101,7 @@ impl Terminal {
     }
 
     /// Start a shell in `cwd`, with `extra_path` ahead of `PATH`.
-    ///
-    /// `extra_path` is how the project's virtual environment gets in: a
-    /// terminal that does not have the venv's `python` on its path is a
-    /// terminal you have to activate the venv in before it is useful.
-    pub(crate) fn start(&mut self, cwd: &Path, extra_path: &[PathBuf]) {
+    pub(crate) fn start(&mut self, cwd: &Path, extra_path: &[PathBuf], ctx: &egui::Context) {
         if self.is_running() {
             return;
         }
@@ -121,16 +127,24 @@ impl Terminal {
             env,
         };
 
-        self.output = AnsiSink::new(SCROLLBACK);
-        self.follow = true;
-        self.focus_input = true;
+        let (rows, cols) = self.screen.size();
+        self.screen = Screen::new(rows, cols, SCROLLBACK);
+        self.grab_focus = true;
         self.label = name;
+        self.message = None;
 
-        match Session::spawn(&config, 30, 120) {
+        // Wake the interface when the shell produces something. Without this
+        // the output waits in the channel until a key is pressed or the pointer
+        // moves, which looks exactly like the program having hung -- and for a
+        // shell, where output arrives after you have stopped typing, that is
+        // the normal case rather than an edge one.
+        let waker = ctx.clone();
+        let wake: editor_proc::pty::Waker = std::sync::Arc::new(move || waker.request_repaint());
+
+        match Session::spawn_with_wake(&config, rows as u16, cols as u16, Some(wake)) {
             Ok(session) => self.session = Some(session),
             Err(e) => {
-                self.output
-                    .push_line(&format!("[Could not start a shell: {e:#}]"));
+                self.message = Some(format!("Could not start a shell: {e:#}"));
                 self.session = None;
             }
         }
@@ -140,13 +154,10 @@ impl Terminal {
         if let Some(session) = self.session.take() {
             session.stop();
         }
-        self.output.push_line("[Shell closed]");
+        self.message = Some("Shell closed.".to_owned());
     }
 
     /// Drain the shell's output. Call once per frame.
-    ///
-    /// Returns true if anything arrived, so the caller knows to keep the frame
-    /// loop turning.
     pub(crate) fn poll(&mut self) -> bool {
         let Some(session) = self.session.as_ref() else {
             return false;
@@ -155,17 +166,18 @@ impl Terminal {
         let busy = !events.is_empty();
         for event in events {
             match event {
-                Event::Output(bytes) => self.output.feed(&bytes),
+                Event::Output(bytes) => self.screen.feed(&bytes),
                 Event::Exited(_) => {
-                    self.output.push_line("[Shell exited]");
+                    self.message = Some("Shell exited.".to_owned());
                     self.session = None;
                 }
-                Event::Failed(message) => self.output.push_line(&format!("[{message}]")),
+                Event::Failed(message) => self.message = Some(message),
             }
         }
         busy
     }
 
+    /// Draw the terminal. Returns true if a shell should be started.
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, cwd: Option<&Path>) -> bool {
         let mut wants_start = false;
 
@@ -181,78 +193,314 @@ impl Terminal {
                     wants_start = true;
                 }
             }
-            if ui.button("Clear").clicked() {
-                self.output = AnsiSink::new(SCROLLBACK);
-            }
-            if let Some(cwd) = cwd {
+            // The title a program set, which is how `claude` and `vim` say what
+            // they are doing.
+            if let Some(title) = self.screen.title() {
+                ui.separator();
+                ui.weak(title.to_owned());
+            } else if let Some(cwd) = cwd {
+                ui.separator();
                 ui.weak(cwd.display().to_string());
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut self.follow, "Follow");
-            });
         });
         ui.separator();
 
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let row = ui.fonts_mut(|f| f.row_height(&font));
-
-        // Bottom-up, so the prompt claims its height *first* and the scrollback
-        // fills whatever is left. Laying out top-down and capping the scroll
-        // area at "available height minus a guess" is what clipped the input
-        // behind the status bar: the guess has to be exactly right, and it
-        // stops being right the moment the interface font size changes.
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            if self.is_running() {
-                ui.horizontal(|ui| {
-                    ui.weak("\u{203a}");
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.input)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("Type a command"),
-                    );
-                    if std::mem::take(&mut self.focus_input) {
-                        field.request_focus();
-                    }
-                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let line = std::mem::take(&mut self.input);
-                        if let Some(session) = self.session.as_ref() {
-                            // Carriage return alone. A terminal sends CR for
-                            // Enter, and the LF is a second key press: PSReadLine
-                            // reads it as "insert a newline", drops to its `>>`
-                            // continuation prompt, and treats the next command
-                            // as a second line of the same statement.
-                            let _ = session.send_input(&format!("{line}\r"));
-                        }
-                        // Keep focus, so a run of commands can be typed without
-                        // reaching for the mouse between each one.
-                        self.focus_input = true;
-                        self.follow = true;
-                    }
-                });
-                ui.separator();
-            }
-
-            // Whatever height is left after the prompt has taken its own.
-            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                egui::ScrollArea::both()
-                    .id_salt("terminal_output")
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(self.follow)
-                    .show_rows(ui, row, self.output.line_count(), |ui, rows| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        for line in self.output.lines().skip(rows.start).take(rows.len()) {
-                            let text = line.plain();
-                            ui.label(
-                                egui::RichText::new(if text.is_empty() { " " } else { &text })
-                                    .font(font.clone()),
-                            );
-                        }
-                    });
+        if let Some(message) = self.message.clone()
+            && !self.is_running()
+        {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.weak(message);
             });
-        });
+            return wants_start;
+        }
 
+        self.grid_ui(ui);
         wants_start
+    }
+
+    /// The grid itself, plus the keyboard.
+    fn grid_ui(&mut self, ui: &mut egui::Ui) {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let metrics = Metrics {
+            row_height: ui.fonts_mut(|f| f.row_height(&font)),
+            // Every cell is one character wide because the font is monospaced,
+            // which is the assumption the whole grid rests on.
+            cell_width: ui.fonts_mut(|f| f.glyph_width(&font, 'M')),
+            font,
+        };
+
+        // The *viewport* decides the grid, not the content: the child is
+        // drawing into the window you can see, and telling it otherwise makes
+        // it lay out for a screen that is not there.
+        let viewport = ui.available_size();
+        let cols = ((viewport.x / metrics.cell_width).floor() as usize).clamp(20, 500);
+        let rows = ((viewport.y / metrics.row_height).floor() as usize).clamp(4, 200);
+
+        if self.screen.size() != (rows, cols) {
+            self.screen.resize(rows, cols);
+            if let Some(session) = self.session.as_ref() {
+                session.resize(rows as u16, cols as u16);
+            }
+        }
+
+        // Scrollback above the grid, in one scrollable run. Sticking to the
+        // bottom keeps the live screen in view while output arrives, and
+        // scrolling up reaches what has gone past — which is the whole reason
+        // a shell keeps history.
+        //
+        // The alternate screen has no scrollback, so this collapses to exactly
+        // the grid there, which is what a full-screen program wants: it is
+        // drawing a window, not producing a transcript.
+        let history = self.screen.scrollback().len();
+        let total_rows = history + rows;
+
+        egui::ScrollArea::vertical()
+            .id_salt("terminal_grid")
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(viewport.x, total_rows as f32 * metrics.row_height),
+                    egui::Sense::click(),
+                );
+                if std::mem::take(&mut self.grab_focus) || response.clicked() {
+                    response.request_focus();
+                }
+
+                if response.has_focus() {
+                    // Claim the keys egui would otherwise spend on moving focus
+                    // between widgets. A terminal wants all of them: Tab
+                    // completes, the arrows move through history, Escape means
+                    // Escape.
+                    ui.memory_mut(|memory| {
+                        memory.set_focus_lock_filter(
+                            response.id,
+                            egui::EventFilter {
+                                tab: true,
+                                horizontal_arrows: true,
+                                vertical_arrows: true,
+                                escape: true,
+                            },
+                        );
+                    });
+                    self.handle_keys(ui);
+                }
+
+                let clip = ui.clip_rect();
+                self.paint(
+                    &ui.painter_at(clip),
+                    ui.visuals(),
+                    rect,
+                    clip,
+                    &metrics,
+                    response.has_focus(),
+                );
+            });
+    }
+
+    /// Turn this frame's input into bytes for the child.
+    fn handle_keys(&mut self, ui: &egui::Ui) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let application_cursor = self.screen.application_cursor();
+        let bracketed = self.screen.bracketed_paste();
+        let events = ui.input(|i| i.events.clone());
+
+        for event in events {
+            let bytes = match event {
+                egui::Event::Text(text) => terminal_keys::encode_text(&text),
+                egui::Event::Paste(text) => terminal_keys::encode_paste(&text, bracketed),
+                egui::Event::Copy | egui::Event::Cut => {
+                    // Ctrl+C in a terminal interrupts; it does not copy, which
+                    // is why every terminal uses Ctrl+Shift+C for copying. egui
+                    // synthesises these from the platform, so they are ignored
+                    // here and the interrupt goes through as Ctrl+C below.
+                    continue;
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => match terminal_keys::encode(key, modifiers, application_cursor) {
+                    Some(bytes) => bytes,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let _ = session.send_bytes(&bytes);
+        }
+    }
+
+    /// Draw the rows that fall inside the clip rectangle.
+    ///
+    /// Only those: a shell with five thousand rows of history would otherwise
+    /// lay out five thousand rows to show forty.
+    #[allow(clippy::too_many_arguments)]
+    fn paint(
+        &self,
+        painter: &egui::Painter,
+        visuals: &egui::Visuals,
+        rect: egui::Rect,
+        clip: egui::Rect,
+        metrics: &Metrics,
+        focused: bool,
+    ) {
+        let scrollback = self.screen.scrollback();
+        let visible = self.screen.visible_lines();
+        let total = scrollback.len() + visible.len();
+
+        let first = (((clip.top() - rect.top()) / metrics.row_height)
+            .floor()
+            .max(0.0) as usize)
+            .min(total);
+        let last =
+            ((((clip.bottom() - rect.top()) / metrics.row_height).ceil() as usize) + 1).min(total);
+
+        for row in first..last {
+            let line = match scrollback.get(row) {
+                Some(line) => line,
+                None => &visible[row - scrollback.len()],
+            };
+            let y = rect.top() + row as f32 * metrics.row_height;
+            self.paint_line(painter, visuals, line, egui::pos2(rect.left(), y), metrics);
+        }
+
+        if focused && self.screen.cursor_visible() && self.is_running() {
+            let (row, col) = self.screen.cursor();
+            let top = rect.top() + (scrollback.len() + row) as f32 * metrics.row_height;
+            let left = rect.left() + col as f32 * metrics.cell_width;
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(left, top),
+                    egui::vec2(metrics.cell_width.max(1.0), metrics.row_height),
+                ),
+                0.0,
+                // A block, at half strength, so the character underneath is
+                // still readable through it.
+                visuals.strong_text_color().gamma_multiply(0.5),
+            );
+        }
+    }
+
+    fn paint_line(
+        &self,
+        painter: &egui::Painter,
+        visuals: &egui::Visuals,
+        line: &Line,
+        at: egui::Pos2,
+        metrics: &Metrics,
+    ) {
+        let (left, y) = (at.x, at.y);
+        let (font, cell_width) = (&metrics.font, metrics.cell_width);
+        let mut column = 0usize;
+        for run in &line.runs {
+            let width = run.text.chars().count() as f32 * cell_width;
+            let x = left + column as f32 * cell_width;
+
+            if let Some(background) = run.style.background {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(x, y),
+                        egui::vec2(width, metrics.row_height),
+                    ),
+                    0.0,
+                    colour_of(visuals, background),
+                );
+            }
+            let colour = run
+                .style
+                .foreground
+                .map_or_else(|| visuals.text_color(), |c| colour_of(visuals, c));
+            painter.text(
+                egui::pos2(x, y),
+                egui::Align2::LEFT_TOP,
+                &run.text,
+                font.clone(),
+                colour,
+            );
+            column += run.text.chars().count();
+        }
+    }
+}
+
+/// A terminal colour as something to paint with.
+///
+/// The sixteen indexed colours are the ones a theme is entitled to an opinion
+/// about; beyond that the program has asked for a specific colour and gets it.
+fn colour_of(visuals: &egui::Visuals, colour: Colour) -> egui::Color32 {
+    match colour {
+        Colour::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
+        Colour::Indexed(index) => indexed(visuals, index),
+    }
+}
+
+fn indexed(visuals: &egui::Visuals, index: u8) -> egui::Color32 {
+    // The usual xterm palette, adjusted so the dark half stays legible on a
+    // light background: pure blue on white is unreadable, and a terminal that
+    // follows the editor's theme has to be readable in both.
+    let dark = visuals.dark_mode;
+    match index {
+        0 => {
+            if dark {
+                egui::Color32::from_rgb(40, 42, 48)
+            } else {
+                egui::Color32::from_rgb(60, 62, 68)
+            }
+        }
+        1 => egui::Color32::from_rgb(200, 70, 70),
+        2 => egui::Color32::from_rgb(90, 160, 90),
+        3 => {
+            if dark {
+                egui::Color32::from_rgb(200, 170, 80)
+            } else {
+                egui::Color32::from_rgb(150, 120, 30)
+            }
+        }
+        4 => {
+            if dark {
+                egui::Color32::from_rgb(100, 150, 220)
+            } else {
+                egui::Color32::from_rgb(50, 100, 190)
+            }
+        }
+        5 => egui::Color32::from_rgb(170, 110, 200),
+        6 => egui::Color32::from_rgb(70, 160, 170),
+        7 => {
+            if dark {
+                egui::Color32::from_rgb(200, 202, 208)
+            } else {
+                egui::Color32::from_rgb(80, 82, 88)
+            }
+        }
+        // The bright half.
+        8 => egui::Color32::from_rgb(120, 122, 128),
+        9 => egui::Color32::from_rgb(240, 110, 110),
+        10 => egui::Color32::from_rgb(120, 200, 120),
+        11 => egui::Color32::from_rgb(230, 200, 110),
+        12 => egui::Color32::from_rgb(130, 180, 245),
+        13 => egui::Color32::from_rgb(200, 140, 230),
+        14 => egui::Color32::from_rgb(100, 200, 210),
+        15 => {
+            if dark {
+                egui::Color32::from_rgb(245, 246, 250)
+            } else {
+                egui::Color32::from_rgb(30, 32, 38)
+            }
+        }
+        // The 6x6x6 colour cube, then the greyscale ramp.
+        16..=231 => {
+            let n = index - 16;
+            let step = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            egui::Color32::from_rgb(step(n / 36), step((n / 6) % 6), step(n % 6))
+        }
+        232..=255 => {
+            let level = 8 + (index - 232) * 10;
+            egui::Color32::from_gray(level)
+        }
     }
 }
 
@@ -266,8 +514,6 @@ mod tests {
         assert!(!name.is_empty());
         assert!(!program.as_os_str().is_empty());
         if cfg!(windows) {
-            // PowerShell where it exists, `cmd` as the floor -- every Windows
-            // install has one of them.
             assert!(
                 name.contains("PowerShell") || name.contains("Command Prompt"),
                 "got {name}"
@@ -308,15 +554,50 @@ mod tests {
 
     #[test]
     fn stopping_a_terminal_that_never_started_still_says_so() {
-        // So the panel does not sit looking live after a failed start.
         let mut terminal = Terminal::default();
         terminal.stop();
-        let text: String = terminal
-            .output
-            .lines()
-            .map(|l| l.plain())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("closed"), "got {text:?}");
+        assert!(
+            terminal
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("closed")),
+            "got {:?}",
+            terminal.message
+        );
+    }
+
+    /// The grid is what a program draws on, so output has to reach it.
+    #[test]
+    fn output_lands_on_the_grid() {
+        let mut terminal = Terminal::default();
+        terminal.screen.feed(b"\x1b[2;3Hhello");
+        assert!(
+            terminal.screen.to_text().contains("hello"),
+            "got {:?}",
+            terminal.screen.to_text()
+        );
+    }
+
+    /// Every index has to produce a colour rather than panicking, including
+    /// the cube and the greyscale ramp at the top of the range.
+    #[test]
+    fn every_palette_index_maps_to_a_colour() {
+        let visuals = egui::Visuals::dark();
+        for index in 0..=255u8 {
+            let _ = indexed(&visuals, index);
+        }
+        let light = egui::Visuals::light();
+        for index in 0..=255u8 {
+            let _ = indexed(&light, index);
+        }
+    }
+
+    /// Pure blue on white is unreadable, so the dark half of the palette has to
+    /// differ between themes.
+    #[test]
+    fn the_dark_colours_differ_between_themes_so_both_stay_readable() {
+        let dark = indexed(&egui::Visuals::dark(), 4);
+        let light = indexed(&egui::Visuals::light(), 4);
+        assert_ne!(dark, light);
     }
 }

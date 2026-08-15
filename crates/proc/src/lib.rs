@@ -18,5 +18,6 @@ pub mod links;
 pub mod packages;
 pub mod pty;
 pub mod run_config;
+pub mod screen;
 pub mod spawn;
 pub mod venv;

@@ -21,6 +21,12 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use crate::run_config::RunConfig;
 
+/// Called from the reader thread when the child produces something.
+///
+/// Kept as a plain callback rather than taking an `egui::Context`, so this
+/// crate stays unaware of the user interface drawing it.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Something that happened to the running process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -63,6 +69,25 @@ impl Session {
     /// If the PTY cannot be opened or the program cannot be started — a missing
     /// interpreter, a bad working directory.
     pub fn spawn(config: &RunConfig, rows: u16, cols: u16) -> Result<Self> {
+        Self::spawn_with_wake(config, rows, cols, None)
+    }
+
+    /// Start a child, waking the caller whenever it produces something.
+    ///
+    /// `wake` is called from the reader thread the moment output arrives. A
+    /// user interface that only draws when something happens will otherwise sit
+    /// idle with the output waiting in the channel: the program writes, nothing
+    /// asks, and the screen updates the next time a key is pressed or the
+    /// pointer moves. Which looks exactly like the program having hung.
+    ///
+    /// # Errors
+    /// If the pseudo-terminal cannot be opened or the program cannot be run.
+    pub fn spawn_with_wake(
+        config: &RunConfig,
+        rows: u16,
+        cols: u16,
+        wake: Option<Waker>,
+    ) -> Result<Self> {
         let pty = NativePtySystem::default();
         let pair = pty
             .openpty(PtySize {
@@ -116,8 +141,15 @@ impl Session {
             tx.clone(),
             Arc::clone(&writer),
             Arc::clone(&exit_state),
+            wake.clone(),
         );
-        spawn_waiter(Arc::clone(&child), tx, Arc::clone(&finished), exit_state);
+        spawn_waiter(
+            Arc::clone(&child),
+            tx,
+            Arc::clone(&finished),
+            exit_state,
+            wake,
+        );
 
         Ok(Self {
             events,
@@ -162,11 +194,24 @@ impl Session {
     /// # Errors
     /// If the terminal has already closed.
     pub fn send_input(&self, text: &str) -> Result<()> {
+        self.send_bytes(text.as_bytes())
+    }
+
+    /// Send raw bytes to the child.
+    ///
+    /// What an interactive program needs: an arrow key is three bytes that are
+    /// not text, and Ctrl+C is one byte that is not a character. Anything
+    /// full-screen reads keys rather than lines, so the terminal has to be able
+    /// to send exactly what the key was.
+    ///
+    /// # Errors
+    /// If the terminal has already closed.
+    pub fn send_bytes(&self, bytes: &[u8]) -> Result<()> {
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| anyhow::anyhow!("the terminal writer is poisoned"))?;
-        writer.write_all(text.as_bytes())?;
+        writer.write_all(bytes)?;
         writer.flush()?;
         Ok(())
     }
@@ -228,6 +273,7 @@ fn spawn_reader(
     tx: Sender<Event>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     state: Arc<ExitState>,
+    wake: Option<Waker>,
 ) {
     // `reader` is moved into the thread; the caller keeps nothing.
     let mut reader = std::mem::replace(reader, Box::new(std::io::empty()));
@@ -247,6 +293,9 @@ fn spawn_reader(
                     if tx.send(Event::Output(chunk.to_vec())).is_err() {
                         break; // the console went away
                     }
+                    if let Some(wake) = wake.as_ref() {
+                        wake();
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
@@ -259,6 +308,9 @@ fn spawn_reader(
         state.drained.store(true, Ordering::SeqCst);
         if state.code.lock().is_ok_and(|c| c.is_some()) {
             announce_exit(&state, &tx);
+            if let Some(wake) = wake.as_ref() {
+                wake();
+            }
         }
     });
 }
@@ -306,6 +358,7 @@ fn spawn_waiter(
     tx: Sender<Event>,
     finished: Arc<AtomicBool>,
     state: Arc<ExitState>,
+    wake: Option<Waker>,
 ) {
     let _ = std::thread::Builder::new()
         .name("pty-waiter".to_owned())
@@ -340,6 +393,9 @@ fn spawn_waiter(
                 std::thread::sleep(Duration::from_millis(5));
             }
             announce_exit(&state, &tx);
+            if let Some(wake) = wake.as_ref() {
+                wake();
+            }
 
             // Only now is the session finished. Flipping this before the
             // announcement would let a caller that polls `is_running` stop
