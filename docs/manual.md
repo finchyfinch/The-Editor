@@ -62,6 +62,7 @@ A few that are worth knowing about:
 | `Ctrl+Shift+[` | Fold or unfold the block around the caret |
 | `Ctrl+Shift+G` | Show this file's changes since the last commit |
 | `Ctrl+G` | Open the Source Control panel |
+| `Ctrl+Shift+B` | Show who last touched each line |
 | `Ctrl+F` | Find, in this file |
 | `Ctrl+Shift+F` | Find across the project |
 | `F12` | Go to the definition |
@@ -117,8 +118,30 @@ a file, which goes to the recycle bin, discarded changes are not anywhere —
 not in the undo history, not in the recycle bin, and not in git. Untracked
 files are never touched by it.
 
-The Editor runs your own `git` throughout, so your configuration, your hooks
-and your signing key all apply. It does not yet commit; that is next.
+### Committing
+
+Write a message in the box at the top of the panel and press **Commit**. The
+button says how many files are going in, and when it is greyed out the hover
+says why — nothing staged, no message, or a conflict still to resolve.
+
+**Amend the last commit** rewrites the commit you are on instead of adding one,
+and starts from its message so a considered one is not replaced by a hurried
+one. It is the right tool for a typo in a message or a file you meant to
+include, and the wrong one once the commit has been pushed anywhere.
+
+Your `git` does the work, so your hooks run and your signing key signs. If a
+hook refuses the commit, what it printed appears in the panel and **the message
+is left alone** — fix the problem and press Commit again.
+
+### History and blame
+
+**History…** opens the log: commits on the left, and the selected one's message
+and files on the right. Click a file to open it. **Load more** reads further
+back; the window starts with the most recent hundred.
+
+**Ctrl+Shift+B** annotates every line of the open file with who last touched it
+and when. The annotations are read from the *saved* file, so unsaved edits shift
+them until you save.
 
 ### When a file changes underneath you
 

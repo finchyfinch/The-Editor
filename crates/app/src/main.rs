@@ -15,6 +15,7 @@ mod diff_view;
 mod docs_window;
 mod file_picker;
 mod git_panel;
+mod history_view;
 mod logging;
 mod new_file;
 mod packages_panel;

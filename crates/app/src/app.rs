@@ -32,6 +32,7 @@ use crate::diff_view;
 use crate::docs_window::DocsWindow;
 use crate::file_picker::FilePicker;
 use crate::git_panel::{self, GitPanel};
+use crate::history_view::{self, HistoryView};
 use crate::new_file;
 use crate::packages_panel::PackagesPanel;
 use crate::palette::Palette;
@@ -237,6 +238,10 @@ pub(crate) struct EditorApp {
     git: editor_vcs::tracker::Tracker,
     /// The Source Control tab.
     git_panel: GitPanel,
+    /// The commit history, in a window of its own.
+    history: HistoryView,
+    /// Whether the editor shows who last touched each line.
+    show_blame: bool,
     /// Whether the window had focus last frame, so returning to it can be
     /// told from merely still having it.
     was_focused: bool,
@@ -426,6 +431,8 @@ impl EditorApp {
                 }))
             },
             git_panel: GitPanel::default(),
+            history: HistoryView::default(),
+            show_blame: false,
             was_focused: true,
             from_command_line: open,
             recovery: recovery::Recovery::new(&paths_for_recovery),
@@ -847,6 +854,11 @@ impl EditorApp {
                 // The working tree just changed on disk, and the panel is
                 // describing the state from before the save.
                 self.git.refresh_status();
+                // Blame is of the file on disk, so this is the one moment it
+                // goes stale without HEAD having moved.
+                if let Some(path) = self.docs[index].doc.path().map(Path::to_path_buf) {
+                    self.git.refresh_blame(&path);
+                }
                 self.info(format!("Saved {name}"));
             }
             Err(e) => self.error(format!("Save failed: {e:#}")),
@@ -3397,6 +3409,58 @@ impl EditorApp {
             git_panel::Action::Discard(paths) => self.pending_discard = Some(paths),
             git_panel::Action::Open(path) => self.open_path(&path, true),
             git_panel::Action::Diff(path) => self.diff_view.open(path),
+            git_panel::Action::Commit { message, amend } => {
+                self.git
+                    .act(editor_vcs::tracker::Action::Commit { message, amend });
+            }
+            git_panel::Action::ShowHistory => {
+                self.history.open();
+                if !self.git.log_known() {
+                    self.git.refresh_log(history_view::PAGE);
+                }
+            }
+        }
+    }
+
+    /// The history window, and what it needs to draw.
+    fn history_window(&mut self, ctx: &egui::Context) {
+        if !self.history.is_open() {
+            return;
+        }
+        // Asked for here rather than when the row was clicked: the selection
+        // can also change by the list reloading under it, and this covers both.
+        let selected = self.history.selected().map(str::to_owned);
+        if let Some(id) = &selected {
+            self.git.detail(id);
+        }
+
+        let state = if self.git.has_repo() {
+            if self.git.log_known() {
+                history_view::State::Ready {
+                    commits: self.git.log(),
+                    detail: selected.as_deref().and_then(|id| self.git.known_detail(id)),
+                    // Exactly as many as were asked for means there are
+                    // probably more; fewer means the history ran out.
+                    more: self.git.log().len() >= self.git.log_limit(),
+                }
+            } else {
+                history_view::State::Waiting
+            }
+        } else {
+            history_view::State::NoRepository
+        };
+
+        let branch = self.git.branch().map(str::to_owned);
+        let action = self.history.ui(ctx, branch.as_deref(), state);
+
+        match action {
+            history_view::Action::None => {}
+            history_view::Action::LoadMore(limit) => self.git.refresh_log(limit),
+            history_view::Action::Open(relative) => {
+                if let Some(root) = self.git.root().map(Path::to_path_buf) {
+                    self.open_path(&root.join(relative), true);
+                }
+            }
         }
     }
 
@@ -3818,8 +3882,21 @@ impl EditorApp {
                 self.dock = DockTab::Git;
                 self.show_output = true;
                 // Opening the panel is the moment its contents matter, and the
-                // status may be minutes old or never fetched.
+                // status may be minutes old or never fetched. The log comes
+                // with it because that is where the previous message lives, and
+                // an amend needs it before the checkbox is ticked.
                 self.git.refresh_status();
+                if !self.git.log_known() {
+                    self.git.refresh_log(history_view::PAGE);
+                }
+            }
+            CommandId::ToggleBlame => {
+                self.show_blame = !self.show_blame;
+                if self.show_blame {
+                    self.info(
+                        "Blame is read from the saved file; unsaved edits shift it until you save",
+                    );
+                }
             }
             CommandId::ShowDiff => match self.active_doc().and_then(|e| e.doc.path()) {
                 Some(path) => {
@@ -4364,6 +4441,25 @@ impl EditorApp {
                 })
                 .unwrap_or_default();
 
+            // Who last touched each line, when the annotations are switched on.
+            // Read from the file *on disk*, so unsaved edits shift it — which
+            // is what the message on switching it on says, and why saving asks
+            // for it again.
+            let blame: Vec<(usize, String)> = if self.show_blame {
+                active_path
+                    .as_ref()
+                    .and_then(|path| self.git.blame(path))
+                    .map(|lines| {
+                        lines
+                            .iter()
+                            .map(|line| (line.number.saturating_sub(1), line.origin.label()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
             if let Some(entry) = self.active.and_then(|i| self.docs.get_mut(i)) {
                 opts.language = entry.language;
                 // The parse tree was brought up to date by `sync_highlighters`
@@ -4393,6 +4489,7 @@ impl EditorApp {
                     .view
                     .set_debug_state(breakpoints_here.clone(), paused_line);
                 entry.view.set_changes(changes);
+                entry.view.set_blame(blame);
 
                 // Editing a preview tab promotes it: the file is being worked
                 // on, so it must not be replaced by the next explorer click.
@@ -4736,6 +4833,12 @@ impl eframe::App for EditorApp {
         self.runner.set_context(&ctx);
         self.poll_watcher();
         self.git.poll();
+        if self.git.take_committed() {
+            // Only on a commit that actually landed. One a hook refused leaves
+            // the message alone, so it can be tried again after the fix.
+            self.git_panel.committed();
+            self.info("Committed");
+        }
         self.check_disk_on_focus(&ctx);
         self.autosave(&ctx);
         self.poll_debugger(&ctx);
@@ -4974,6 +5077,7 @@ impl eframe::App for EditorApp {
                                     git_panel::State::Ready {
                                         status: self.git.status(),
                                         error: self.git.error(),
+                                        last_message: self.git.last_message(),
                                     }
                                 } else {
                                     git_panel::State::Waiting
@@ -5003,6 +5107,9 @@ impl eframe::App for EditorApp {
             }
             if open_git {
                 self.git.refresh_status();
+                if !self.git.log_known() {
+                    self.git.refresh_log(history_view::PAGE);
+                }
             }
             self.apply_packages_action(packages_action);
             self.apply_git_action(git_action);
@@ -5072,6 +5179,7 @@ impl eframe::App for EditorApp {
         self.licences
             .ui(&ctx, "third_party", "Third-Party Licences", THIRD_PARTY);
         self.diff_window(&ctx);
+        self.history_window(&ctx);
         self.rename_ui(&ctx);
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.

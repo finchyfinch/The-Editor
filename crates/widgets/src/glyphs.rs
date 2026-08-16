@@ -42,6 +42,8 @@ pub const CLOSE: &str = "\u{00d7}";
 /// fonts stop. These two are in both families.
 pub const TREE_OPEN: &str = "\u{23f7}";
 pub const TREE_CLOSED: &str = "\u{23f5}";
+/// A commit that joined two histories, in the history list.
+pub const MERGE: &str = "\u{1f500}";
 /// The editor's fold column, painted in the code font.
 ///
 /// Deliberately lighter than [`TREE_OPEN`]: this one sits beside every foldable
@@ -68,6 +70,7 @@ mod tests {
         ("CLOSE", super::CLOSE, Family::Proportional),
         ("TREE_OPEN", super::TREE_OPEN, Family::Proportional),
         ("TREE_CLOSED", super::TREE_CLOSED, Family::Proportional),
+        ("MERGE", super::MERGE, Family::Proportional),
         ("FOLD_OPEN", super::FOLD_OPEN, Family::Monospace),
         ("FOLD_CLOSED", super::FOLD_CLOSED, Family::Monospace),
         // `editor_lsp::diagnostics::Severity::glyph`, drawn in the status bar,

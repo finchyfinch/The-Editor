@@ -41,6 +41,11 @@ impl Change {
     /// a future git that reports something new should leave the file *visible*
     /// in the panel, described imprecisely, rather than dropped from it.
     #[must_use]
+    pub fn from_status_letter(letter: char) -> Self {
+        Self::from_letter(letter)
+    }
+
+    #[must_use]
     fn from_letter(letter: char) -> Self {
         match letter {
             ' ' | '.' => Self::Unmodified,

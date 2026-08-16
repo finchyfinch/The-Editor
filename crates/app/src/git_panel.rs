@@ -37,6 +37,10 @@ pub(crate) enum Action {
     Diff(PathBuf),
     /// Ask git for the working tree's state again.
     Refresh,
+    /// Commit what is staged.
+    Commit { message: String, amend: bool },
+    /// Show the history.
+    ShowHistory,
 }
 
 /// The Source Control tab.
@@ -45,6 +49,26 @@ pub(crate) struct GitPanel {
     /// Which row the pointer last acted on, so the diff and the file open
     /// against the same thing the buttons did.
     selected: Option<PathBuf>,
+    /// The commit message being written. Kept here, not in egui's memory,
+    /// because a message survives switching tabs and must survive a commit git
+    /// refused — a hook that rejects the change must not also throw away the
+    /// sentence explaining it.
+    message: String,
+    /// Whether the next commit rewrites the last one.
+    amend: bool,
+    /// Whether the box has been filled from the previous message. Once per
+    /// tick of the box, so editing it and toggling twice does not overwrite
+    /// what was typed.
+    amend_prefilled: bool,
+}
+
+impl GitPanel {
+    /// Empty the message box, after a commit that actually landed.
+    pub(crate) fn committed(&mut self) {
+        self.message.clear();
+        self.amend = false;
+        self.amend_prefilled = false;
+    }
 }
 
 impl GitPanel {
@@ -69,7 +93,11 @@ impl GitPanel {
                 ui.weak("Reading the working tree\u{2026}");
                 return action;
             }
-            State::Ready { status, error } => {
+            State::Ready {
+                status,
+                error,
+                last_message,
+            } => {
                 if let Some(error) = error {
                     // Git's own words, in full. A tidy summary of a git error
                     // throws away the part that says what to do about it.
@@ -78,9 +106,101 @@ impl GitPanel {
                     });
                     ui.separator();
                 }
-                action = self.body(ui, status, root);
+                action = self.commit_box(ui, status, last_message);
+                ui.separator();
+                let below = self.body(ui, status, root);
+                if action == Action::None {
+                    action = below;
+                }
             }
         }
+
+        action
+    }
+
+    /// The message box and the button that uses it.
+    fn commit_box(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: &Status,
+        last_message: Option<&str>,
+    ) -> Action {
+        let mut action = Action::None;
+        let staged = status.staged().count();
+        let conflicts = status.conflicted().count();
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.message)
+                    .desired_rows(2)
+                    .desired_width(ui.available_width() - 260.0)
+                    .hint_text("Message for the next commit"),
+            );
+
+            ui.vertical(|ui| {
+                // Amending is only possible where there is something to amend,
+                // and only sensible before the work has been shared. The second
+                // is the user's judgement; the first is a fact.
+                let can_amend = last_message.is_some();
+                let amend = ui.add_enabled(
+                    can_amend,
+                    egui::Checkbox::new(&mut self.amend, "Amend the last commit"),
+                );
+                if amend.changed() {
+                    if self.amend && self.message.trim().is_empty() && !self.amend_prefilled {
+                        // Start from the message being replaced. Offering a
+                        // blank box invites replacing a considered message with
+                        // a hurried one.
+                        self.message = last_message.unwrap_or_default().to_owned();
+                        self.amend_prefilled = true;
+                    } else if !self.amend && self.amend_prefilled {
+                        // It was filled in on our account, so take it back out
+                        // rather than leaving the old message to be committed
+                        // again as a new one.
+                        self.message.clear();
+                        self.amend_prefilled = false;
+                    }
+                }
+                amend.on_hover_text(if can_amend {
+                    "Rewrite the last commit instead of adding one. Safe until it has been shared."
+                } else {
+                    "There is no commit to amend yet."
+                });
+
+                // Amending can commit nothing new — fixing a message is a
+                // perfectly good reason to amend — so it does not need
+                // anything staged. An ordinary commit does.
+                let has_something = staged > 0 || self.amend;
+                let ready = has_something && !self.message.trim().is_empty() && conflicts == 0;
+                let label = if self.amend {
+                    "Amend".to_owned()
+                } else if staged > 0 {
+                    format!("Commit {staged} file{}", if staged == 1 { "" } else { "s" })
+                } else {
+                    "Commit".to_owned()
+                };
+                let button = ui.add_enabled(ready, egui::Button::new(label));
+                if button.clicked() {
+                    action = Action::Commit {
+                        message: self.message.clone(),
+                        amend: self.amend,
+                    };
+                }
+                // Say *why* it is disabled. A greyed button with no explanation
+                // is the most annoying thing an interface can do.
+                button.on_disabled_hover_text(if conflicts > 0 {
+                    "Resolve the conflicts first."
+                } else if !has_something {
+                    "Stage something first."
+                } else {
+                    "Write a message first."
+                });
+
+                if ui.button("History\u{2026}").clicked() {
+                    action = Action::ShowHistory;
+                }
+            });
+        });
 
         action
     }
@@ -281,6 +401,9 @@ pub(crate) enum State<'a> {
     Ready {
         status: &'a Status,
         error: Option<&'a str>,
+        /// The message of the commit HEAD is on, which is what an amend starts
+        /// from. `None` before the first commit, when there is nothing to amend.
+        last_message: Option<&'a str>,
     },
 }
 

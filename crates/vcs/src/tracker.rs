@@ -66,6 +66,12 @@ pub enum Action {
     /// tracker will do it when asked; asking is the caller's responsibility,
     /// and the caller must have confirmed it with the user first.
     Discard(Vec<String>),
+    /// Commit what is staged.
+    ///
+    /// `amend` rewrites the commit HEAD is on rather than adding one. That is
+    /// safe on work nobody else has seen and a nuisance on work they have, so
+    /// it is the caller's decision and never the default.
+    Commit { message: String, amend: bool },
 }
 
 impl Action {
@@ -75,6 +81,8 @@ impl Action {
             Self::Stage(_) => "stage",
             Self::Unstage(_) => "unstage",
             Self::Discard(_) => "discard",
+            Self::Commit { amend: false, .. } => "commit",
+            Self::Commit { amend: true, .. } => "amend",
         }
     }
 }
@@ -91,6 +99,12 @@ enum Request {
     Status,
     /// Change the index or the working tree, then re-read the state.
     Act(Action),
+    /// Read the recent commits.
+    Log { limit: usize },
+    /// Read one commit in full.
+    Show(String),
+    /// Read who last touched each line of a file.
+    Blame(PathBuf),
 }
 
 /// What the worker found.
@@ -114,6 +128,24 @@ enum Reply {
     /// An action failed. Success says nothing here — the status that follows
     /// it says everything worth saying.
     Failed(String),
+    /// A commit landed. The only action whose *success* needs announcing: it is
+    /// what tells the panel it may clear the message box, and clearing it on
+    /// anything less certain would throw away a message a failing hook rejected.
+    Committed,
+    /// The recent commits, and the message of the one HEAD is on. The second is
+    /// what an amend starts from, and it is free to fetch alongside the first.
+    Log {
+        commits: Result<Vec<crate::log::Commit>, String>,
+        last_message: Option<String>,
+    },
+    Show {
+        id: String,
+        detail: Result<crate::log::Detail, String>,
+    },
+    Blame {
+        path: PathBuf,
+        lines: Result<Vec<crate::blame::Line>, String>,
+    },
 }
 
 /// HEAD's version of one file, or the knowledge that there isn't one.
@@ -166,6 +198,27 @@ pub struct Tracker {
     status_pending: bool,
     /// Whatever git last said when an action failed, for the caller to show.
     error: Option<String>,
+    /// The recent commits, newest first.
+    log: Vec<crate::log::Commit>,
+    log_known: bool,
+    log_pending: bool,
+    /// How far back the last request went, so asking for more can be told from
+    /// asking again.
+    log_limit: usize,
+    /// The message of the commit HEAD is on, for an amend to start from.
+    last_message: Option<String>,
+    /// A commit landed and nobody has been told yet.
+    committed: bool,
+    /// Commits whose full details have been fetched, keyed by object name. A
+    /// commit never changes, so this is only cleared when the project does.
+    details: HashMap<String, crate::log::Detail>,
+    /// Details asked for and not yet answered.
+    details_pending: std::collections::HashSet<String>,
+    /// Blame for one file at a time — the one being looked at. Holding every
+    /// file's would be a copy of the repository's history in memory for the
+    /// sake of a margin nobody is reading on the other tabs.
+    blame: Option<(PathBuf, Vec<crate::blame::Line>)>,
+    blame_pending: Option<PathBuf>,
     /// Whether the worker has answered anything at all. Distinguishes "no
     /// repository" from "have not looked yet", which look identical otherwise
     /// and mean opposite things to anything drawing a branch name.
@@ -205,6 +258,16 @@ impl Tracker {
             status_known: false,
             status_pending: false,
             error: None,
+            log: Vec::new(),
+            log_known: false,
+            log_pending: false,
+            log_limit: 0,
+            last_message: None,
+            committed: false,
+            details: HashMap::new(),
+            details_pending: std::collections::HashSet::new(),
+            blame: None,
+            blame_pending: None,
             replied: false,
             requested: 0,
         }
@@ -224,6 +287,16 @@ impl Tracker {
         self.status_known = false;
         self.status_pending = false;
         self.error = None;
+        self.log.clear();
+        self.log_known = false;
+        self.log_pending = false;
+        self.log_limit = 0;
+        self.last_message = None;
+        self.committed = false;
+        self.details.clear();
+        self.details_pending.clear();
+        self.blame = None;
+        self.blame_pending = None;
         self.replied = false;
         self.requested = 0;
         let _ = self
@@ -266,8 +339,52 @@ impl Tracker {
                         // And the working tree is now described against a
                         // different commit too.
                         self.refresh_status();
+                        // The history gained or lost a commit, and the blame
+                        // for every line of every file may have moved with it.
+                        // Details are kept: a commit's contents never change,
+                        // and one that was rewritten has a different name.
+                        self.blame = None;
+                        self.blame_pending = None;
+                        if self.log_known {
+                            self.refresh_log(self.log_limit);
+                        }
                     }
                     self.branch = branch;
+                }
+                Reply::Log {
+                    commits,
+                    last_message,
+                } => {
+                    self.log_pending = false;
+                    self.last_message = last_message;
+                    match commits {
+                        Ok(commits) => {
+                            self.log = commits;
+                            self.log_known = true;
+                        }
+                        Err(message) => self.error = Some(message),
+                    }
+                }
+                Reply::Show { id, detail } => {
+                    self.details_pending.remove(&id);
+                    match detail {
+                        Ok(detail) => {
+                            self.details.insert(id, detail);
+                        }
+                        Err(message) => self.error = Some(message),
+                    }
+                }
+                Reply::Blame { path, lines } => {
+                    if self.blame_pending.as_ref() == Some(&path) {
+                        self.blame_pending = None;
+                    }
+                    match lines {
+                        Ok(lines) => self.blame = Some((path, lines)),
+                        // Not an error worth interrupting anyone with: a file
+                        // git has never seen has no blame, which is a fact
+                        // about the file rather than a failure.
+                        Err(_) => self.blame = Some((path, Vec::new())),
+                    }
                 }
                 Reply::Status(result) => {
                     self.status_pending = false;
@@ -280,6 +397,7 @@ impl Tracker {
                     }
                 }
                 Reply::Failed(message) => self.error = Some(message),
+                Reply::Committed => self.committed = true,
             }
         }
 
@@ -357,7 +475,115 @@ impl Tracker {
         }
         self.error = None;
         self.status_pending = true;
+        // A commit moves HEAD, and the HEAD check is what notices — and what
+        // then reloads the baselines, the gutter and the history. Waiting up to
+        // the poll interval for it means the panel sits showing the state from
+        // before the commit for a second or two, which reads as a failure.
+        self.last_head_check = Instant::now() - HEAD_INTERVAL;
         let _ = self.requests.send(Request::Act(action));
+    }
+
+    /// The recent commits, newest first.
+    #[must_use]
+    pub fn log(&self) -> &[crate::log::Commit] {
+        &self.log
+    }
+
+    /// Whether a history has ever come back, so an empty list can be told from
+    /// a repository with no commits in it.
+    #[must_use]
+    pub fn log_known(&self) -> bool {
+        self.log_known
+    }
+
+    /// How far back the history currently goes.
+    #[must_use]
+    pub fn log_limit(&self) -> usize {
+        self.log_limit
+    }
+
+    /// Read the most recent `limit` commits.
+    ///
+    /// Repeated calls while a request is out are free, so this is safe from a
+    /// frame loop. Asking for *more* than is already loaded is not free and is
+    /// how the history view grows.
+    pub fn refresh_log(&mut self, limit: usize) {
+        if self.repo.is_none() || self.log_pending {
+            return;
+        }
+        self.log_pending = true;
+        self.log_limit = limit;
+        let _ = self.requests.send(Request::Log { limit });
+    }
+
+    /// The message of the commit HEAD is on, for an amend to start from.
+    #[must_use]
+    pub fn last_message(&self) -> Option<&str> {
+        self.last_message.as_deref()
+    }
+
+    /// Whether a commit landed since this was last asked.
+    ///
+    /// Taken rather than read, because the one thing it is for — emptying the
+    /// message box — must happen exactly once. A commit refused by a hook does
+    /// *not* set this, so the message survives to be tried again.
+    pub fn take_committed(&mut self) -> bool {
+        std::mem::take(&mut self.committed)
+    }
+
+    /// One commit in full, if it has already been fetched.
+    ///
+    /// Separate from [`Self::detail`] because it takes `&self`: a caller that
+    /// has asked once needs to read the answer *while* borrowing the log, and
+    /// asking again to do so would need a second mutable borrow.
+    #[must_use]
+    pub fn known_detail(&self, id: &str) -> Option<&crate::log::Detail> {
+        self.details.get(id)
+    }
+
+    /// One commit in full, if it has been fetched. Asks for it if not.
+    pub fn detail(&mut self, id: &str) -> Option<&crate::log::Detail> {
+        if self.repo.is_some()
+            && !self.details.contains_key(id)
+            && self.details_pending.insert(id.to_owned())
+        {
+            let _ = self.requests.send(Request::Show(id.to_owned()));
+        }
+        self.details.get(id)
+    }
+
+    /// Who last touched each line of `path`, if it has been fetched.
+    ///
+    /// Asks for it when the answer on hand is about a different file, and
+    /// returns nothing this time round. One file's blame is held at a time.
+    pub fn blame(&mut self, path: &Path) -> Option<&[crate::blame::Line]> {
+        let have = self
+            .blame
+            .as_ref()
+            .is_some_and(|(cached, _)| cached == path);
+        if !have && self.repo.is_some() && self.blame_pending.as_deref() != Some(path) {
+            self.blame_pending = Some(path.to_path_buf());
+            let _ = self.requests.send(Request::Blame(path.to_path_buf()));
+        }
+        self.blame
+            .as_ref()
+            .filter(|(cached, _)| cached == path)
+            .map(|(_, lines)| lines.as_slice())
+    }
+
+    /// Read `path`'s blame again.
+    ///
+    /// Blame describes the file *on disk*, so saving invalidates it even though
+    /// HEAD has not moved — which is the one case the HEAD check cannot catch.
+    pub fn refresh_blame(&mut self, path: &Path) {
+        if self
+            .blame
+            .as_ref()
+            .is_some_and(|(cached, _)| cached == path)
+        {
+            self.blame = None;
+        }
+        self.blame_pending = None;
     }
 
     /// Whatever git last complained about, if anything.
@@ -495,22 +721,55 @@ fn worker(inbox: &Receiver<Request>, outbox: &Sender<Reply>, wake: &Waker) {
                 let Some(repo) = repo.as_ref() else { continue };
                 Reply::Status(repo.status())
             }
+            Request::Log { limit } => {
+                let Some(repo) = repo.as_ref() else { continue };
+                Reply::Log {
+                    commits: repo.log(limit, None),
+                    // Fetched here rather than on its own request: it is one
+                    // more cheap call on a thread that is already running one,
+                    // and it is always wanted at the same moment.
+                    last_message: repo.last_message(),
+                }
+            }
+            Request::Show(id) => {
+                let Some(repo) = repo.as_ref() else { continue };
+                let detail = repo.show(&id);
+                Reply::Show { id, detail }
+            }
+            Request::Blame(path) => {
+                let Some(repo) = repo.as_ref() else { continue };
+                let lines = repo
+                    .relative(&path)
+                    .ok_or_else(|| "that file is not in this repository".to_owned())
+                    .and_then(|relative| repo.blame(&relative));
+                Reply::Blame { path, lines }
+            }
             Request::Act(action) => {
                 let Some(repo) = repo.as_ref() else { continue };
                 let outcome = match &action {
                     Action::Stage(paths) => repo.stage(paths),
                     Action::Unstage(paths) => repo.unstage(paths),
                     Action::Discard(paths) => repo.discard(paths),
+                    Action::Commit { message, amend } => repo.commit(message, *amend).map(drop),
                 };
-                if let Err(message) = outcome {
-                    // Say what was being attempted. Git's own message is about
-                    // paths and refs and says nothing about which button was
-                    // pressed.
-                    let failure = format!("Could not {}: {message}", action.verb());
-                    if outbox.send(Reply::Failed(failure)).is_err() {
-                        return;
+                match outcome {
+                    Err(message) => {
+                        // Say what was being attempted. Git's own message is
+                        // about paths and refs and says nothing about which
+                        // button was pressed.
+                        let failure = format!("Could not {}: {message}", action.verb());
+                        if outbox.send(Reply::Failed(failure)).is_err() {
+                            return;
+                        }
+                        wake();
                     }
-                    wake();
+                    Ok(()) if matches!(action, Action::Commit { .. }) => {
+                        if outbox.send(Reply::Committed).is_err() {
+                            return;
+                        }
+                        wake();
+                    }
+                    Ok(()) => {}
                 }
                 // The status follows either way. After a success it is the
                 // result; after a failure it is proof of what actually
@@ -1011,6 +1270,177 @@ mod tests {
         tracker.poll();
         assert!(!tracker.status_known());
         assert_eq!(tracker.error(), None, "there was nothing to fail");
+    }
+
+    // ---- committing, history and blame ----------------------------------
+
+    #[test]
+    fn committing_clears_the_tree_and_lands_in_the_history() {
+        let sandbox = Sandbox::new("commit");
+        let mut tracker = sandbox.tracker();
+        tracker.refresh_log(20);
+        assert!(wait_for(&mut tracker, |t| t.log_known()));
+        let before = tracker.log().len();
+
+        sandbox.write("first.txt", "one\nCHANGED\n");
+        tracker.act(Action::Stage(vec!["first.txt".to_owned()]));
+        assert!(wait_for(&mut tracker, |t| t.status().staged().count() == 1));
+
+        tracker.act(Action::Commit {
+            message: "A committed change".to_owned(),
+            amend: false,
+        });
+        assert!(
+            wait_for(&mut tracker, |t| t.status().is_clean()),
+            "the tree should be clean once the commit lands"
+        );
+        // The history follows without being asked, because HEAD moved and the
+        // tracker notices that for itself.
+        assert!(
+            wait_for(&mut tracker, |t| t.log().len() > before),
+            "the new commit should appear in the history"
+        );
+        assert_eq!(tracker.log()[0].subject, "A committed change");
+        assert_eq!(tracker.error(), None);
+    }
+
+    #[test]
+    fn a_commit_with_nothing_staged_reports_what_git_said() {
+        let sandbox = Sandbox::new("commit-empty");
+        let mut tracker = sandbox.tracker();
+        tracker.act(Action::Commit {
+            message: "nothing to say".to_owned(),
+            amend: false,
+        });
+        assert!(wait_for(&mut tracker, |t| t.error().is_some()));
+        let message = tracker.error().expect("a message").to_owned();
+        assert!(message.starts_with("Could not commit:"), "got {message:?}");
+    }
+
+    #[test]
+    fn amending_offers_the_previous_message_to_start_from() {
+        let sandbox = Sandbox::new("amend-message");
+        let mut tracker = sandbox.tracker();
+        tracker.refresh_log(20);
+        assert!(wait_for(&mut tracker, |t| t.log_known()));
+        assert_eq!(
+            tracker.last_message(),
+            Some("initial"),
+            "amending edits that commit, so its message is where to start"
+        );
+    }
+
+    #[test]
+    fn amending_rewrites_rather_than_adds() {
+        let sandbox = Sandbox::new("amend");
+        let mut tracker = sandbox.tracker();
+        tracker.refresh_log(20);
+        assert!(wait_for(&mut tracker, |t| t.log_known()));
+        let before = tracker.log().len();
+
+        sandbox.write("first.txt", "one\nCHANGED\n");
+        tracker.act(Action::Stage(vec!["first.txt".to_owned()]));
+        assert!(wait_for(&mut tracker, |t| t.status().staged().count() == 1));
+        tracker.act(Action::Commit {
+            message: "second thoughts".to_owned(),
+            amend: true,
+        });
+
+        assert!(wait_for(&mut tracker, |t| t
+            .log()
+            .first()
+            .is_some_and(|c| c.subject == "second thoughts")));
+        assert_eq!(
+            tracker.log().len(),
+            before,
+            "the commit was rewritten, not added to"
+        );
+    }
+
+    #[test]
+    fn a_commits_details_are_fetched_once_and_then_kept() {
+        let sandbox = Sandbox::new("detail");
+        let mut tracker = sandbox.tracker();
+        tracker.refresh_log(20);
+        assert!(wait_for(&mut tracker, |t| t.log_known()));
+        let id = tracker.log()[0].id.clone();
+
+        assert_eq!(tracker.detail(&id), None, "asked for; not answered yet");
+        assert!(wait_for(&mut tracker, |t| t.detail(&id).is_some()));
+
+        let detail = tracker.detail(&id).expect("details").clone();
+        assert_eq!(detail.message, "initial");
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].1, "first.txt");
+
+        // A commit never changes, so a second ask must not queue a second
+        // subprocess — the pending set is what stops it.
+        for _ in 0..50 {
+            tracker.detail(&id);
+        }
+        assert!(tracker.details_pending.is_empty());
+    }
+
+    #[test]
+    fn blame_says_who_last_touched_each_line() {
+        let sandbox = Sandbox::new("blame");
+        let mut tracker = sandbox.tracker();
+        let file = sandbox.root.join("first.txt");
+
+        assert_eq!(tracker.blame(&file), None, "asked for; not answered yet");
+        assert!(wait_for(&mut tracker, |t| t.blame(&file).is_some()));
+
+        let lines = tracker.blame(&file).expect("blame").to_vec();
+        assert_eq!(lines.len(), 2, "first.txt has two lines");
+        assert_eq!(lines[0].origin.summary, "initial");
+        assert_eq!(lines[0].origin.author, "Test");
+    }
+
+    /// Blame describes the file on disk, so saving invalidates it even though
+    /// HEAD has not moved — the one case the HEAD check cannot catch.
+    #[test]
+    fn saving_makes_the_blame_stale() {
+        let sandbox = Sandbox::new("blame-stale");
+        let mut tracker = sandbox.tracker();
+        let file = sandbox.root.join("first.txt");
+        assert!(wait_for(&mut tracker, |t| t.blame(&file).is_some()));
+        assert_eq!(tracker.blame(&file).expect("blame").len(), 2);
+
+        sandbox.write("first.txt", "one\ntwo\nthree\nfour\n");
+        tracker.refresh_blame(&file);
+        assert_eq!(tracker.blame(&file), None, "the old answer was dropped");
+        assert!(wait_for(&mut tracker, |t| t
+            .blame(&file)
+            .is_some_and(|lines| lines.len() == 4)));
+        assert!(
+            tracker.blame(&file).expect("blame")[3]
+                .origin
+                .is_uncommitted(),
+            "the lines just typed belong to no commit"
+        );
+    }
+
+    #[test]
+    fn a_file_outside_the_repository_has_no_blame_and_no_error() {
+        let sandbox = Sandbox::new("blame-outside");
+        let mut tracker = sandbox.tracker();
+        let outside = std::env::temp_dir().join("nothing-to-do-with-this-repo.txt");
+        assert!(wait_for(&mut tracker, |t| t.blame(&outside).is_some()));
+        assert_eq!(tracker.blame(&outside), Some(&[][..]));
+        assert_eq!(
+            tracker.error(),
+            None,
+            "a file with no history is a fact about the file, not a failure"
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_commits_has_an_empty_history() {
+        let mut tracker = tracker();
+        assert!(!tracker.log_known());
+        tracker.refresh_log(20);
+        tracker.poll();
+        assert_eq!(tracker.log(), []);
     }
 
     /// Opening one crate of a workspace is the normal case, and it makes the

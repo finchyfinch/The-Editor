@@ -187,6 +187,100 @@ impl Repo {
             .map(drop)
     }
 
+    /// Commit whatever is staged.
+    ///
+    /// Hooks run, because it is the user's own git doing the work — a
+    /// `pre-commit` that formats the tree or refuses the change behaves exactly
+    /// as it does on the command line, and its output comes back in the error.
+    /// Signing likewise: a configured key signs this commit as it would any
+    /// other.
+    ///
+    /// # Errors
+    /// Whatever git said, verbatim — including "nothing to commit", which is a
+    /// perfectly ordinary thing for it to say.
+    pub fn commit(&self, message: &str, amend: bool) -> Result<String, String> {
+        if message.trim().is_empty() {
+            // Git would accept `-m ""` for an amend and silently keep the old
+            // message, which is not what an empty box means.
+            return Err("A commit needs a message.".to_owned());
+        }
+        let mut args = vec!["commit", "--quiet"];
+        if amend {
+            args.push("--amend");
+        }
+        args.push("-m");
+        args.push(message);
+        self.run(&args)
+    }
+
+    /// The message of the commit HEAD is on.
+    ///
+    /// What an amend starts from: amending is editing that commit, so offering
+    /// a blank box would invite replacing a good message with a hurried one.
+    #[must_use]
+    pub fn last_message(&self) -> Option<String> {
+        let text = self.run(&["log", "-1", "--pretty=%B"]).ok()?;
+        let text = text.trim_end();
+        (!text.is_empty()).then(|| text.to_owned())
+    }
+
+    /// The most recent commits, newest first.
+    ///
+    /// `path` narrows it to one file's history. `limit` is a bound on how many
+    /// to read, because a repository's log is unbounded and a panel showing all
+    /// of it would spend its time formatting rows nobody scrolls to.
+    ///
+    /// # Errors
+    /// Whatever git said. A repository with no commits yet is *not* an error
+    /// here: it has an empty history, which is a true answer.
+    pub fn log(&self, limit: usize, path: Option<&str>) -> Result<Vec<crate::log::Commit>, String> {
+        if !self.has_commits() {
+            return Ok(Vec::new());
+        }
+        let count = limit.to_string();
+        let format = format!("--format={}", crate::log::FORMAT);
+        let mut args = vec!["log", "--max-count", &count, &format];
+        if let Some(path) = path {
+            // `--follow` tracks the file through renames, which is what anyone
+            // asking for one file's history wants. It only works for a single
+            // path, which is all this takes.
+            args.push("--follow");
+            args.push("--");
+            args.push(path);
+        }
+        Ok(crate::log::parse(&self.run(&args)?))
+    }
+
+    /// One commit in full: its message, and the files it touched.
+    ///
+    /// # Errors
+    /// Whatever git said — including that there is no such object.
+    pub fn show(&self, id: &str) -> Result<crate::log::Detail, String> {
+        // Two calls rather than one, because the message is free-form text and
+        // the file list is NUL-separated records: reading both out of one
+        // stream means agreeing on a boundary that a message could contain.
+        let message = self.run(&["show", "--no-patch", "--format=%B", id])?;
+        // `--format=` with nothing after it suppresses the header entirely, so
+        // what comes back is only the records.
+        let files = self.run(&["show", "--name-status", "-z", "--format=", id])?;
+        Ok(crate::log::Detail {
+            message: message.trim_end().to_owned(),
+            files: crate::log::changed_files(&files),
+        })
+    }
+
+    /// Who last touched each line of `path`, and when.
+    ///
+    /// # Errors
+    /// Whatever git said — including that the file is not tracked, which is the
+    /// answer for anything new.
+    pub fn blame(&self, path: &str) -> Result<Vec<crate::blame::Line>, String> {
+        // The porcelain format is the one meant for machines: stable, and it
+        // states each commit's details once rather than per line.
+        let output = self.run(&["blame", "--porcelain", "--", path])?;
+        Ok(crate::blame::parse(&output))
+    }
+
     /// Run git with a fixed set of arguments and then a list of paths.
     ///
     /// Separate from [`run`] because the paths are owned strings from the
@@ -225,8 +319,19 @@ fn run(cwd: &Path, args: &[&str]) -> Result<String, String> {
 
     let output = command.output().map_err(|e| format!("running git: {e}"))?;
     if !output.status.success() {
+        // Both streams, because a failing *hook* is a common way for a commit
+        // to be refused and hooks print to stdout as often as to stderr.
+        // Reporting only stderr there leaves "the commit failed" with no reason
+        // attached, which is the least useful thing an editor can say.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(stderr.trim().to_owned());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = match (stderr.trim(), stdout.trim()) {
+            ("", "") => format!("git exited with {}", output.status),
+            (err, "") => err.to_owned(),
+            ("", out) => out.to_owned(),
+            (err, out) => format!("{err}\n{out}"),
+        };
+        return Err(message);
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -492,6 +597,289 @@ mod tests {
             ])
             .expect("stage");
         assert_eq!(fixture.status().staged().count(), 3);
+    }
+
+    // ---- committing, history and blame ----------------------------------
+    //
+    // The parsers have their own tests against handwritten input. These check
+    // the same parsers against what git *actually* writes, which is the half a
+    // handwritten fixture cannot prove.
+
+    #[test]
+    fn committing_what_is_staged_leaves_a_clean_tree() {
+        let fixture = Fixture::new("commit");
+        fixture.write("first.txt", "one\nCHANGED\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+
+        fixture
+            .repo
+            .commit("Change the first file", false)
+            .expect("commit");
+
+        assert!(fixture.status().is_clean());
+        assert_eq!(
+            fixture.repo.last_message().as_deref(),
+            Some("Change the first file")
+        );
+    }
+
+    #[test]
+    fn committing_with_nothing_staged_says_so_rather_than_pretending() {
+        let fixture = Fixture::new("commit-empty");
+        let outcome = fixture.repo.commit("nothing to say", false);
+        assert!(outcome.is_err(), "git should refuse, and did not");
+    }
+
+    #[test]
+    fn a_commit_needs_a_message() {
+        let fixture = Fixture::new("commit-blank");
+        fixture.write("first.txt", "changed\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+        // Refused here rather than by git, which would take `-m ""` for an
+        // amend and quietly keep the old message.
+        assert!(fixture.repo.commit("   \n ", false).is_err());
+    }
+
+    #[test]
+    fn amending_replaces_the_last_commit_rather_than_adding_one() {
+        let fixture = Fixture::new("amend");
+        let before = fixture.repo.log(100, None).expect("log").len();
+
+        fixture.write("first.txt", "one\nCHANGED\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+        fixture.repo.commit("first go", false).expect("commit");
+
+        fixture.write("second.txt", "more\n");
+        fixture
+            .repo
+            .stage(&["second.txt".to_owned()])
+            .expect("stage");
+        fixture
+            .repo
+            .commit("second thoughts", true)
+            .expect("amending");
+
+        let log = fixture.repo.log(100, None).expect("log");
+        assert_eq!(
+            log.len(),
+            before + 1,
+            "one commit was added and then rewritten, not two"
+        );
+        assert_eq!(log[0].subject, "second thoughts");
+        assert!(fixture.status().is_clean(), "both files went in");
+    }
+
+    /// A multi-line message must survive intact — the body is where the reason
+    /// for a change lives, and losing it is losing the point of committing.
+    #[test]
+    fn a_message_keeps_its_body() {
+        let fixture = Fixture::new("commit-body");
+        fixture.write("first.txt", "changed\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+
+        let message =
+            "A subject line\n\nAnd a body, with a blank line above it\nand two lines in it.";
+        fixture.repo.commit(message, false).expect("commit");
+
+        assert_eq!(fixture.repo.last_message().as_deref(), Some(message));
+        assert_eq!(
+            fixture.repo.log(1, None).expect("log")[0].subject,
+            "A subject line",
+            "the log shows the subject alone"
+        );
+    }
+
+    /// The separators exist because these characters are ordinary in a subject.
+    #[test]
+    fn a_subject_full_of_punctuation_comes_back_unmangled() {
+        let fixture = Fixture::new("commit-punctuation");
+        let subject = "Fix --format=%H | don't \"quote\" me\ttabbed";
+        fixture.write("first.txt", "changed\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+        fixture.repo.commit(subject, false).expect("commit");
+
+        assert_eq!(fixture.repo.log(1, None).expect("log")[0].subject, subject);
+    }
+
+    #[test]
+    fn the_log_is_newest_first_and_bounded() {
+        let fixture = Fixture::new("log-order");
+        for n in 1..=5 {
+            fixture.write("first.txt", &format!("version {n}\n"));
+            fixture
+                .repo
+                .stage(&["first.txt".to_owned()])
+                .expect("stage");
+            fixture
+                .repo
+                .commit(&format!("change {n}"), false)
+                .expect("commit");
+        }
+
+        let log = fixture.repo.log(3, None).expect("log");
+        assert_eq!(log.len(), 3, "the limit is a limit");
+        assert_eq!(log[0].subject, "change 5", "newest first");
+        assert_eq!(log[2].subject, "change 3");
+        assert!(!log[0].id.is_empty() && log[0].short.len() >= 4);
+        assert!(!log[0].relative.is_empty(), "git phrases the age for us");
+        assert_eq!(log[0].date().len(), 10, "an ISO date, ten characters");
+    }
+
+    #[test]
+    fn one_files_history_leaves_out_the_others() {
+        let fixture = Fixture::new("log-path");
+        fixture.write("second.txt", "new file\n");
+        fixture
+            .repo
+            .stage(&["second.txt".to_owned()])
+            .expect("stage");
+        fixture
+            .repo
+            .commit("add the second", false)
+            .expect("commit");
+
+        let all = fixture.repo.log(100, None).expect("log");
+        let one = fixture.repo.log(100, Some("second.txt")).expect("log");
+        assert_eq!(one.len(), 1, "one commit touched this file");
+        assert_eq!(one[0].subject, "add the second");
+        assert!(all.len() > one.len());
+    }
+
+    /// A repository with nothing in it has an empty history, which is a true
+    /// answer rather than a failure.
+    #[test]
+    fn an_unborn_repository_has_an_empty_log() {
+        let fixture = Fixture::unborn("log-unborn");
+        assert_eq!(fixture.repo.log(10, None).expect("log"), []);
+        assert_eq!(fixture.repo.last_message(), None);
+    }
+
+    #[test]
+    fn a_commits_details_are_its_message_and_what_it_touched() {
+        let fixture = Fixture::new("show");
+        fixture.write("first.txt", "changed\n");
+        fixture.write("second.txt", "new\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned(), "second.txt".to_owned()])
+            .expect("stage");
+        fixture
+            .repo
+            .commit("A subject\n\nAnd a body.", false)
+            .expect("commit");
+
+        let id = fixture.repo.head_id().expect("a commit");
+        let detail = fixture.repo.show(&id).expect("show");
+        assert_eq!(detail.message, "A subject\n\nAnd a body.");
+
+        let mut names: Vec<&str> = detail.files.iter().map(|(_, p)| p.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["first.txt", "second.txt"]);
+        let kinds: Vec<crate::status::Change> = detail.files.iter().map(|(c, _)| *c).collect();
+        assert!(
+            kinds.contains(&crate::status::Change::Modified),
+            "{kinds:?}"
+        );
+        assert!(kinds.contains(&crate::status::Change::Added), "{kinds:?}");
+    }
+
+    /// A rename spends two path fields, and the second is the name that
+    /// matters — the same trap as the status listing.
+    #[test]
+    fn a_renamed_file_is_listed_under_its_new_name() {
+        let fixture = Fixture::new("show-rename");
+        std::fs::rename(
+            fixture.repo.root.join("first.txt"),
+            fixture.repo.root.join("renamed.txt"),
+        )
+        .expect("rename");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned(), "renamed.txt".to_owned()])
+            .expect("stage");
+        fixture.repo.commit("rename it", false).expect("commit");
+
+        let id = fixture.repo.head_id().expect("a commit");
+        let detail = fixture.repo.show(&id).expect("show");
+        let names: Vec<&str> = detail.files.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(
+            names.contains(&"renamed.txt"),
+            "expected the new name, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"first.txt"),
+            "and not the old one, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn blame_attributes_each_line_to_the_commit_that_wrote_it() {
+        let fixture = Fixture::new("blame");
+        // `first.txt` is "one\ntwo\n" from the initial commit. Add a third line
+        // in a commit of its own, so the two lines have different origins.
+        fixture.write("first.txt", "one\ntwo\nthree\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+        fixture
+            .repo
+            .commit("add the third line", false)
+            .expect("commit");
+
+        let blame = fixture.repo.blame("first.txt").expect("blame");
+        assert_eq!(blame.len(), 3, "one entry per line");
+        assert_eq!(blame[0].number, 1);
+        assert_eq!(blame[2].number, 3);
+        assert_eq!(blame[0].origin.summary, "initial");
+        assert_eq!(blame[2].origin.summary, "add the third line");
+        assert_eq!(blame[0].origin.author, "Test");
+        assert!(!blame[0].origin.is_uncommitted());
+        assert_eq!(
+            blame[0].origin.date().len(),
+            10,
+            "a date, worked out from the epoch seconds"
+        );
+        assert_ne!(
+            blame[0].origin.id, blame[2].origin.id,
+            "two lines, two commits"
+        );
+    }
+
+    /// A line that has been typed and not committed has no commit to name, and
+    /// blame says so with a run of zeros rather than by omitting it.
+    #[test]
+    fn blame_marks_lines_that_are_not_committed_yet() {
+        let fixture = Fixture::new("blame-uncommitted");
+        fixture.write("first.txt", "one\ntwo\njust typed\n");
+
+        let blame = fixture.repo.blame("first.txt").expect("blame");
+        assert_eq!(blame.len(), 3);
+        assert!(!blame[0].origin.is_uncommitted());
+        assert!(blame[2].origin.is_uncommitted());
+        assert_eq!(blame[2].origin.label(), "Not committed");
+    }
+
+    #[test]
+    fn blaming_a_file_git_has_never_seen_is_an_error_not_a_panic() {
+        let fixture = Fixture::new("blame-untracked");
+        fixture.write("second.txt", "never added\n");
+        assert!(fixture.repo.blame("second.txt").is_err());
     }
 
     /// The two columns are independent, and the panel shows a file in both.

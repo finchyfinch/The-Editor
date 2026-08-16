@@ -931,6 +931,17 @@ cannot be reached.
   letting the caller ask, because a caller that asks for itself can ask too
   early and get the state from before the action — which is what makes a
   staging panel look like it does nothing.
+- **Committing, amending, history and blame.** The message box lives in the
+  panel and survives a commit git refused: a hook that rejects the change must
+  not also throw away the sentence explaining it, so only a commit that actually
+  landed empties it. Amending starts from the message it is replacing. **History**
+  (from the panel) is the log in one pane and the selected commit's message and
+  files in the other, a hundred at a time. **Ctrl+Shift+B** annotates every line
+  of the open file with who last touched it, read from `git blame --porcelain`
+  — the form that states each commit once and refers back to it, rather than
+  repeating the headers a thousand times for a thousand lines.
+  `%x1f`/`%x1e` separate the log's fields, because every separator a human would
+  choose is one a commit subject can contain.
 
 ### Sequencing changes made along the way
 
@@ -956,7 +967,7 @@ about reviewing from memory rather than from the code.
 
 | | Why it matters | Rough size |
 |---|---|---|
-| **Version control — committing and history** | Reading and staging have landed (see below). What remains is commit and amend, log and blame, and branch switching. Everything reads from the same `editor-vcs` crate and the same worker thread, so the expensive part — deciding how the editor talks to git at all — is already paid for. | 1.5–2 wk |
+| **Version control — branches** | Reading, staging, committing, history and blame have all landed (see below). What remains is branch switching and creation, and the remote operations that go with them — fetch, pull, push. Those are the ones that touch a network and a credential helper, which is a different kind of problem from everything so far and is why they were left until last. | 1–1.5 wk |
 | **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. "Run Tests" currently just runs the open file. A headline PyCharm feature for Python and the natural partner to the debugger. | 2–3 wk |
 | **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
 | **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |

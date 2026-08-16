@@ -77,6 +77,7 @@ pub(crate) enum CommandId {
     ShowProblems,
     ShowDiff,
     ShowSourceControl,
+    ToggleBlame,
     SelectInterpreter,
     CreateVenv,
     // View
@@ -163,6 +164,7 @@ impl CommandId {
         Self::ShowProblems,
         Self::ShowDiff,
         Self::ShowSourceControl,
+        Self::ToggleBlame,
         Self::SelectInterpreter,
         Self::CreateVenv,
         Self::ToggleExplorer,
@@ -503,6 +505,12 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "View",
         "Source Control",
         ctrl(Key::G),
+    ),
+    cmd(
+        CommandId::ToggleBlame,
+        "View",
+        "Blame Annotations",
+        ctrl_shift(Key::B),
     ),
     cmd(
         CommandId::SelectInterpreter,

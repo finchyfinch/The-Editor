@@ -13,7 +13,9 @@
 //! [`tracker::Tracker`] is what the application holds: it owns the worker
 //! thread, the cache, and the rule for when the cache stops being true.
 
+pub mod blame;
 pub mod diff;
+pub mod log;
 pub mod repo;
 pub mod status;
 pub mod tracker;

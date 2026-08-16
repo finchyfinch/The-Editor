@@ -38,6 +38,12 @@ const BLINK_MS: u128 = 530;
 const CHANGE_BAR_WIDTH: f32 = 3.0;
 /// The change column: the bar, plus the gap that keeps it off the breakpoints.
 const CHANGE_COLUMN: f32 = CHANGE_BAR_WIDTH + 2.0;
+/// How many characters of blame annotation to show.
+///
+/// Enough for a date and a first name, which is what makes a line's history
+/// recognisable at a glance. Longer names are cut rather than allowed to push
+/// the code sideways — the hover has the whole thing.
+const BLAME_COLUMNS: usize = 20;
 
 /// Appearance and behaviour knobs, supplied from settings.
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +154,14 @@ pub struct EditorView {
     /// How this buffer differs from the committed version, supplied by the
     /// application each frame. Sorted by line, one entry per changed line.
     changes: Vec<(usize, LineStatus)>,
+    /// Who last touched each line, by zero-based line number. Empty when the
+    /// annotations are switched off, which is what decides whether the column
+    /// exists at all.
+    blame: Vec<(usize, String)>,
+    /// How wide the blame column came out this frame. Held rather than passed,
+    /// because everything else in the gutter is positioned relative to it and
+    /// threading it through four more parameters buys nothing.
+    blame_width: f32,
     /// The bracket pair around the caret, recomputed as the caret moves.
     bracket_pair: Option<editor_syntax::brackets::BracketPair>,
     /// Set by the context menu, taken by the application next frame.
@@ -528,6 +542,14 @@ impl EditorView {
         self.changes = changes;
     }
 
+    /// Who last touched each line, by zero-based line number.
+    ///
+    /// An empty list switches the column off entirely rather than drawing an
+    /// empty one: a blank strip beside the code is worse than no strip.
+    pub fn set_blame(&mut self, blame: Vec<(usize, String)>) {
+        self.blame = blame;
+    }
+
     /// Ranges to highlight as search results, and which of them is current.
     ///
     /// Set once per frame before drawing; cleared when the find bar closes.
@@ -573,7 +595,15 @@ impl EditorView {
         // rather than a stripe drawn over the breakpoint dots: a bar behind a
         // dot is a bar you cannot see, and a bar you can click is a breakpoint
         // you set by accident.
-        let gutter_width = CHANGE_COLUMN
+        // The blame column, at the very left, and only when there is blame to
+        // put in it.
+        self.blame_width = if self.blame.is_empty() {
+            0.0
+        } else {
+            space_width * BLAME_COLUMNS as f32 + 10.0
+        };
+        let gutter_width = self.blame_width
+            + CHANGE_COLUMN
             + breakpoint_width
             + fold_width
             + if opts.show_line_numbers {
@@ -777,16 +807,17 @@ impl EditorView {
 
         response.request_focus();
 
-        // The change column is at the very left and takes no clicks: in this
-        // slice the marks are something to read, not something to act on.
-        if response.clicked() && pos.x < rect.left() + CHANGE_COLUMN {
+        // The blame and change columns are at the very left and take no clicks:
+        // both are something to read, not something to act on.
+        let gutter_left = rect.left() + self.blame_width + CHANGE_COLUMN;
+        if response.clicked() && pos.x < gutter_left {
             return false;
         }
 
         // A click in the breakpoint column sets one, which is how every other
         // editor does it and the first thing anyone tries. Handled before the
         // caret moves, so the click does not also jump the caret to line 1.
-        if response.clicked() && pos.x < rect.left() + CHANGE_COLUMN + row_height {
+        if response.clicked() && pos.x < gutter_left + row_height {
             let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
             let line = self.fold_map.line_at(row);
             if line < doc.line_count() {
@@ -1898,6 +1929,7 @@ impl EditorView {
                 continue;
             }
             let y = rect.top() + row as f32 * row_height;
+            let x = rect.left() + self.blame_width;
             let colour = change_colour(&visuals, *status);
             let bar = match status {
                 // A deletion has no lines of its own, so it gets a short mark
@@ -1905,15 +1937,55 @@ impl EditorView {
                 // claim the line below was deleted, which is the opposite of
                 // what happened to it.
                 LineStatus::DeletedAbove => egui::Rect::from_min_size(
-                    egui::pos2(rect.left(), y),
+                    egui::pos2(x, y),
                     egui::vec2(CHANGE_BAR_WIDTH, (row_height * 0.3).max(2.0)),
                 ),
                 _ => egui::Rect::from_min_size(
-                    egui::pos2(rect.left(), y),
+                    egui::pos2(x, y),
                     egui::vec2(CHANGE_BAR_WIDTH, row_height),
                 ),
             };
             painter.rect_filled(bar, 0.0, colour);
+        }
+
+        // Blame, in the leftmost column when it is switched on.
+        //
+        // Painted per visible row rather than per entry: the annotations cover
+        // every line of the file, and walking all of them to draw forty would
+        // make scrolling a long file cost more the further down it went.
+        if self.blame_width > 0.0 {
+            let index: std::collections::HashMap<usize, &String> = self
+                .blame
+                .iter()
+                .map(|(line, text)| (*line, text))
+                .collect();
+            for row in first..last {
+                let line = self.fold_map.line_at(row);
+                let Some(text) = index.get(&line) else {
+                    continue;
+                };
+                let y = rect.top() + row as f32 * row_height;
+                // Truncated by characters, not bytes: a name with an accent in
+                // it must not be cut in half.
+                let shown: String = text.chars().take(BLAME_COLUMNS).collect();
+                painter.text(
+                    egui::pos2(rect.left() + 4.0, y),
+                    egui::Align2::LEFT_TOP,
+                    shown,
+                    font.clone(),
+                    visuals.weak_text_color(),
+                );
+            }
+            // A hairline between the annotations and everything else, so the
+            // eye has somewhere to stop.
+            let x = rect.left() + self.blame_width - 3.0;
+            painter.line_segment(
+                [
+                    egui::pos2(x, visible.top()),
+                    egui::pos2(x, visible.bottom()),
+                ],
+                egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.3)),
+            );
         }
 
         // Breakpoints, in their own column beside the change bars.
@@ -1925,7 +1997,10 @@ impl EditorView {
                 continue;
             }
             let y = rect.top() + self.fold_map.row_at(*line) as f32 * row_height + row_height / 2.0;
-            let centre = egui::pos2(rect.left() + CHANGE_COLUMN + row_height / 2.0, y);
+            let centre = egui::pos2(
+                rect.left() + self.blame_width + CHANGE_COLUMN + row_height / 2.0,
+                y,
+            );
             let radius = row_height * 0.26;
             let colour = egui::Color32::from_rgb(0xd0, 0x45, 0x45);
             if *verified {
@@ -2094,7 +2169,10 @@ impl EditorView {
                     .min_by_key(|d| d.severity)
                 {
                     painter.text(
-                        egui::pos2(rect.left() + CHANGE_COLUMN + row_height + 2.0, y),
+                        egui::pos2(
+                            rect.left() + self.blame_width + CHANGE_COLUMN + row_height + 2.0,
+                            y,
+                        ),
                         egui::Align2::LEFT_TOP,
                         worst.severity.glyph(),
                         font.clone(),
