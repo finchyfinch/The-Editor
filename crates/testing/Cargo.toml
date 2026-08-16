@@ -1,0 +1,18 @@
+[package]
+name = "editor-testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Running tests, and reading what the test runner said"
+
+[dependencies]
+editor-proc = { version = "1.0.0", path = "../proc" }
+# For LanguageId alone: which framework suits a file is a fact about its
+# language, and the language is already decided in one place.
+editor-syntax = { version = "1.0.0", path = "../syntax" }
+
+[lints]
+workspace = true

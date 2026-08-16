@@ -9,6 +9,7 @@ members = [
     "crates/proc",
     "crates/search",
     "crates/config",
+    "crates/testing",
     "crates/vcs",
     "crates/widgets",
 ]

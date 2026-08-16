@@ -43,6 +43,7 @@ use crate::runner::Runner;
 use crate::settings_window;
 use crate::symbol_picker::SymbolPicker;
 use crate::terminal::Terminal;
+use crate::tests_panel::{self, TestsPanel};
 use crate::venv_dialog;
 use crate::watcher::Watcher;
 
@@ -247,6 +248,11 @@ pub(crate) struct EditorApp {
     pending_force_delete: Option<String>,
     /// Whether the editor shows who last touched each line.
     show_blame: bool,
+    /// The Tests tab.
+    tests_panel: TestsPanel,
+    /// The run in progress, or the last one. `None` before anything has been
+    /// run, which the panel shows differently from a run that found nothing.
+    tests: Option<editor_testing::Session>,
     /// Whether the window had focus last frame, so returning to it can be
     /// told from merely still having it.
     was_focused: bool,
@@ -361,6 +367,7 @@ enum DockTab {
     Terminal,
     Packages,
     Git,
+    Tests,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -440,6 +447,8 @@ impl EditorApp {
             branches: BranchesView::default(),
             pending_force_delete: None,
             show_blame: false,
+            tests_panel: TestsPanel::default(),
+            tests: None,
             was_focused: true,
             from_command_line: open,
             recovery: recovery::Recovery::new(&paths_for_recovery),
@@ -3809,6 +3818,177 @@ impl EditorApp {
         }
     }
 
+    /// Which framework this project's tests use, and where to run it from.
+    ///
+    /// Decided by the *active file's* language rather than by scanning the
+    /// project: a repository with Python and Rust in it has both, and the one
+    /// you are looking at is the one you mean.
+    fn test_framework(&self) -> Option<(editor_testing::Framework, PathBuf)> {
+        let entry = self.active_doc()?;
+        let framework = editor_testing::framework_for(entry.language)?;
+        let path = entry.doc.path()?;
+
+        let cwd = match framework {
+            // pytest resolves node ids against where it was started, so it must
+            // start at the project root and nowhere else — otherwise every id
+            // in the report is relative to a directory the next run will not
+            // be using.
+            editor_testing::Framework::Pytest => self
+                .tree
+                .root()
+                .map(Path::to_path_buf)
+                .or_else(|| path.parent().map(Path::to_path_buf))?,
+            // Cargo needs a manifest above it.
+            editor_testing::Framework::CargoTest => {
+                editor_proc::run_config::find_cargo_manifest(path, self.tree.root())?
+            }
+        };
+        Some((framework, cwd))
+    }
+
+    /// Run some tests, and read the results as they arrive.
+    fn run_tests(&mut self, scope: editor_testing::Scope) {
+        // Testing stale code is the same trap as running it.
+        if self.active_doc().is_some_and(|e| e.doc.is_dirty())
+            && let Some(active) = self.active
+            && !self.save_indices(&[active])
+        {
+            return;
+        }
+
+        let Some((framework, cwd)) = self.test_framework() else {
+            self.error(
+                "Open a Python or Rust file first \u{2014} the file decides which tests to run",
+            );
+            return;
+        };
+
+        // A file scope has to be expressed the way the framework expects, which
+        // for pytest is relative to where it will be started.
+        let scope = match scope {
+            editor_testing::Scope::File(path) => {
+                editor_testing::Scope::File(path.strip_prefix(&cwd).unwrap_or(&path).to_path_buf())
+            }
+            other => other,
+        };
+
+        let interpreter = self
+            .interpreter()
+            .map(|i| i.path)
+            .filter(|_| framework == editor_testing::Framework::Pytest);
+        let config = match editor_testing::command(framework, &scope, &cwd, interpreter.as_deref())
+        {
+            Ok(config) => config,
+            Err(e) => {
+                self.error(e.to_string());
+                return;
+            }
+        };
+
+        self.tests = Some(editor_testing::Session::new(framework, scope));
+        self.dock = DockTab::Tests;
+        self.show_output = true;
+        // The console still shows the run in full — a test that prints
+        // something is often the fastest way to find out why it failed, and the
+        // panel only shows verdicts.
+        self.runner.watch_output(true);
+        // On pipes, not a terminal: this output is going to be *read*, and a
+        // runner that can see a terminal formats for one. See editor_proc::pipe.
+        self.runner.use_pipes(true);
+        if let Err(e) = self.runner.start(config, true) {
+            self.error(format!("Could not start: {e:#}"));
+            self.runner.watch_output(false);
+            self.tests = None;
+        }
+        // Only this run: an ordinary Run must still get its terminal.
+        self.runner.use_pipes(false);
+    }
+
+    /// Run the one test the caret is in.
+    fn run_test_at_caret(&mut self) {
+        let Some((framework, cwd)) = self.test_framework() else {
+            self.error("Open a Python or Rust file first");
+            return;
+        };
+        let Some(entry) = self.active_doc() else {
+            return;
+        };
+        let Some(path) = entry.doc.path().map(Path::to_path_buf) else {
+            self.error("Save the file before running its tests");
+            return;
+        };
+        let Some(tree) = entry.highlighter.as_ref().and_then(|h| h.tree()) else {
+            self.error("The file has not been parsed yet");
+            return;
+        };
+
+        let outline = editor_syntax::symbols::outline(tree, entry.doc.text());
+        let caret = entry.view.selection.head;
+        let Some(name) = editor_testing::discover::test_at(&outline, caret, framework) else {
+            self.info("The caret is not inside a test");
+            return;
+        };
+
+        let id = match framework {
+            editor_testing::Framework::Pytest => {
+                let relative = path.strip_prefix(&cwd).unwrap_or(&path);
+                editor_testing::discover::node_id(&relative.to_string_lossy(), &name)
+            }
+            // libtest filters by name; the target is added by the parser when
+            // the results come back.
+            editor_testing::Framework::CargoTest => name,
+        };
+        self.run_tests(editor_testing::Scope::These(vec![id]));
+    }
+
+    /// Feed whatever the run has printed into the results parser.
+    fn poll_tests(&mut self) {
+        let Some(session) = self.tests.as_mut() else {
+            return;
+        };
+        let bytes = self.runner.take_output();
+        if !bytes.is_empty() {
+            session.feed(&bytes);
+        }
+    }
+
+    /// Carry out what the Tests panel asked for.
+    fn apply_tests_action(&mut self, action: tests_panel::Action) {
+        match action {
+            tests_panel::Action::None => {}
+            tests_panel::Action::RunAll => self.run_tests(editor_testing::Scope::All),
+            tests_panel::Action::RunOne(id) => {
+                self.run_tests(editor_testing::Scope::These(vec![id]));
+            }
+            tests_panel::Action::RunFailures => {
+                let failures = self
+                    .tests
+                    .as_ref()
+                    .map(|s| s.report.failures())
+                    .unwrap_or_default();
+                if !failures.is_empty() {
+                    self.run_tests(editor_testing::Scope::These(failures));
+                }
+            }
+            tests_panel::Action::Stop => self.runner.stop(),
+            tests_panel::Action::Open { file, line } => {
+                // Frameworks report paths relative to where they were started,
+                // which is the runner's working directory.
+                let path = self.runner.cwd().join(&file);
+                let path = if path.exists() {
+                    path
+                } else {
+                    // A path that is already absolute, or one relative to the
+                    // project rather than the run.
+                    self.tree
+                        .root()
+                        .map_or_else(|| PathBuf::from(&file), |root| root.join(&file))
+                };
+                self.open_at(&path, line.saturating_sub(1) as usize, 0);
+            }
+        }
+    }
+
     // ---- commands --------------------------------------------------------
 
     fn run_command(&mut self, id: CommandId, ctx: &egui::Context) {
@@ -3983,7 +4163,27 @@ impl EditorApp {
             }
 
             CommandId::Run => self.run_active(false),
-            CommandId::RunTests => self.run_active(true),
+            CommandId::RunTests => self.run_tests(editor_testing::Scope::All),
+            CommandId::RunTestsInFile => match self.active_doc().and_then(|e| e.doc.path()) {
+                Some(path) => {
+                    let path = path.to_path_buf();
+                    self.run_tests(editor_testing::Scope::File(path));
+                }
+                None => self.error("Save the file before running its tests"),
+            },
+            CommandId::RunTestAtCaret => self.run_test_at_caret(),
+            CommandId::RunFailedTests => {
+                let failures = self
+                    .tests
+                    .as_ref()
+                    .map(|s| s.report.failures())
+                    .unwrap_or_default();
+                if failures.is_empty() {
+                    self.info("No failing tests to run again");
+                } else {
+                    self.run_tests(editor_testing::Scope::These(failures));
+                }
+            }
             CommandId::RunStop => {
                 if self.runner.is_running() {
                     self.runner.stop();
@@ -4974,6 +5174,7 @@ impl eframe::App for EditorApp {
         self.open_from_command_line();
         self.runner.set_context(&ctx);
         self.poll_watcher();
+        self.poll_tests();
         self.git.poll();
         // Git refusing to delete an unmerged branch is not a dead end: it is the
         // moment to ask whether to force it. Tried the safe way first and only
@@ -5077,11 +5278,45 @@ impl eframe::App for EditorApp {
             ctx.request_repaint();
         }
         if let Some(code) = self.runner.take_finished() {
+            // Whatever arrived after the last `poll_tests`, which is where the
+            // summary lines usually land. Taken *here* and not before the
+            // check: draining the tap on every frame would throw away the
+            // output of a run still going, which is every line of it.
+            let last_output = self.runner.take_output();
+
+            // A test run's own report is the outcome, so the generic "Exited
+            // with code 1" banner is noise — a failing test is *supposed* to
+            // exit non-zero.
+            let was_tests = self.tests.is_some();
+            let outcome = self.tests.as_mut().map(|session| {
+                // Anything left in the pipe, then close the parsers: a test
+                // that started and never reported becomes a failure rather
+                // than staying "running" for ever.
+                session.feed(&last_output);
+                session.finish();
+                (
+                    session.report.summary(),
+                    session
+                        .report
+                        .count(editor_testing::report::Outcome::Failed),
+                )
+            });
+            if let Some((summary, failed)) = outcome {
+                self.runner.watch_output(false);
+                if failed > 0 {
+                    self.error(summary);
+                } else {
+                    self.info(summary);
+                }
+            }
+
             // A virtual environment being created takes precedence over the
             // generic banner: the user asked for an environment, not for a
             // process to exit.
             if let Some(completion) = self.pending_venv.take() {
                 self.finish_venv(&completion, code);
+            } else if was_tests {
+                // Already reported, in the terms that matter.
             } else {
                 match code {
                     Some(0) => self.info("Finished"),
@@ -5108,6 +5343,13 @@ impl eframe::App for EditorApp {
             let mut open_git = false;
             let mut packages_action = crate::packages_panel::Action::None;
             let mut git_action = git_panel::Action::None;
+            let mut tests_action = tests_panel::Action::None;
+            // Read before the closure borrows self for the panel.
+            let test_label = self
+                .tests
+                .as_ref()
+                .map(|s| format!("{} \u{2014} {}", s.framework.label(), s.scope.label()))
+                .unwrap_or_default();
             // Read before the closure borrows self for the panel. The panel
             // needs the repository root to turn git's relative paths back into
             // ones the editor can open — the *repository's* root, not the open
@@ -5207,6 +5449,12 @@ impl eframe::App for EditorApp {
                             self.dock = DockTab::Git;
                             open_git = true;
                         }
+                        if ui
+                            .selectable_label(self.dock == DockTab::Tests, "TESTS")
+                            .clicked()
+                        {
+                            self.dock = DockTab::Tests;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("\u{00d7}").on_hover_text("Hide").clicked() {
                                 self.show_output = false;
@@ -5248,6 +5496,22 @@ impl eframe::App for EditorApp {
                             };
                             git_action = self.git_panel.ui(ui, state, git_root.as_deref());
                         }
+                        DockTab::Tests => {
+                            let state = match &self.tests {
+                                None => tests_panel::State::Idle,
+                                Some(session) if session.report.finished => {
+                                    tests_panel::State::Finished {
+                                        report: &session.report,
+                                        label: &test_label,
+                                    }
+                                }
+                                Some(session) => tests_panel::State::Running {
+                                    report: &session.report,
+                                    label: &test_label,
+                                },
+                            };
+                            tests_action = self.tests_panel.ui(ui, state);
+                        }
                         DockTab::Debug => {
                             let running = self.debug.is_some();
                             let paused = self
@@ -5275,6 +5539,7 @@ impl eframe::App for EditorApp {
             }
             self.apply_packages_action(packages_action);
             self.apply_git_action(git_action);
+            self.apply_tests_action(tests_action);
 
             match search_action {
                 crate::project_search::Action::None => {}
@@ -5964,6 +6229,9 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Item(CommandId::RunRestart),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::RunTests),
+            MenuEntry::Item(CommandId::RunTestsInFile),
+            MenuEntry::Item(CommandId::RunTestAtCaret),
+            MenuEntry::Item(CommandId::RunFailedTests),
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::ToggleBreakpoint),
             MenuEntry::Item(CommandId::DebugStart),

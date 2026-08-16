@@ -54,6 +54,72 @@ impl Line {
     }
 }
 
+/// Strip escape sequences from a line of output.
+///
+/// For code that needs to *read* what a program printed rather than draw it —
+/// a test runner matching `test foo ... ok`, say, against a runner that colours
+/// its output because it can see a terminal. Turning the colour off instead
+/// would be simpler and would also take the colour away from the console, where
+/// it is wanted.
+///
+/// Handles the two forms that appear in program output: CSI sequences
+/// (`ESC [ … final`) and the two-character ones (`ESC` plus a byte). OSC
+/// strings are consumed up to their terminator. Anything else escape-like is
+/// dropped rather than guessed at, which is right for a function whose job is
+/// to leave only the text.
+#[must_use]
+pub fn strip(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            // A lone carriage return means the line was redrawn — a progress
+            // bar — and what matters is what it was redrawn *as*.
+            if c == '\r' {
+                out.clear();
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters and intermediates, then a final byte in @-~.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: a string, terminated by BEL or by ESC \.
+            Some(']') => {
+                let mut previous = '\0';
+                for c in chars.by_ref() {
+                    if c == '\u{7}' || (previous == '\u{1b}' && c == '\\') {
+                        break;
+                    }
+                    previous = c;
+                }
+            }
+            // Anything else is a short sequence. Those in `0x20..=0x2f` are
+            // *intermediate* bytes with a final byte still to come — `ESC ( B`,
+            // which selects a character set, is three long — so keep taking
+            // until the final one. Everything else is two, already consumed.
+            Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
+                for c in chars.by_ref() {
+                    if !('\u{20}'..='\u{2f}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 /// Accumulates styled lines from a byte stream.
 pub struct AnsiSink {
     parser: Parser,
@@ -318,6 +384,61 @@ impl Perform for SinkState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip;
+
+    #[test]
+    fn plain_text_is_left_alone() {
+        assert_eq!(strip("test foo ... ok"), "test foo ... ok");
+        assert_eq!(strip(""), "");
+    }
+
+    #[test]
+    fn colour_is_removed() {
+        assert_eq!(strip("\u{1b}[32mok\u{1b}[0m"), "ok");
+        assert_eq!(
+            strip("test \u{1b}[1;31mFAILED\u{1b}[0m here"),
+            "test FAILED here"
+        );
+    }
+
+    /// What pytest and cargo actually emit around a percentage or a path.
+    #[test]
+    fn a_real_line_of_test_output_comes_out_readable() {
+        let line = "\u{1b}[1mtests/test_a.py\u{1b}[0m::\u{1b}[1mtest_b\u{1b}[0m \
+                    \u{1b}[32mPASSED\u{1b}[0m\u{1b}[36m [ 50%]\u{1b}[0m";
+        assert_eq!(strip(line), "tests/test_a.py::test_b PASSED [ 50%]");
+    }
+
+    #[test]
+    fn an_osc_title_is_removed_whole() {
+        assert_eq!(strip("\u{1b}]0;a title\u{7}after"), "after");
+        assert_eq!(strip("\u{1b}]0;a title\u{1b}\\after"), "after");
+    }
+
+    /// A progress bar redraws its line, and what it was redrawn as is what the
+    /// line says.
+    #[test]
+    fn a_carriage_return_keeps_only_what_came_after_it() {
+        assert_eq!(strip("first go\rsecond go"), "second go");
+        assert_eq!(strip("  50%\r 100%"), " 100%");
+    }
+
+    #[test]
+    fn a_truncated_sequence_does_not_leak_into_the_text() {
+        // A read boundary can land inside a sequence; better to lose the
+        // fragment than to print `[32m` in the middle of a name.
+        assert_eq!(strip("before\u{1b}[32"), "before");
+        assert_eq!(strip("before\u{1b}"), "before");
+    }
+
+    #[test]
+    fn two_character_sequences_are_dropped() {
+        assert_eq!(strip("a\u{1b}(Bb"), "ab");
     }
 }
 

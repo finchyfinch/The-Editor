@@ -16,6 +16,7 @@ pub mod ansi;
 pub mod interpreter;
 pub mod links;
 pub mod packages;
+pub mod pipe;
 pub mod pty;
 pub mod run_config;
 pub mod screen;

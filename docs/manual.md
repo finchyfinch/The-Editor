@@ -63,6 +63,7 @@ A few that are worth knowing about:
 | `Ctrl+Shift+G` | Show this file's changes since the last commit |
 | `Ctrl+G` | Open the Source Control panel |
 | `Ctrl+Shift+B` | Show who last touched each line |
+| `Ctrl+Shift+T` | Run the test the caret is in |
 | `Ctrl+F` | Find, in this file |
 | `Ctrl+Shift+F` | Find across the project |
 | `F12` | Go to the definition |
@@ -214,6 +215,35 @@ terminal. Scroll up for history; it sticks to the bottom while output arrives.
 
 The terminal takes its size from the panel, so drag the dock taller if a
 program needs more room.
+
+### Tests
+
+**Run → Run Tests** runs the whole suite; **Ctrl+Shift+T** runs just the test
+the caret is in. Results appear in the **Tests** panel *as they happen*, not in
+one lump at the end, so a slow suite tells you where it has got to.
+
+| | |
+|---|---|
+| Run Tests | Everything the framework can find |
+| Run Tests in This File | Python only — a `.rs` file does not name a cargo target |
+| Run the Test at the Caret | `Ctrl+Shift+T` |
+| Run Failed Tests Again | Only the ones that failed last time |
+
+Failures come first and are the only thing shown until you tick **Show
+passing** — in a run of four hundred with two failures, the two are the part
+worth looking at. Click one to jump to the line it failed on and see the whole
+message; click **Run** beside it to run that one again.
+
+Python uses **pytest**, run as `python -m pytest` so it is the project's pytest
+and not whichever is first on `PATH`. Rust uses **cargo test**. Both are your
+own — your `conftest.py`, your fixtures, your `pytest.ini` and your
+`[profile.test]` all apply. The full output is in the **Output** panel as
+usual, which is where to look when a test printed something.
+
+Tests run on plain pipes rather than in a terminal, unlike everything else the
+Run menu starts. A test runner that can see a terminal redraws its lines to
+keep a percentage at the right-hand edge, and what comes out cannot be read
+reliably. Nothing is lost by it — nobody types into a test run.
 
 ### Debugging Python
 

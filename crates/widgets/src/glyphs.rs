@@ -44,6 +44,14 @@ pub const TREE_OPEN: &str = "\u{23f7}";
 pub const TREE_CLOSED: &str = "\u{23f5}";
 /// A commit that joined two histories, in the history list.
 pub const MERGE: &str = "\u{1f500}";
+/// Test outcomes in the Tests panel. A pass reuses [`OK`].
+///
+/// Cues, not decoration: PLAN.md §3.11 requires that nothing is conveyed by
+/// colour alone, and a red row and a green row are the same row to a great many
+/// people.
+pub const TEST_FAILED: &str = "\u{2716}";
+pub const TEST_SKIPPED: &str = "\u{25ab}";
+pub const TEST_RUNNING: &str = "\u{25b6}";
 /// Commits this branch has that its upstream does not, and the other way round.
 ///
 /// Not `\u{2191}` and `\u{2193}`, which are the obvious pair and are not in the
@@ -77,6 +85,9 @@ mod tests {
         ("TREE_OPEN", super::TREE_OPEN, Family::Proportional),
         ("TREE_CLOSED", super::TREE_CLOSED, Family::Proportional),
         ("MERGE", super::MERGE, Family::Proportional),
+        ("TEST_FAILED", super::TEST_FAILED, Family::Proportional),
+        ("TEST_SKIPPED", super::TEST_SKIPPED, Family::Proportional),
+        ("TEST_RUNNING", super::TEST_RUNNING, Family::Proportional),
         ("AHEAD", super::AHEAD, Family::Proportional),
         ("BEHIND", super::BEHIND, Family::Proportional),
         ("FOLD_OPEN", super::FOLD_OPEN, Family::Monospace),

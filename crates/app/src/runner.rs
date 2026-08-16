@@ -18,7 +18,14 @@ pub(crate) struct Runner {
     /// Set once, after the window exists. `None` only in tests, which drive
     /// the runner directly and have nothing to wake.
     wake: Option<eframe::egui::Context>,
-    session: Option<Session>,
+    session: Option<Child>,
+    /// Whether the *next* run goes on plain pipes rather than a terminal.
+    ///
+    /// Set for a test run, whose output is going to be read rather than looked
+    /// at: pytest on a terminal redraws its lines to keep a percentage at the
+    /// right-hand edge, and what comes out has almost no newlines in it. See
+    /// `editor_proc::pipe`.
+    piped: bool,
     output: AnsiSink,
     pub(crate) console: Console,
     /// Kept so Restart can re-run the same thing after the process has gone.
@@ -33,6 +40,15 @@ pub(crate) struct Runner {
     /// installing requirements into an environment that failed to be created
     /// only produces a second, more confusing error.
     queue: std::collections::VecDeque<RunConfig>,
+    /// A copy of the output, for something that wants to *read* the run rather
+    /// than draw it — the test runner, parsing results as they arrive.
+    ///
+    /// `None` when nobody is watching, so an ordinary run costs nothing. The
+    /// bytes are taken away by whoever asked for them, not by the sink's own
+    /// trimming, so no index into the console is involved: the console drops
+    /// old lines to stay within its limit and that would shift every index
+    /// underneath a reader.
+    tap: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -49,6 +65,7 @@ impl Default for Runner {
         Self {
             wake: None,
             session: None,
+            piped: false,
             output: AnsiSink::new(DEFAULT_SCROLLBACK),
             console: Console::default(),
             last: None,
@@ -56,6 +73,7 @@ impl Default for Runner {
             label: "No process".to_owned(),
             finished: None,
             queue: std::collections::VecDeque::new(),
+            tap: None,
         }
     }
 }
@@ -67,7 +85,7 @@ const DEFAULT_SCROLLBACK: usize = 50_000;
 impl Runner {
     #[must_use]
     pub(crate) fn is_running(&self) -> bool {
-        self.session.as_ref().is_some_and(Session::is_running)
+        self.session.as_ref().is_some_and(Child::is_running)
     }
 
     /// Put a banner line into the console, as a finished run does.
@@ -163,7 +181,11 @@ impl Runner {
             let waker: editor_proc::pty::Waker = std::sync::Arc::new(move || ctx.request_repaint());
             waker
         });
-        let session = Session::spawn_with_wake(&config, 24, 120, wake)?;
+        let session = if self.piped {
+            Child::Piped(editor_proc::pipe::Session::spawn(&config, wake)?)
+        } else {
+            Child::Terminal(Session::spawn_with_wake(&config, 24, 120, wake)?)
+        };
         self.cwd = config.cwd.clone();
         self.label = config.label.clone();
         self.last = Some(config);
@@ -225,7 +247,12 @@ impl Runner {
         let mut next = None;
         for event in events {
             match event {
-                Event::Output(bytes) => self.output.feed(&bytes),
+                Event::Output(bytes) => {
+                    if let Some(tap) = &mut self.tap {
+                        tap.extend_from_slice(&bytes);
+                    }
+                    self.output.feed(&bytes);
+                }
                 Event::Exited(code) => {
                     match code {
                         Some(0) => self.output.push_line("[Finished]"),
@@ -269,6 +296,27 @@ impl Runner {
         true
     }
 
+    /// Run the next command on plain pipes rather than a terminal.
+    ///
+    /// For output that is going to be parsed. Reset by the next ordinary run,
+    /// so this cannot leak into the console's behaviour.
+    pub(crate) fn use_pipes(&mut self, on: bool) {
+        self.piped = on;
+    }
+
+    /// Start or stop copying output for a reader.
+    ///
+    /// Switching it on discards anything already collected: a new run's parser
+    /// must not be handed the tail of the last one's output.
+    pub(crate) fn watch_output(&mut self, on: bool) {
+        self.tap = on.then(Vec::new);
+    }
+
+    /// Take the output copied since the last call.
+    pub(crate) fn take_output(&mut self) -> Vec<u8> {
+        self.tap.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
     /// Take the exit code of a run that has just finished, once.
     pub(crate) fn take_finished(&mut self) -> Option<Option<i32>> {
         self.finished.take()
@@ -289,11 +337,60 @@ impl Runner {
             ..
         } = self;
         let state = editor_widgets::console::RunState {
-            running: session.as_ref().is_some_and(Session::is_running),
+            running: session.as_ref().is_some_and(Child::is_running),
             label,
             cwd,
         };
         console.ui(ui, output, state)
+    }
+}
+
+/// A running child, on a terminal or on pipes.
+///
+/// Two shapes for the same idea, because a pseudo-terminal and a pair of pipes
+/// have nothing in common at the type level and making them generic would push
+/// that generic through everything that touches a run.
+enum Child {
+    Terminal(Session),
+    Piped(editor_proc::pipe::Session),
+}
+
+impl std::fmt::Debug for Child {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminal(s) => s.fmt(f),
+            Self::Piped(s) => s.fmt(f),
+        }
+    }
+}
+
+impl Child {
+    fn is_running(&self) -> bool {
+        match self {
+            Self::Terminal(s) => s.is_running(),
+            Self::Piped(s) => s.is_running(),
+        }
+    }
+
+    fn drain(&self) -> Vec<Event> {
+        match self {
+            Self::Terminal(s) => s.drain(),
+            Self::Piped(s) => s.drain(),
+        }
+    }
+
+    fn stop(&self) {
+        match self {
+            Self::Terminal(s) => s.stop(),
+            Self::Piped(s) => s.stop(),
+        }
+    }
+
+    fn send_input(&self, text: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Terminal(s) => s.send_input(text),
+            Self::Piped(s) => s.send_input(text),
+        }
     }
 }
 

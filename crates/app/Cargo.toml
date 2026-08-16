@@ -22,6 +22,7 @@ editor-search.workspace = true
 editor-syntax.workspace = true
 editor-widgets.workspace = true
 editor-vcs = { version = "1.0.0", path = "../vcs" }
+editor-testing = { version = "1.0.0", path = "../testing" }
 
 anyhow.workspace = true
 eframe = { workspace = true, features = ["glow"] }

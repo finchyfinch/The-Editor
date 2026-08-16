@@ -942,6 +942,27 @@ cannot be reached.
   repeating the headers a thousand times for a thousand lines.
   `%x1f`/`%x1e` separate the log's fields, because every separator a human would
   choose is one a commit subject can contain.
+- **A test runner.** pytest for Python and `cargo test` for Rust, both *run*
+  rather than reimplemented. Results are read from the runner's own output as
+  it arrives rather than from a report file: `--junit-xml` would be more stable
+  and is written when the run *ends*, so a suite taking two minutes would show
+  nothing for two minutes and then everything. The Tests panel fills in as it
+  goes, failures first, click one to land on the line it failed on.
+
+  Two things that were not obvious. The test the caret is in comes from the
+  *outline* the syntax layer already builds — nearest declaration above,
+  enclosing ones above that — rather than from a second set of tree-sitter
+  queries, which also keeps it working in a file that does not currently parse.
+  And test runs go through **plain pipes**, not the console's pseudo-terminal:
+  pytest on a terminal redraws its lines to keep a percentage at the right-hand
+  edge, and what comes out has almost no newlines in it. Half the results were
+  being lost. `editor_proc::pipe` exists for that, and nothing is given up by
+  it — nobody types into a test run.
+
+  Not done: a run button in the gutter beside each test, which §13 asked for.
+  The gutter already carries four columns and a fifth is too many; the command,
+  the menu and the panel cover the same ground.
+
 - **Branches and remotes**, which completes it. The panel names the branch and
   how far it is ahead of or behind its upstream; **Branches…** switches, creates
   and deletes. Branch names are validated before git sees them, so a mistyped
@@ -974,7 +995,8 @@ that were.
 
 **Since built**, and struck from this list: the integrated terminal, rename and
 refactor, crash-recovery autosave, the accessibility pass, package and
-requirements management, go to symbol, code folding, and **version control** —
+requirements management, go to symbol, code folding, the **test runner**, and
+**version control** —
 all of it: gutter change markers, staging, committing, history, blame, branches
 and remotes. That was "the largest omission by a distance" when this list was
 written, and it is now the largest thing on the other side of it. Two more that
@@ -984,7 +1006,6 @@ about reviewing from memory rather than from the code.
 
 | | Why it matters | Rough size |
 |---|---|---|
-| **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. "Run Tests" currently just runs the open file. A headline PyCharm feature for Python and the natural partner to the debugger. | 2–3 wk |
 | **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
 | **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |
 | **Outline / breadcrumbs / go to symbol** | `documentSymbol` gives all three. Navigating a 3,000-line file is currently scrolling. | 0.5 wk |

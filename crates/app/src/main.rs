@@ -29,6 +29,7 @@ mod settings_window;
 mod symbol_picker;
 mod terminal;
 mod terminal_keys;
+mod tests_panel;
 mod venv_dialog;
 mod watcher;
 
