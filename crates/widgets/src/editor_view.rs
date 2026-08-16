@@ -31,6 +31,32 @@ use eframe::egui;
 const OVERSCAN_ROWS: usize = 4;
 /// Caret blink period.
 const BLINK_MS: u128 = 530;
+/// How long the pointer must sit still before a hover is worth asking about.
+///
+/// Long enough that crossing a line does not ask about every word on it, short
+/// enough that stopping on a name and waiting feels like the editor answering
+/// rather than thinking.
+const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// The pointer resting over the text.
+#[derive(Debug, Clone, Copy)]
+struct Resting {
+    /// Character offset under the pointer.
+    offset: usize,
+    /// Where on screen, so a popup can be put beside it.
+    at: egui::Pos2,
+    /// When it arrived here.
+    since: std::time::Instant,
+}
+
+/// Something the pointer has settled on, for the application to describe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hovered {
+    pub offset: usize,
+    /// Where to put the popup.
+    pub at: egui::Pos2,
+}
+
 /// How wide the change bar is drawn.
 ///
 /// Narrow on purpose. It is a signal in peripheral vision, not something to be
@@ -154,6 +180,11 @@ pub struct EditorView {
     /// How this buffer differs from the committed version, supplied by the
     /// application each frame. Sorted by line, one entry per changed line.
     changes: Vec<(usize, LineStatus)>,
+    /// Where the pointer is resting over the text, and for how long.
+    ///
+    /// The offset alone is not enough: a hover has to wait for the pointer to
+    /// settle, or moving across a line asks about every word on it.
+    resting: Option<Resting>,
     /// Who last touched each line, by zero-based line number. Empty when the
     /// annotations are switched off, which is what decides whether the column
     /// exists at all.
@@ -671,6 +702,7 @@ impl EditorView {
                 self.describe_for_screen_readers(ui, doc, &response);
 
                 let text_left = rect.left() + gutter_width;
+                self.track_pointer(ui, doc, &response, &font, rect, text_left, row_height);
                 let visible = ui.clip_rect().intersect(rect);
                 let rows_per_page = (visible.height() / row_height).floor().max(1.0) as usize;
 
@@ -786,6 +818,68 @@ impl EditorView {
     }
 
     // ---- input -----------------------------------------------------------
+
+    /// Note where the pointer is resting over the text.
+    ///
+    /// Only records; [`Self::hovered`] decides when it has rested long enough.
+    /// Moving to a different character restarts the clock, so dragging across a
+    /// line never asks about anything.
+    #[allow(clippy::too_many_arguments)]
+    fn track_pointer(
+        &mut self,
+        ui: &egui::Ui,
+        doc: &Document,
+        response: &egui::Response,
+        font: &egui::FontId,
+        rect: egui::Rect,
+        text_left: f32,
+        row_height: f32,
+    ) {
+        // A pointer that is dragging, or over the gutter, is not asking about
+        // anything. Nor is one over a different widget.
+        let Some(pos) = response.hover_pos() else {
+            self.resting = None;
+            return;
+        };
+        if response.dragged() || pos.x < text_left {
+            self.resting = None;
+            return;
+        }
+
+        let offset = self.offset_at_pos(ui, doc, font, pos, rect, text_left, row_height);
+        match self.resting {
+            Some(resting) if resting.offset == offset => {}
+            _ => {
+                self.resting = Some(Resting {
+                    offset,
+                    at: pos,
+                    since: std::time::Instant::now(),
+                });
+            }
+        }
+
+        // The clock has to be *watched*, or nothing wakes the loop between the
+        // pointer stopping and the delay expiring — and the hover would appear
+        // only on the next keystroke.
+        if self
+            .resting
+            .is_some_and(|r| r.since.elapsed() < HOVER_DELAY)
+        {
+            ui.ctx().request_repaint_after(HOVER_DELAY);
+        }
+    }
+
+    /// What the pointer has settled on, once it has been there long enough.
+    ///
+    /// `None` while it is still moving, or when it is not over the text at all.
+    #[must_use]
+    pub fn hovered(&self) -> Option<Hovered> {
+        let resting = self.resting?;
+        (resting.since.elapsed() >= HOVER_DELAY).then_some(Hovered {
+            offset: resting.offset,
+            at: resting.at,
+        })
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse(

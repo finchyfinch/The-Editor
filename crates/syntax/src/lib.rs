@@ -8,6 +8,7 @@
 pub mod brackets;
 pub mod errors;
 pub mod highlight;
+pub mod hover;
 pub mod indent;
 pub mod methods;
 pub mod symbols;

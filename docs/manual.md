@@ -279,6 +279,15 @@ to a language server:
 Each can be switched off individually in **Settings > Languages** — useful if
 one of them is noisier than it is helpful on a particular project.
 
+**Hover** the pointer over a name and hold it still: a moment later a box
+appears with the type, the signature and the documentation.
+
+With no server running it still answers, from the file you are looking at — the
+line the name was declared on, and its docstring or doc comment — and says that
+is what it is doing. It cannot tell you a type, or anything about a name from
+another file or a library, so it says so rather than letting a partial answer
+pass for a whole one.
+
 **Completion** appears as you type, and on `Ctrl+Space`. With no server running
 it falls back to the words already in the file, which is less clever and still
 better than nothing.

@@ -942,6 +942,19 @@ cannot be reached.
   repeating the headers a thousand times for a thousand lines.
   `%x1f`/`%x1e` separate the log's fields, because every separator a human would
   choose is one a commit subject can contain.
+- **Hover.** `textDocument/hover`, with a parse-tree fallback that gives the
+  declaration line and the docstring and *says* that is all it is — the
+  degradation ladder in §3.6 applied to one more feature.
+
+  One thing worth recording, because it would have been very hard to find from
+  the outside: hover asks **every** server that advertises `hoverProvider`, not
+  the first. Ruff advertises it and means it — it explains its own rule codes —
+  but has nothing to say about ordinary code, so stopping at the first
+  supporting server meant Ruff answered `null` in ten milliseconds and
+  basedpyright, which knows the type, was never asked. The symptom was a hover
+  that silently always used the fallback. The caller keeps the first non-empty
+  answer, so the order the replies arrive in does not matter.
+
 - **A test runner.** pytest for Python and `cargo test` for Rust, both *run*
   rather than reimplemented. Results are read from the runner's own output as
   it arrives rather than from a report file: `--junit-xml` would be more stable
@@ -995,8 +1008,8 @@ that were.
 
 **Since built**, and struck from this list: the integrated terminal, rename and
 refactor, crash-recovery autosave, the accessibility pass, package and
-requirements management, go to symbol, code folding, the **test runner**, and
-**version control** —
+requirements management, go to symbol, code folding, hover, the **test
+runner**, and **version control** —
 all of it: gutter change markers, staging, committing, history, blame, branches
 and remotes. That was "the largest omission by a distance" when this list was
 written, and it is now the largest thing on the other side of it. Two more that
@@ -1006,7 +1019,6 @@ about reviewing from memory rather than from the code.
 
 | | Why it matters | Rough size |
 |---|---|---|
-| **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
 | **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |
 | **Outline / breadcrumbs / go to symbol** | `documentSymbol` gives all three. Navigating a 3,000-line file is currently scrolling. | 0.5 wk |
 | **Auto-import** | Type `Path`, get `from pathlib import Path`. High value in Python specifically, and a code action the servers already offer. | 1 wk |

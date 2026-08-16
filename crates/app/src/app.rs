@@ -248,6 +248,13 @@ pub(crate) struct EditorApp {
     pending_force_delete: Option<String>,
     /// Whether the editor shows who last touched each line.
     show_blame: bool,
+    /// What is under the pointer, and what to say about it.
+    ///
+    /// Held across frames because the answer arrives from a server long after
+    /// the question, and cleared the moment the pointer moves to a different
+    /// character — a description of somewhere the pointer has left is worse
+    /// than none.
+    hover: Option<Hover>,
     /// The Tests tab.
     tests_panel: TestsPanel,
     /// The run in progress, or the last one. `None` before anything has been
@@ -356,6 +363,24 @@ pub(crate) struct EditorApp {
     synced: std::collections::HashMap<PathBuf, u64>,
 }
 
+/// What the pointer is resting on, and what is known about it.
+#[derive(Debug, Clone)]
+struct Hover {
+    /// The character offset asked about, so a reply about somewhere else can be
+    /// told from one about here.
+    offset: usize,
+    /// Where to put the popup.
+    at: egui::Pos2,
+    /// What to show. Empty while waiting for a server that has been asked.
+    text: String,
+    /// True when the text came from the parse tree rather than a server, so the
+    /// popup can say so — the difference between "this is what it is" and "this
+    /// is the line it was declared on" matters.
+    from_file: bool,
+    /// Whether a server has been asked and has not answered.
+    waiting: bool,
+}
+
 /// The bottom dock's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DockTab {
@@ -447,6 +472,7 @@ impl EditorApp {
             branches: BranchesView::default(),
             pending_force_delete: None,
             show_blame: false,
+            hover: None,
             tests_panel: TestsPanel::default(),
             tests: None,
             was_focused: true,
@@ -2141,6 +2167,103 @@ impl EditorApp {
         self.apply_completion(action);
     }
 
+    /// Notice what the pointer has settled on, and find out about it.
+    ///
+    /// A server is asked when one can answer; the parse tree answers meanwhile
+    /// and answers alone when there is no server. The degradation ladder in
+    /// PLAN.md §3.6: everything that can work without a server should.
+    fn sync_hover(&mut self) {
+        // A popup while a menu or a dialog is open is a popup in the way.
+        if self.palette.is_open() || self.completion.is_open() {
+            self.hover = None;
+            return;
+        }
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            self.hover = None;
+            return;
+        };
+        let Some(hovered) = entry.view.hovered() else {
+            self.hover = None;
+            return;
+        };
+        // Already asked about this character; the answer may still be coming.
+        if self
+            .hover
+            .as_ref()
+            .is_some_and(|h| h.offset == hovered.offset)
+        {
+            return;
+        }
+
+        // What the file itself can say, which is available at once and is the
+        // whole answer when nothing else can be asked.
+        let local = entry
+            .highlighter
+            .as_ref()
+            .and_then(|h| h.tree())
+            .and_then(|tree| {
+                editor_syntax::hover::local(tree, entry.doc.text(), hovered.offset, entry.language)
+            });
+
+        let path = entry.doc.path().map(Path::to_path_buf);
+        // `line_col` is one-based for the status bar; the protocol is not.
+        let (line, column) = entry.doc.line_col(hovered.offset);
+        let (line, column) = (line as u32 - 1, column as u32 - 1);
+        let asked = match path {
+            Some(path) => self.lsp.hover(&path, line, column),
+            None => false,
+        };
+
+        self.hover = Some(Hover {
+            offset: hovered.offset,
+            at: hovered.at,
+            text: local
+                .as_ref()
+                .map(editor_syntax::hover::Local::text)
+                .unwrap_or_default(),
+            from_file: local.is_some(),
+            waiting: asked,
+        });
+    }
+
+    /// Draw whatever is known about what the pointer is on.
+    fn hover_draw(&mut self, ctx: &egui::Context) {
+        let Some(hover) = self.hover.clone() else {
+            return;
+        };
+        // Nothing to say and nothing coming: no popup at all, rather than an
+        // empty one that follows the pointer around.
+        if hover.text.is_empty() && !hover.waiting {
+            return;
+        }
+
+        egui::Area::new(egui::Id::new("hover_popup"))
+            // Below and slightly right of the pointer, which is where a tooltip
+            // goes and where it does not cover the word being asked about.
+            .fixed_pos(hover.at + egui::vec2(12.0, 20.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(560.0);
+                    if hover.text.is_empty() {
+                        ui.weak("Looking\u{2026}");
+                        return;
+                    }
+                    // Monospace: a signature is code, and proportional spacing
+                    // makes `a: i32, b: i32` hard to read as a list.
+                    ui.label(egui::RichText::new(&hover.text).monospace());
+                    if hover.from_file {
+                        // Say where this came from. "Declared on this line" and
+                        // "this is its type" are different claims, and only one
+                        // of them is being made.
+                        ui.add_space(4.0);
+                        ui.weak("From this file only \u{2014} no language server answered.");
+                    }
+                });
+            });
+    }
+
     /// Put an accepted suggestion into the document.
     fn apply_completion(&mut self, action: completion::Action) {
         let completion::Action::Accept { insert, replacing } = action else {
@@ -2538,6 +2661,25 @@ impl EditorApp {
                 }
                 editor_lsp::session::Notice::DiagnosticsChanged(_) => {}
                 editor_lsp::session::Notice::Rename(files) => self.apply_rename(files),
+                editor_lsp::session::Notice::Hovered { line, column, text } => {
+                    // Only if it is still about where the pointer is. The
+                    // pointer moves while the request is in flight, and a
+                    // description of somewhere it has left is worse than none.
+                    if let Some(hover) = self.hover.as_mut()
+                        && let Some(entry) = self.active.and_then(|i| self.docs.get(i))
+                    {
+                        let (at_line, at_column) = entry.doc.line_col(hover.offset);
+                        if at_line as u32 - 1 == line && at_column as u32 - 1 == column {
+                            hover.waiting = false;
+                            if !text.trim().is_empty() {
+                                // A server's answer replaces the file's guess:
+                                // it knows the type, and the other knows a line.
+                                hover.text = text;
+                                hover.from_file = false;
+                            }
+                        }
+                    }
+                }
                 editor_lsp::session::Notice::Completions(items) => {
                     // Matched against the word as it is *now*, not as it was
                     // when the request went out; the popup decides whether the
@@ -5202,6 +5344,7 @@ impl eframe::App for EditorApp {
         self.sync_highlighters(&ctx);
         self.sync_completion();
         self.sync_problem_at_caret();
+        self.sync_hover();
         // Before the menu bar, toolbar and editor read this frame's events:
         // whoever looks first gets the key.
         self.completion_keys(&ctx);
@@ -5612,6 +5755,7 @@ impl eframe::App for EditorApp {
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.
         self.completion_draw(&ctx);
+        self.hover_draw(&ctx);
         if let Some(relative) = self.file_picker.ui(&ctx)
             && let Some(root) = self.tree.root().map(Path::to_path_buf)
         {

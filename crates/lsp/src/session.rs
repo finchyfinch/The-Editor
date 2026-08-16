@@ -149,6 +149,13 @@ enum Pending {
     Locations(Query),
     Completions,
     Rename,
+    /// A hover, and where it was asked about. The position comes back with the
+    /// answer because the pointer will have moved on by then, and a description
+    /// of something else under the pointer is worse than none.
+    Hover {
+        line: u32,
+        column: u32,
+    },
 }
 
 /// What happened that the application should react to.
@@ -166,6 +173,13 @@ pub enum Notice {
     },
     /// Suggestions came back for the position last asked about.
     Completions(Vec<Completion>),
+    /// A description of what is at a position. Empty text means the server had
+    /// nothing to say about it, which is an answer and not a failure.
+    Hovered {
+        line: u32,
+        column: u32,
+        text: String,
+    },
     /// A rename came back, as the files it would change. Empty means the
     /// server declined -- renaming a keyword, or a symbol it cannot resolve.
     Rename(Vec<FileEdit>),
@@ -473,6 +487,55 @@ impl Lsp {
         false
     }
 
+    /// Ask what is at a position — a type, a signature, a docstring.
+    ///
+    /// Returns false when nothing could be asked, so the caller can fall back
+    /// to what the parse tree knows rather than waiting for a reply that is
+    /// never coming.
+    ///
+    /// Any hover still outstanding is forgotten first, for the same reason
+    /// completions are: the pointer moves while the request is in flight, and
+    /// an older, slower reply arriving last would describe somewhere the
+    /// pointer has left.
+    ///
+    /// **Every** server that can answer is asked, not the first one. This is
+    /// where hover differs from [`Self::ask`]: Ruff advertises `hoverProvider`
+    /// and means it — it explains its own rule codes — but has nothing to say
+    /// about ordinary code. Stopping at the first server that *supports* hover
+    /// meant Ruff answered `null` in ten milliseconds and basedpyright, which
+    /// knows the type, was never asked at all. The caller keeps the first
+    /// non-empty answer.
+    pub fn hover(&mut self, path: &Path, line: u32, column: u32) -> bool {
+        self.pending
+            .retain(|_, kind| !matches!(kind, Pending::Hover { .. }));
+
+        let Some(document) = self.documents.get(path) else {
+            return false;
+        };
+        let told = document.told.clone();
+        let uri = server::path_to_uri(path);
+        let mut asked = false;
+
+        for id in told {
+            let Some(server) = self.servers.get_mut(id) else {
+                continue;
+            };
+            if !server.is_ready() || !server.supports("hoverProvider") {
+                continue;
+            }
+            let params = json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": column },
+            });
+            if let Ok(request) = server.send_request("textDocument/hover", params) {
+                self.pending
+                    .insert((id, request), Pending::Hover { line, column });
+                asked = true;
+            }
+        }
+        asked
+    }
+
     /// Ask a server to rename the symbol at a position.
     ///
     /// Returns false if nothing could be asked. Rename is the one feature here
@@ -625,6 +688,13 @@ impl Lsp {
                         Some(Pending::Rename) => {
                             notices.push(Notice::Rename(parse_workspace_edit(&result)));
                         }
+                        Some(Pending::Hover { line, column }) => {
+                            notices.push(Notice::Hovered {
+                                line,
+                                column,
+                                text: parse_hover(&result),
+                            });
+                        }
                         None => {}
                     },
                 }
@@ -687,6 +757,72 @@ impl Drop for Lsp {
 /// order shifts every range after the first. That is the easiest way to corrupt
 /// a file during a rename, and it fails quietly: the result is still valid text,
 /// just wrong.
+/// Read a `Hover` into the text to show.
+///
+/// The protocol has accumulated four shapes for `contents` over the years and
+/// every one is still legal, so every one is read: a plain string, a
+/// `MarkedString` object with a language and a value, an array of either, and a
+/// `MarkupContent` with a kind and a value. rust-analyzer sends the last,
+/// basedpyright the last, and older servers the first two.
+///
+/// Fenced code blocks are unwrapped rather than rendered. A hover is a few
+/// lines in a small window; the fences are the only markdown in it that would
+/// be *lost* by showing the source, and the rest — a bullet, an underscore —
+/// reads perfectly well as it is.
+fn parse_hover(result: &serde_json::Value) -> String {
+    fn one(value: &serde_json::Value) -> Option<String> {
+        // A plain string, or `MarkupContent`/`MarkedString`'s `value`.
+        if let Some(text) = value.as_str() {
+            return Some(text.to_owned());
+        }
+        value
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
+
+    let contents = result.get("contents").unwrap_or(&serde_json::Value::Null);
+    let text = match contents {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(one)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        other => one(other).unwrap_or_default(),
+    };
+
+    unfence(&text)
+}
+
+/// Strip markdown code fences, keeping what was inside them.
+///
+/// The lines between the fences are the signature and the type, which is the
+/// part of a hover anyone reads. Leaving ```` ```rust ```` on screen is three
+/// characters of noise above every one of them.
+fn unfence(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut previous_was_blank = true;
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            // The fence itself goes, and so does a blank line that would be
+            // left stranded where two blocks met.
+            continue;
+        }
+        let blank = line.trim().is_empty();
+        if blank && previous_was_blank {
+            continue;
+        }
+        previous_was_blank = blank;
+        out.push(line);
+    }
+
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
 fn parse_workspace_edit(result: &serde_json::Value) -> Vec<FileEdit> {
     fn edits_of(value: &serde_json::Value) -> Vec<TextEdit> {
         let mut out: Vec<TextEdit> = value
@@ -856,6 +992,108 @@ fn parse_locations(result: &serde_json::Value) -> Vec<Location> {
         serde_json::Value::Object(_) => one(result).into_iter().collect(),
         // `null` is a valid answer meaning "I do not know".
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::{parse_hover, unfence};
+    use serde_json::json;
+
+    #[test]
+    fn a_server_with_nothing_to_say_says_nothing() {
+        assert_eq!(parse_hover(&json!(null)), "");
+        assert_eq!(parse_hover(&json!({})), "");
+        assert_eq!(parse_hover(&json!({ "contents": [] })), "");
+    }
+
+    /// The oldest shape, and still legal.
+    #[test]
+    fn a_plain_string_is_read() {
+        let value = json!({ "contents": "fn add(a: i32) -> i32" });
+        assert_eq!(parse_hover(&value), "fn add(a: i32) -> i32");
+    }
+
+    /// `MarkupContent`, which is what rust-analyzer and basedpyright send.
+    #[test]
+    fn markup_content_is_read_and_unfenced() {
+        let value = json!({
+            "contents": {
+                "kind": "markdown",
+                "value": "```rust\nfn add(a: i32, b: i32) -> i32\n```\n\nAdds two numbers.",
+            }
+        });
+        assert_eq!(
+            parse_hover(&value),
+            "fn add(a: i32, b: i32) -> i32\n\nAdds two numbers."
+        );
+    }
+
+    /// `MarkedString`: a language and a value.
+    #[test]
+    fn a_marked_string_is_read() {
+        let value = json!({
+            "contents": { "language": "python", "value": "def add(a, b)" }
+        });
+        assert_eq!(parse_hover(&value), "def add(a, b)");
+    }
+
+    /// An array of any of the above, which older servers send freely.
+    #[test]
+    fn an_array_of_pieces_is_joined() {
+        let value = json!({
+            "contents": [
+                { "language": "rust", "value": "fn add" },
+                "Adds two numbers.",
+            ]
+        });
+        assert_eq!(parse_hover(&value), "fn add\n\nAdds two numbers.");
+    }
+
+    #[test]
+    fn fences_go_and_what_was_inside_them_stays() {
+        assert_eq!(unfence("```rust\ncode\n```"), "code");
+        assert_eq!(unfence("```\ncode\n```"), "code");
+        assert_eq!(unfence("no fences here"), "no fences here");
+    }
+
+    /// Two blocks back to back leave a run of blank lines where the fences
+    /// were, and a hover is a small window.
+    #[test]
+    fn blank_lines_left_by_the_fences_are_collapsed() {
+        let text = "```rust\nfirst\n```\n\n```rust\nsecond\n```";
+        assert_eq!(unfence(text), "first\n\nsecond");
+    }
+
+    #[test]
+    fn trailing_blank_lines_are_dropped() {
+        assert_eq!(unfence("text\n\n\n"), "text");
+    }
+
+    /// Everything except the fences is left as it is: a hover is a few lines,
+    /// and a bullet or an underscore reads perfectly well unrendered.
+    #[test]
+    fn other_markdown_is_left_alone() {
+        let value = json!({
+            "contents": { "kind": "markdown", "value": "- one\n- two\n\n*emphasis*" }
+        });
+        assert_eq!(parse_hover(&value), "- one\n- two\n\n*emphasis*");
+    }
+
+    /// A real answer from rust-analyzer, which puts the module path above the
+    /// signature in its own fence.
+    #[test]
+    fn a_realistic_rust_analyzer_answer_reads_cleanly() {
+        let value = json!({
+            "contents": {
+                "kind": "markdown",
+                "value": "```rust\neditor_core::document\n```\n\n```rust\npub fn line_of(&self, offset: usize) -> usize\n```\n\n---\n\nThe line `offset` falls on.",
+            }
+        });
+        assert_eq!(
+            parse_hover(&value),
+            "editor_core::document\n\npub fn line_of(&self, offset: usize) -> usize\n\n---\n\nThe line `offset` falls on."
+        );
     }
 }
 
