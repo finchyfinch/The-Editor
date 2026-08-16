@@ -143,6 +143,38 @@ back; the window starts with the most recent hundred.
 and when. The annotations are read from the *saved* file, so unsaved edits shift
 them until you save.
 
+### Branches
+
+The top of the Source Control panel names the branch you are on, what it tracks,
+and how far ahead or behind it is. The status bar shows the same, shorter.
+
+**Branches…** lists them. Switch with a click; type a name to create one, and
+the box says at once if git would refuse the name rather than waiting for the
+button. Remote branches are listed to show what is there — checking one out
+directly would leave you on a detached HEAD, so The Editor does not offer it.
+
+**Delete** tries the safe way first. When a branch has commits that exist
+nowhere else git refuses, and that refusal becomes the offer to delete it
+anyway — with a note that the reflog can still find them for a while and The
+Editor cannot.
+
+### Remotes
+
+**Fetch** asks the remote what it has and changes nothing here. **Pull** brings
+your branch up to date and is fast-forward only: if the histories have diverged
+it refuses rather than starting a merge you did not ask for, and the merge or
+rebase is then yours to do deliberately. **Push** sends the current branch, and
+is never forced — a forced push can destroy somebody else's commits, and the
+terminal is there for the rare case that genuinely needs one.
+
+Whatever git prints appears under the buttons. One operation runs at a time and
+the panel says which; the rest of the git display waits for it, because two git
+processes on one repository get in each other's way.
+
+Anything needing a password will fail rather than hang — The Editor never
+answers a credential prompt on your behalf. Use the terminal (**Ctrl+`**) for
+those, or an agent or credential helper that answers without asking.
+
 ### When a file changes underneath you
 
 If something else rewrites a file you have open — `git checkout`, a formatter,

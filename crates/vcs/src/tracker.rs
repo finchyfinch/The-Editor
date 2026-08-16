@@ -72,6 +72,53 @@ pub enum Action {
     /// safe on work nobody else has seen and a nuisance on work they have, so
     /// it is the caller's decision and never the default.
     Commit { message: String, amend: bool },
+    /// Move onto a branch.
+    Checkout(String),
+    /// Start a branch at HEAD.
+    CreateBranch { name: String, switch: bool },
+    /// Delete a branch.
+    ///
+    /// With `force`, this drops commits that are not merged anywhere. The
+    /// reflog can still reach them for a while; nothing in the interface can.
+    /// Callers must confirm before forcing.
+    DeleteBranch { name: String, force: bool },
+    /// Ask a remote what it has, without taking any of it.
+    Fetch(String),
+    /// Bring the current branch up to date, fast-forward only.
+    Pull,
+    /// Send the current branch to a remote. Never forced.
+    Push {
+        remote: String,
+        branch: String,
+        set_upstream: bool,
+    },
+}
+
+impl Action {
+    /// Whether this touches a remote, and so may take a while.
+    ///
+    /// The worker runs one thing at a time — deliberately, because two git
+    /// processes on one repository contend for the index lock — so a slow
+    /// fetch holds up the gutter behind it. Saying which of these is running
+    /// is what makes that legible rather than mysterious.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Fetch(_) | Self::Pull | Self::Push { .. })
+    }
+
+    /// Whether this changes which branches exist, or where they point.
+    fn touches_branches(&self) -> bool {
+        matches!(
+            self,
+            Self::Checkout(_)
+                | Self::CreateBranch { .. }
+                | Self::DeleteBranch { .. }
+                | Self::Commit { .. }
+                | Self::Fetch(_)
+                | Self::Pull
+                | Self::Push { .. }
+        )
+    }
 }
 
 impl Action {
@@ -83,6 +130,12 @@ impl Action {
             Self::Discard(_) => "discard",
             Self::Commit { amend: false, .. } => "commit",
             Self::Commit { amend: true, .. } => "amend",
+            Self::Checkout(_) => "switch branch",
+            Self::CreateBranch { .. } => "create the branch",
+            Self::DeleteBranch { .. } => "delete the branch",
+            Self::Fetch(_) => "fetch",
+            Self::Pull => "pull",
+            Self::Push { .. } => "push",
         }
     }
 }
@@ -105,6 +158,8 @@ enum Request {
     Show(String),
     /// Read who last touched each line of a file.
     Blame(PathBuf),
+    /// Read the branches and the configured remotes.
+    Branches,
 }
 
 /// What the worker found.
@@ -127,7 +182,12 @@ enum Reply {
     Status(Result<crate::status::Status, String>),
     /// An action failed. Success says nothing here — the status that follows
     /// it says everything worth saying.
-    Failed(String),
+    ///
+    /// The action comes back with the message because some failures are worth
+    /// *offering something about* rather than only reporting: git refusing to
+    /// delete an unmerged branch is the prompt to ask whether to force it, and
+    /// that needs to know which branch.
+    Failed(Action, String),
     /// A commit landed. The only action whose *success* needs announcing: it is
     /// what tells the panel it may clear the message box, and clearing it on
     /// anything less certain would throw away a message a failing hook rejected.
@@ -146,6 +206,13 @@ enum Reply {
         path: PathBuf,
         lines: Result<Vec<crate::blame::Line>, String>,
     },
+    Branches {
+        branches: Result<Vec<crate::branch::Branch>, String>,
+        remotes: Vec<String>,
+    },
+    /// A remote operation said something worth reading — git's summary of what
+    /// it fetched or pushed, which is the only confirmation that it worked.
+    Remote(String),
 }
 
 /// HEAD's version of one file, or the knowledge that there isn't one.
@@ -209,6 +276,23 @@ pub struct Tracker {
     last_message: Option<String>,
     /// A commit landed and nobody has been told yet.
     committed: bool,
+    /// The action that produced [`Self::error`], for a caller that can offer
+    /// something better than the message alone.
+    failed: Option<Action>,
+    /// The branches, local and remote-tracking.
+    branches: Vec<crate::branch::Branch>,
+    branches_known: bool,
+    branches_pending: bool,
+    /// The configured remotes, in git's order. The first is the default for
+    /// pushing, which is what `origin` being first means in practice.
+    remotes: Vec<String>,
+    /// The remote operation currently running, if any, so the interface can say
+    /// what it is waiting for instead of appearing to have stopped.
+    busy: Option<&'static str>,
+    /// What a remote operation last reported. Git's own summary — "Everything
+    /// up-to-date", the ref update lines — which is the only confirmation that
+    /// anything happened.
+    remote_said: Option<String>,
     /// Commits whose full details have been fetched, keyed by object name. A
     /// commit never changes, so this is only cleared when the project does.
     details: HashMap<String, crate::log::Detail>,
@@ -264,6 +348,13 @@ impl Tracker {
             log_limit: 0,
             last_message: None,
             committed: false,
+            failed: None,
+            branches: Vec::new(),
+            branches_known: false,
+            branches_pending: false,
+            remotes: Vec::new(),
+            busy: None,
+            remote_said: None,
             details: HashMap::new(),
             details_pending: std::collections::HashSet::new(),
             blame: None,
@@ -293,6 +384,13 @@ impl Tracker {
         self.log_limit = 0;
         self.last_message = None;
         self.committed = false;
+        self.failed = None;
+        self.branches.clear();
+        self.branches_known = false;
+        self.branches_pending = false;
+        self.remotes.clear();
+        self.busy = None;
+        self.remote_said = None;
         self.details.clear();
         self.details_pending.clear();
         self.blame = None;
@@ -348,6 +446,11 @@ impl Tracker {
                         if self.log_known {
                             self.refresh_log(self.log_limit);
                         }
+                        // And a branch has moved, or a different one is now
+                        // checked out, or both.
+                        if self.branches_known {
+                            self.refresh_branches();
+                        }
                     }
                     self.branch = branch;
                 }
@@ -388,6 +491,9 @@ impl Tracker {
                 }
                 Reply::Status(result) => {
                     self.status_pending = false;
+                    // Every action ends with a status, so this is where a
+                    // remote operation stops being in progress.
+                    self.busy = None;
                     match result {
                         Ok(status) => {
                             self.status = status;
@@ -396,8 +502,25 @@ impl Tracker {
                         Err(message) => self.error = Some(message),
                     }
                 }
-                Reply::Failed(message) => self.error = Some(message),
+                Reply::Failed(action, message) => {
+                    self.error = Some(message);
+                    self.failed = Some(action);
+                }
                 Reply::Committed => self.committed = true,
+                Reply::Branches { branches, remotes } => {
+                    self.branches_pending = false;
+                    self.remotes = remotes;
+                    match branches {
+                        Ok(branches) => {
+                            self.branches = branches;
+                            self.branches_known = true;
+                        }
+                        Err(message) => self.error = Some(message),
+                    }
+                }
+                Reply::Remote(said) => {
+                    self.remote_said = (!said.trim().is_empty()).then(|| said.trim().to_owned());
+                }
             }
         }
 
@@ -474,13 +597,76 @@ impl Tracker {
             return;
         }
         self.error = None;
+        self.failed = None;
         self.status_pending = true;
+        if action.is_remote() {
+            self.busy = Some(match action {
+                Action::Fetch(_) => "Fetching\u{2026}",
+                Action::Pull => "Pulling\u{2026}",
+                _ => "Pushing\u{2026}",
+            });
+            self.remote_said = None;
+        }
         // A commit moves HEAD, and the HEAD check is what notices — and what
         // then reloads the baselines, the gutter and the history. Waiting up to
         // the poll interval for it means the panel sits showing the state from
         // before the commit for a second or two, which reads as a failure.
         self.last_head_check = Instant::now() - HEAD_INTERVAL;
         let _ = self.requests.send(Request::Act(action));
+    }
+
+    /// Every branch, local ones first, then the remote-tracking ones.
+    #[must_use]
+    pub fn branches(&self) -> &[crate::branch::Branch] {
+        &self.branches
+    }
+
+    /// Whether a branch listing has ever come back.
+    #[must_use]
+    pub fn branches_known(&self) -> bool {
+        self.branches_known
+    }
+
+    /// The branch HEAD is on, with what it knows about its upstream.
+    #[must_use]
+    pub fn current_branch(&self) -> Option<&crate::branch::Branch> {
+        self.branches.iter().find(|b| b.is_head)
+    }
+
+    /// The configured remotes. Empty means there is nowhere to push.
+    #[must_use]
+    pub fn remotes(&self) -> &[String] {
+        &self.remotes
+    }
+
+    /// Read the branches and remotes again.
+    pub fn refresh_branches(&mut self) {
+        if self.repo.is_none() || self.branches_pending {
+            return;
+        }
+        self.branches_pending = true;
+        let _ = self.requests.send(Request::Branches);
+    }
+
+    /// The remote operation currently running, if any.
+    ///
+    /// The worker runs one thing at a time, so while this is set the gutter and
+    /// the status are waiting behind it. Saying so is the difference between a
+    /// slow network and an editor that has stopped.
+    #[must_use]
+    pub fn busy(&self) -> Option<&'static str> {
+        self.busy
+    }
+
+    /// What a remote operation last reported, in git's own words.
+    #[must_use]
+    pub fn remote_said(&self) -> Option<&str> {
+        self.remote_said.as_deref()
+    }
+
+    /// Acknowledge that report, so it stops being shown.
+    pub fn clear_remote_said(&mut self) {
+        self.remote_said = None;
     }
 
     /// The recent commits, newest first.
@@ -592,9 +778,18 @@ impl Tracker {
         self.error.as_deref()
     }
 
+    /// The action that produced the current error, if there is one.
+    ///
+    /// Taken rather than read: a caller that turns a refusal into an offer must
+    /// do so once, and leaving it set would raise the same dialog every frame.
+    pub fn take_failed(&mut self) -> Option<Action> {
+        self.failed.take()
+    }
+
     /// Acknowledge the error, so it stops being shown.
     pub fn clear_error(&mut self) {
         self.error = None;
+        self.failed = None;
     }
 
     /// What is known about HEAD's version of `path`.
@@ -744,21 +939,65 @@ fn worker(inbox: &Receiver<Request>, outbox: &Sender<Reply>, wake: &Waker) {
                     .and_then(|relative| repo.blame(&relative));
                 Reply::Blame { path, lines }
             }
+            Request::Branches => {
+                let Some(repo) = repo.as_ref() else { continue };
+                Reply::Branches {
+                    branches: repo.branches(),
+                    // Not a `Result`: a repository with no remotes is the
+                    // ordinary case, and so is one where the question failed —
+                    // either way there is nowhere to push.
+                    remotes: repo.remotes().unwrap_or_default(),
+                }
+            }
             Request::Act(action) => {
                 let Some(repo) = repo.as_ref() else { continue };
+                // Remote operations have something to report even when they
+                // succeed — "Everything up-to-date", the ref update lines —
+                // and that report is the only confirmation anything happened.
+                let mut said = None;
                 let outcome = match &action {
                     Action::Stage(paths) => repo.stage(paths),
                     Action::Unstage(paths) => repo.unstage(paths),
                     Action::Discard(paths) => repo.discard(paths),
                     Action::Commit { message, amend } => repo.commit(message, *amend).map(drop),
+                    Action::Checkout(name) => repo.checkout(name),
+                    Action::CreateBranch { name, switch } => repo.create_branch(name, *switch),
+                    Action::DeleteBranch { name, force } => repo.delete_branch(name, *force),
+                    Action::Fetch(remote) => repo.fetch(remote),
+                    Action::Pull => repo.pull().map(|text| said = Some(text)),
+                    Action::Push {
+                        remote,
+                        branch,
+                        set_upstream,
+                    } => repo
+                        .push(remote, branch, *set_upstream)
+                        .map(|text| said = Some(text)),
                 };
+
+                if let Some(text) = said
+                    && outbox.send(Reply::Remote(text)).is_err()
+                {
+                    return;
+                }
+                // A branch action changes which branches exist or where they
+                // point, and the panel is showing the answer from before it.
+                if action.touches_branches()
+                    && outbox
+                        .send(Reply::Branches {
+                            branches: repo.branches(),
+                            remotes: repo.remotes().unwrap_or_default(),
+                        })
+                        .is_err()
+                {
+                    return;
+                }
                 match outcome {
                     Err(message) => {
                         // Say what was being attempted. Git's own message is
                         // about paths and refs and says nothing about which
                         // button was pressed.
                         let failure = format!("Could not {}: {message}", action.verb());
-                        if outbox.send(Reply::Failed(failure)).is_err() {
+                        if outbox.send(Reply::Failed(action.clone(), failure)).is_err() {
                             return;
                         }
                         wake();
@@ -1062,7 +1301,11 @@ mod tests {
 
     impl Drop for Sandbox {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            // Through the read-only-aware remover: git marks every object file
+            // read-only, so `remove_dir_all` fails on the first one and leaves
+            // a repository behind for every test, every run.
+            crate::repo::tests::remove_tree(&self.root);
+            crate::repo::tests::remove_tree(&self.root.with_extension("origin.git"));
         }
     }
 
@@ -1073,7 +1316,7 @@ mod tests {
                 std::process::id(),
                 std::thread::current().id()
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            crate::repo::tests::remove_tree(&root);
             std::fs::create_dir_all(&root).expect("temporary directory");
 
             let git = |args: &[&str]| {
@@ -1107,6 +1350,32 @@ mod tests {
 
         fn read(&self, name: &str) -> String {
             std::fs::read_to_string(self.root.join(name)).expect("read")
+        }
+
+        /// Give this repository an `origin` it can push to.
+        ///
+        /// A bare repository next door — which is exactly the backup remote
+        /// PLAN.md §12 describes, so this exercises the real arrangement and
+        /// touches no network.
+        fn with_origin(&self) -> PathBuf {
+            let origin = self.root.with_extension("origin.git");
+            crate::repo::tests::remove_tree(&origin);
+            std::fs::create_dir_all(&origin).expect("origin directory");
+
+            let git = |cwd: &Path, args: &[&str]| {
+                let mut command = editor_proc::spawn::quiet("git");
+                command.current_dir(cwd).args(args);
+                let output = command.output().expect("running git");
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&origin, &["init", "--bare", "--quiet"]);
+            let url = origin.to_string_lossy().replace('\\', "/");
+            git(&self.root, &["remote", "add", "origin", &url]);
+            origin
         }
 
         /// A tracker pointed here, with its first status already in.
@@ -1441,6 +1710,205 @@ mod tests {
         tracker.refresh_log(20);
         tracker.poll();
         assert_eq!(tracker.log(), []);
+    }
+
+    // ---- branches and remotes -------------------------------------------
+
+    #[test]
+    fn the_branches_come_back_with_the_one_we_are_on_marked() {
+        let sandbox = Sandbox::new("branches");
+        let mut tracker = sandbox.tracker();
+        assert!(!tracker.branches_known());
+
+        tracker.refresh_branches();
+        assert!(wait_for(&mut tracker, |t| t.branches_known()));
+        assert_eq!(tracker.branches().len(), 1);
+        assert_eq!(
+            tracker.current_branch().map(|b| b.name.as_str()),
+            Some("trial")
+        );
+        assert_eq!(tracker.remotes(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn creating_a_branch_switches_to_it_and_the_listing_follows() {
+        let sandbox = Sandbox::new("create");
+        let mut tracker = sandbox.tracker();
+        tracker.refresh_branches();
+        assert!(wait_for(&mut tracker, |t| t.branches_known()));
+
+        tracker.act(Action::CreateBranch {
+            name: "feature/thing".to_owned(),
+            switch: true,
+        });
+        // The listing is re-read by the worker, not asked for here.
+        assert!(
+            wait_for(&mut tracker, |t| t
+                .current_branch()
+                .is_some_and(|b| b.name == "feature/thing")),
+            "the new branch should become the current one"
+        );
+        assert_eq!(tracker.branches().len(), 2);
+        assert_eq!(tracker.error(), None);
+    }
+
+    #[test]
+    fn switching_back_and_forth_is_reflected() {
+        let sandbox = Sandbox::new("checkout");
+        let mut tracker = sandbox.tracker();
+        tracker.act(Action::CreateBranch {
+            name: "other".to_owned(),
+            switch: false,
+        });
+        assert!(wait_for(&mut tracker, |t| t.branches().len() == 2));
+
+        tracker.act(Action::Checkout("other".to_owned()));
+        assert!(wait_for(&mut tracker, |t| t
+            .current_branch()
+            .is_some_and(|b| b.name == "other")));
+
+        tracker.act(Action::Checkout("trial".to_owned()));
+        assert!(wait_for(&mut tracker, |t| t
+            .current_branch()
+            .is_some_and(|b| b.name == "trial")));
+    }
+
+    #[test]
+    fn a_branch_name_git_would_refuse_is_reported_rather_than_attempted() {
+        let sandbox = Sandbox::new("bad-name");
+        let mut tracker = sandbox.tracker();
+        tracker.act(Action::CreateBranch {
+            name: "has space".to_owned(),
+            switch: true,
+        });
+        assert!(wait_for(&mut tracker, |t| t.error().is_some()));
+        let message = tracker.error().expect("a message").to_owned();
+        assert!(
+            message.contains("spaces"),
+            "the complaint should name the problem, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_a_branch_removes_it_from_the_listing() {
+        let sandbox = Sandbox::new("delete");
+        let mut tracker = sandbox.tracker();
+        tracker.act(Action::CreateBranch {
+            name: "doomed".to_owned(),
+            switch: false,
+        });
+        assert!(wait_for(&mut tracker, |t| t.branches().len() == 2));
+
+        tracker.act(Action::DeleteBranch {
+            name: "doomed".to_owned(),
+            force: false,
+        });
+        assert!(wait_for(&mut tracker, |t| t.branches().len() == 1));
+        assert_eq!(tracker.error(), None);
+    }
+
+    /// A remote operation blocks the one worker, so the interface has to be
+    /// able to say what it is waiting for rather than appearing to have stopped.
+    #[test]
+    fn a_remote_operation_reports_that_it_is_running() {
+        let sandbox = Sandbox::new("busy");
+        let mut tracker = sandbox.tracker();
+        assert_eq!(tracker.busy(), None);
+
+        tracker.act(Action::Fetch("origin".to_owned()));
+        assert_eq!(
+            tracker.busy(),
+            Some("Fetching\u{2026}"),
+            "the moment it is asked for, not when it starts"
+        );
+
+        // There is no `origin`, so it fails — and the status that follows any
+        // action is what clears the flag either way.
+        assert!(wait_for(&mut tracker, |t| t.busy().is_none()));
+        assert!(tracker.error().is_some(), "and it says what went wrong");
+    }
+
+    #[test]
+    fn pushing_to_a_bare_repository_next_door_works_and_reports_what_it_did() {
+        let sandbox = Sandbox::new("push");
+        let _origin = sandbox.with_origin();
+        let mut tracker = sandbox.tracker();
+
+        tracker.refresh_branches();
+        assert!(wait_for(&mut tracker, |t| t.branches_known()));
+        assert_eq!(tracker.remotes(), ["origin"]);
+
+        tracker.act(Action::Push {
+            remote: "origin".to_owned(),
+            branch: "trial".to_owned(),
+            set_upstream: true,
+        });
+        assert!(
+            wait_for(&mut tracker, |t| t.busy().is_none() && t.branches_known()),
+            "the push should finish"
+        );
+        assert_eq!(tracker.error(), None, "and succeed");
+
+        // The upstream is now known, and the two are level.
+        assert!(wait_for(&mut tracker, |t| t
+            .current_branch()
+            .is_some_and(|b| b.upstream.as_deref() == Some("origin/trial"))));
+        let branch = tracker.current_branch().expect("branch");
+        assert_eq!((branch.ahead, branch.behind), (0, 0));
+    }
+
+    #[test]
+    fn a_commit_after_pushing_shows_as_ahead() {
+        let sandbox = Sandbox::new("ahead");
+        let _origin = sandbox.with_origin();
+        let mut tracker = sandbox.tracker();
+        tracker.act(Action::Push {
+            remote: "origin".to_owned(),
+            branch: "trial".to_owned(),
+            set_upstream: true,
+        });
+        assert!(wait_for(&mut tracker, |t| t
+            .current_branch()
+            .is_some_and(|b| b.upstream.is_some())));
+
+        sandbox.write("first.txt", "more\n");
+        tracker.act(Action::Stage(vec!["first.txt".to_owned()]));
+        assert!(wait_for(&mut tracker, |t| t.status().staged().count() == 1));
+        tracker.act(Action::Commit {
+            message: "one more".to_owned(),
+            amend: false,
+        });
+
+        assert!(
+            wait_for(&mut tracker, |t| t
+                .current_branch()
+                .is_some_and(|b| b.ahead == 1)),
+            "committing should leave the branch one ahead of its upstream"
+        );
+    }
+
+    #[test]
+    fn a_tracker_with_no_repository_lists_no_branches() {
+        let mut tracker = tracker();
+        tracker.refresh_branches();
+        tracker.poll();
+        assert!(!tracker.branches_known());
+        assert_eq!(tracker.branches(), []);
+        assert_eq!(tracker.current_branch(), None);
+    }
+
+    #[test]
+    fn changing_project_forgets_the_branches() {
+        let sandbox = Sandbox::new("forget-branches");
+        let mut tracker = sandbox.tracker();
+        tracker.refresh_branches();
+        assert!(wait_for(&mut tracker, |t| t.branches_known()));
+
+        tracker.set_project(None);
+        assert!(!tracker.branches_known());
+        assert_eq!(tracker.branches(), []);
+        assert_eq!(tracker.remotes(), Vec::<String>::new());
+        assert_eq!(tracker.busy(), None);
     }
 
     /// Opening one crate of a workspace is the normal case, and it makes the

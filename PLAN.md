@@ -942,6 +942,22 @@ cannot be reached.
   repeating the headers a thousand times for a thousand lines.
   `%x1f`/`%x1e` separate the log's fields, because every separator a human would
   choose is one a commit subject can contain.
+- **Branches and remotes**, which completes it. The panel names the branch and
+  how far it is ahead of or behind its upstream; **Branches…** switches, creates
+  and deletes. Branch names are validated before git sees them, so a mistyped
+  one is refused with a sentence as it is typed. Deleting tries the safe way
+  first and turns git's refusal into the offer to force — which is the shape
+  worth copying elsewhere: attempt the safe thing, and only raise the dangerous
+  one when the safe one is impossible.
+
+  The three remote operations are deliberately conservative. `pull` is
+  `--ff-only`, because a pull that merges can leave a conflicted working tree
+  behind a button click; `push` is never forced, because no dialog makes a
+  button for that a good idea. `GIT_TERMINAL_PROMPT=0` means anything wanting a
+  password fails rather than hanging, and the terminal is there for those. They
+  run on the same single worker as everything else — two git processes on one
+  repository contend for the index lock — so the panel says which one is
+  running rather than appearing to have stopped.
 
 ### Sequencing changes made along the way
 
@@ -958,16 +974,16 @@ that were.
 
 **Since built**, and struck from this list: the integrated terminal, rename and
 refactor, crash-recovery autosave, the accessibility pass, package and
-requirements management, go to symbol, code folding, and read-only version
-control (gutter change markers, the branch in the status bar, and a diff of the
-buffer against HEAD). Two more that
+requirements management, go to symbol, code folding, and **version control** —
+all of it: gutter change markers, staging, committing, history, blame, branches
+and remotes. That was "the largest omission by a distance" when this list was
+written, and it is now the largest thing on the other side of it. Two more that
 appeared here in an earlier revision turned out to exist already —
 most-recently-used Ctrl+Tab cycling and tab overflow — which is its own lesson
 about reviewing from memory rather than from the code.
 
 | | Why it matters | Rough size |
 |---|---|---|
-| **Version control — branches** | Reading, staging, committing, history and blame have all landed (see below). What remains is branch switching and creation, and the remote operations that go with them — fetch, pull, push. Those are the ones that touch a network and a credential helper, which is a different kind of problem from everything so far and is why they were left until last. | 1–1.5 wk |
 | **Test runner** | Discover tests, run one from the gutter, a pass/fail tree, jump to the failure, re-run failures. "Run Tests" currently just runs the open file. A headline PyCharm feature for Python and the natural partner to the debugger. | 2–3 wk |
 | **Hover** | Type and docstring under the pointer. The language-server plumbing is all there and no `textDocument/hover` is ever sent. The cheapest remaining LSP win. | 2–3 d |
 | **Format on save** | `textDocument/formatting`, or Ruff directly. Expected of any Python IDE. | 2–3 d |
@@ -985,10 +1001,13 @@ real terminal for this reason: a full-screen program needs cursor addressing,
 the alternate screen and raw keys, and a scrollback that understood colour gave
 it none of those while claiming through `TERM` that it did.
 
-What is still missing is not a chat panel — that would duplicate a working CLI
-and tie the editor to one vendor's interface. It is being able to see what an
+What was still missing was not a chat panel — that would duplicate a working CLI
+and tie the editor to one vendor's interface. It was being able to see what an
 agent changed and undo part of it, which is version control, plus the
-project-wide change signal above. Both are on this list on their own merits.
+project-wide change signal below. Version control has since landed in full: the
+gutter marks what an agent touched, the Source Control panel stages or discards
+it a file at a time, and the diff view shows exactly what it did. The change
+signal is still open, and is now the only part of this missing.
 
 Deliberately out of scope, recorded so the decision is not re-litigated: remote
 development over SSH or containers, Jupyter notebooks, database tools, and

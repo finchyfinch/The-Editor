@@ -14,6 +14,7 @@
 //! thread, the cache, and the rule for when the cache stops being true.
 
 pub mod blame;
+pub mod branch;
 pub mod diff;
 pub mod log;
 pub mod repo;

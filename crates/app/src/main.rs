@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod branches_view;
 mod cli;
 mod commands;
 mod completion;

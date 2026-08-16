@@ -281,6 +281,147 @@ impl Repo {
         Ok(crate::blame::parse(&output))
     }
 
+    /// Every local branch, and every remote-tracking one.
+    ///
+    /// # Errors
+    /// Whatever git said.
+    pub fn branches(&self) -> Result<Vec<crate::branch::Branch>, String> {
+        let format = format!("--format={}", crate::branch::FORMAT);
+        // Sorted by how recently each was committed to, which puts the branch
+        // you were on yesterday near the top and the one from last spring near
+        // the bottom. Alphabetical order is no help at all in a repository with
+        // forty branches called `fix-*`.
+        let local = self.run(&[
+            "for-each-ref",
+            "--sort=-committerdate",
+            &format,
+            "refs/heads",
+        ])?;
+        let remote = self.run(&[
+            "for-each-ref",
+            "--sort=-committerdate",
+            &format,
+            "refs/remotes",
+        ])?;
+
+        let mut branches = crate::branch::parse(&local, false);
+        branches.extend(crate::branch::parse(&remote, true));
+        Ok(branches)
+    }
+
+    /// The configured remotes, in the order git lists them.
+    ///
+    /// # Errors
+    /// Whatever git said.
+    pub fn remotes(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .run(&["remote"])?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Move onto `name`.
+    ///
+    /// Git carries uncommitted changes across where it can and refuses where it
+    /// cannot, and its refusal names the files — which is more use than anything
+    /// this could say instead, so it is passed through.
+    ///
+    /// # Errors
+    /// Whatever git said.
+    pub fn checkout(&self, name: &str) -> Result<(), String> {
+        if let Some(complaint) = crate::branch::is_valid_name(name) {
+            return Err(complaint.to_owned());
+        }
+        // `--` so a branch and a file of the same name cannot be confused.
+        self.run(&["checkout", "--quiet", name, "--"]).map(drop)
+    }
+
+    /// Start a branch at HEAD, and move onto it.
+    ///
+    /// # Errors
+    /// If the name is one git would refuse, or whatever git said.
+    pub fn create_branch(&self, name: &str, switch_to_it: bool) -> Result<(), String> {
+        if let Some(complaint) = crate::branch::is_valid_name(name) {
+            return Err(complaint.to_owned());
+        }
+        if switch_to_it {
+            self.run(&["checkout", "--quiet", "-b", name]).map(drop)
+        } else {
+            self.run(&["branch", name]).map(drop)
+        }
+    }
+
+    /// Delete `name`.
+    ///
+    /// Without `force`, git refuses to delete a branch whose commits are not
+    /// merged anywhere — which is the guard worth keeping. **With** `force` the
+    /// commits become unreachable, and although the reflog can still reach them
+    /// for a while, nothing in the interface can. Callers must confirm first.
+    ///
+    /// # Errors
+    /// Whatever git said, including its refusal to delete unmerged work.
+    pub fn delete_branch(&self, name: &str, force: bool) -> Result<(), String> {
+        if let Some(complaint) = crate::branch::is_valid_name(name) {
+            return Err(complaint.to_owned());
+        }
+        let flag = if force { "-D" } else { "-d" };
+        self.run(&["branch", flag, name]).map(drop)
+    }
+
+    /// Fetch from `remote`, and forget remote-tracking branches it has deleted.
+    ///
+    /// Touches the network and changes nothing in the working tree — the
+    /// safest of the three remote operations, and the one worth reaching for
+    /// when you want to know where you stand.
+    ///
+    /// # Errors
+    /// Whatever git said.
+    pub fn fetch(&self, remote: &str) -> Result<(), String> {
+        self.run(&["fetch", "--prune", "--quiet", remote]).map(drop)
+    }
+
+    /// Bring the current branch up to date with its upstream, fast-forward only.
+    ///
+    /// `--ff-only` deliberately. A pull that merges can stop half-way through
+    /// with a conflicted working tree and a message on a terminal nobody is
+    /// looking at, which is a bad thing for a button to be able to do. When the
+    /// histories have diverged this refuses and says so, and the merge or
+    /// rebase is a decision to make deliberately.
+    ///
+    /// # Errors
+    /// Whatever git said, including its refusal to do anything but fast-forward.
+    pub fn pull(&self) -> Result<String, String> {
+        self.run(&["pull", "--ff-only"])
+    }
+
+    /// Send the current branch to `remote`.
+    ///
+    /// Never forced. A forced push can destroy commits on the remote that
+    /// somebody else made, and there is no confirmation dialog that makes a
+    /// button for that a good idea — the terminal is right there for the rare
+    /// case that genuinely needs it.
+    ///
+    /// `set_upstream` is for a branch that has never been pushed, which
+    /// otherwise fails with git's advice about `--set-upstream`.
+    ///
+    /// # Errors
+    /// Whatever git said.
+    pub fn push(&self, remote: &str, branch: &str, set_upstream: bool) -> Result<String, String> {
+        if let Some(complaint) = crate::branch::is_valid_name(branch) {
+            return Err(complaint.to_owned());
+        }
+        let mut args = vec!["push"];
+        if set_upstream {
+            args.push("--set-upstream");
+        }
+        args.push(remote);
+        args.push(branch);
+        self.run(&args)
+    }
+
     /// Run git with a fixed set of arguments and then a list of paths.
     ///
     /// Separate from [`run`] because the paths are owned strings from the
@@ -346,12 +487,55 @@ pub fn is_available() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// This project is a git repository, which makes it the test fixture.
     fn here() -> Option<Repo> {
         Repo::discover(Path::new(env!("CARGO_MANIFEST_DIR")))
+    }
+
+    /// Delete a directory tree, including the parts git made read-only.
+    ///
+    /// `remove_dir_all` alone is not enough on Windows: git marks every object
+    /// file read-only, and the deletion fails on the first one. Ignoring that
+    /// failure — which is what the obvious `let _ =` does — leaves a repository
+    /// behind in the temporary directory for every test, every run.
+    ///
+    /// Retried, because a tracker's worker thread can still be finishing a git
+    /// process when its sandbox is dropped, and Windows will not delete a
+    /// directory that a running process has as its working directory. Waiting a
+    /// moment is the whole fix; the alternative — joining the worker on drop —
+    /// would make the *application* block on exit for a slow fetch.
+    pub(crate) fn remove_tree(path: &Path) {
+        for attempt in 0..20 {
+            remove_tree_once(path);
+            if !path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+        }
+    }
+
+    fn remove_tree_once(path: &Path) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() && !child.is_symlink() {
+                remove_tree_once(&child);
+            } else {
+                if let Ok(metadata) = child.metadata() {
+                    let mut permissions = metadata.permissions();
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    permissions.set_readonly(false);
+                    let _ = std::fs::set_permissions(&child, permissions);
+                }
+                let _ = std::fs::remove_file(&child);
+            }
+        }
+        let _ = std::fs::remove_dir(path);
     }
 
     /// A repository of its own, in a temporary directory, deleted afterwards.
@@ -365,7 +549,10 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.repo.root);
+            remove_tree(&self.repo.root);
+            // The bare remote and the second clone, when a test made them.
+            remove_tree(&self.repo.root.with_extension("origin.git"));
+            remove_tree(&self.repo.root.with_extension("clone"));
         }
     }
 
@@ -377,7 +564,7 @@ mod tests {
                 std::process::id(),
                 std::thread::current().id()
             ));
-            let _ = std::fs::remove_dir_all(&root);
+            remove_tree(&root);
             std::fs::create_dir_all(&root).expect("temporary directory");
 
             let git = |args: &[&str]| {
@@ -880,6 +1067,337 @@ mod tests {
         let fixture = Fixture::new("blame-untracked");
         fixture.write("second.txt", "never added\n");
         assert!(fixture.repo.blame("second.txt").is_err());
+    }
+
+    // ---- branches and remotes -------------------------------------------
+
+    impl Fixture {
+        /// Give this repository a `origin` it can push to and pull from.
+        ///
+        /// A bare repository next door, which is exactly what the backup remote
+        /// in PLAN.md §12 is — so these tests exercise the real arrangement
+        /// rather than a mock, and no network is involved.
+        fn with_origin(&self) -> PathBuf {
+            let origin = self.repo.root.with_extension("origin.git");
+            std::fs::create_dir_all(&origin).expect("origin directory");
+            run(&origin, &["init", "--bare", "--quiet"]).expect("bare init");
+
+            let url = origin.to_string_lossy().replace('\\', "/");
+            run(&self.repo.root, &["remote", "add", "origin", &url]).expect("remote add");
+            origin
+        }
+
+        fn head_of(&self, branch: &str) -> Option<String> {
+            self.repo
+                .run(&["rev-parse", branch])
+                .ok()
+                .map(|id| id.trim().to_owned())
+        }
+    }
+
+    #[test]
+    fn the_only_branch_is_the_one_we_are_on() {
+        let fixture = Fixture::new("branches");
+        let branches = fixture.repo.branches().expect("branches");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "trial");
+        assert!(branches[0].is_head);
+        assert!(!branches[0].is_remote());
+        assert_eq!(branches[0].upstream, None);
+        assert!(!branches[0].short.is_empty());
+    }
+
+    #[test]
+    fn a_new_branch_can_be_started_and_switched_to() {
+        let fixture = Fixture::new("create-branch");
+        fixture
+            .repo
+            .create_branch("feature/thing", true)
+            .expect("create");
+
+        assert_eq!(fixture.repo.branch().as_deref(), Some("feature/thing"));
+        let branches = fixture.repo.branches().expect("branches");
+        assert_eq!(branches.len(), 2);
+        assert!(
+            branches
+                .iter()
+                .any(|b| b.name == "feature/thing" && b.is_head)
+        );
+    }
+
+    #[test]
+    fn a_branch_can_be_made_without_moving_onto_it() {
+        let fixture = Fixture::new("create-stay");
+        fixture.repo.create_branch("later", false).expect("create");
+        assert_eq!(
+            fixture.repo.branch().as_deref(),
+            Some("trial"),
+            "we should still be where we were"
+        );
+        assert!(
+            fixture
+                .repo
+                .branches()
+                .expect("branches")
+                .iter()
+                .any(|b| b.name == "later")
+        );
+    }
+
+    #[test]
+    fn switching_branches_moves_head() {
+        let fixture = Fixture::new("checkout");
+        fixture.repo.create_branch("other", false).expect("create");
+        fixture.repo.checkout("other").expect("checkout");
+        assert_eq!(fixture.repo.branch().as_deref(), Some("other"));
+        fixture.repo.checkout("trial").expect("checkout back");
+        assert_eq!(fixture.repo.branch().as_deref(), Some("trial"));
+    }
+
+    /// The names are checked before git sees them, so a mistyped one is refused
+    /// with a sentence rather than with `fatal: not a valid branch name`.
+    #[test]
+    fn an_impossible_branch_name_is_refused_before_git_is_asked() {
+        let fixture = Fixture::new("bad-name");
+        let complaint = fixture
+            .repo
+            .create_branch("has space", true)
+            .expect_err("should be refused");
+        assert!(complaint.contains("spaces"), "got {complaint:?}");
+        assert!(
+            fixture.repo.checkout("-x").is_err(),
+            "a name that would be read as an option must not reach git"
+        );
+    }
+
+    #[test]
+    fn deleting_a_merged_branch_is_allowed_and_an_unmerged_one_is_not() {
+        let fixture = Fixture::new("delete");
+        fixture.repo.create_branch("merged", false).expect("create");
+        fixture
+            .repo
+            .delete_branch("merged", false)
+            .expect("a branch with nothing unique on it");
+
+        // A branch with a commit of its own is not merged anywhere.
+        fixture
+            .repo
+            .create_branch("unmerged", true)
+            .expect("create");
+        fixture.write("first.txt", "on the branch\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+        fixture.repo.commit("branch work", false).expect("commit");
+        fixture.repo.checkout("trial").expect("checkout");
+
+        assert!(
+            fixture.repo.delete_branch("unmerged", false).is_err(),
+            "git should refuse to drop unmerged work without being forced"
+        );
+        fixture
+            .repo
+            .delete_branch("unmerged", true)
+            .expect("forcing should work");
+        assert!(
+            !fixture
+                .repo
+                .branches()
+                .expect("branches")
+                .iter()
+                .any(|b| b.name == "unmerged")
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_remotes_says_so() {
+        let fixture = Fixture::new("no-remotes");
+        assert_eq!(
+            fixture.repo.remotes().expect("remotes"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pushing_sends_the_branch_and_sets_its_upstream() {
+        let fixture = Fixture::new("push");
+        let origin = fixture.with_origin();
+        assert_eq!(fixture.repo.remotes().expect("remotes"), ["origin"]);
+
+        fixture
+            .repo
+            .push("origin", "trial", true)
+            .expect("first push");
+
+        // The bare repository now has the commit.
+        let there = run(&origin, &["rev-parse", "trial"]).expect("rev-parse");
+        assert_eq!(there.trim(), fixture.head_of("HEAD").expect("head"));
+
+        // And the branch knows what it tracks.
+        let branches = fixture.repo.branches().expect("branches");
+        let trial = branches
+            .iter()
+            .find(|b| b.name == "trial")
+            .expect("the branch");
+        assert_eq!(trial.upstream.as_deref(), Some("origin/trial"));
+        assert_eq!((trial.ahead, trial.behind), (0, 0));
+    }
+
+    #[test]
+    fn a_commit_made_after_pushing_shows_as_ahead() {
+        let fixture = Fixture::new("ahead");
+        let _origin = fixture.with_origin();
+        fixture.repo.push("origin", "trial", true).expect("push");
+
+        fixture.write("first.txt", "more\n");
+        fixture
+            .repo
+            .stage(&["first.txt".to_owned()])
+            .expect("stage");
+        fixture.repo.commit("one more", false).expect("commit");
+
+        let branches = fixture.repo.branches().expect("branches");
+        let trial = branches.iter().find(|b| b.name == "trial").expect("branch");
+        assert_eq!((trial.ahead, trial.behind), (1, 0));
+        assert_eq!(trial.track_summary("^", "v"), "^1");
+    }
+
+    /// Fetch and pull, exercised the way the backup remote in PLAN.md §12
+    /// actually works: a second clone pushes, and this one catches up.
+    #[test]
+    fn fetching_shows_what_arrived_and_pulling_takes_it() {
+        let fixture = Fixture::new("pull");
+        let origin = fixture.with_origin();
+        fixture.repo.push("origin", "trial", true).expect("push");
+
+        // Somebody else's clone, which commits and pushes.
+        let elsewhere = fixture.repo.root.with_extension("clone");
+        let url = origin.to_string_lossy().replace('\\', "/");
+        // `--branch trial` because a bare repository's HEAD still names
+        // whatever branch `git init` chose, and nothing was ever pushed to
+        // that one — cloning without this lands on an unborn branch, and the
+        // clone's push then fails with "src refspec trial does not match any".
+        run(
+            &std::env::temp_dir(),
+            &[
+                "clone",
+                "--quiet",
+                "--branch",
+                "trial",
+                &url,
+                &elsewhere.to_string_lossy(),
+            ],
+        )
+        .expect("clone");
+        run(
+            &elsewhere,
+            &["config", "user.email", "other@example.invalid"],
+        )
+        .expect("config");
+        run(&elsewhere, &["config", "user.name", "Other"]).expect("config");
+        run(&elsewhere, &["config", "commit.gpgsign", "false"]).expect("config");
+        std::fs::write(elsewhere.join("theirs.txt"), "from elsewhere\n").expect("write");
+        run(&elsewhere, &["add", "."]).expect("add");
+        run(&elsewhere, &["commit", "--quiet", "-m", "their work"]).expect("commit");
+        run(&elsewhere, &["push", "--quiet", "origin", "trial"]).expect("the other clone's push");
+
+        // Before fetching we know nothing about it.
+        let before = fixture.repo.branches().expect("branches");
+        let trial = before.iter().find(|b| b.name == "trial").expect("branch");
+        assert_eq!((trial.ahead, trial.behind), (0, 0));
+
+        fixture.repo.fetch("origin").expect("fetch");
+        let after = fixture.repo.branches().expect("branches");
+        let trial = after.iter().find(|b| b.name == "trial").expect("branch");
+        assert_eq!(
+            (trial.ahead, trial.behind),
+            (0, 1),
+            "fetching should reveal the commit without taking it"
+        );
+        assert!(
+            !fixture.repo.root.join("theirs.txt").exists(),
+            "and must not touch the working tree"
+        );
+
+        fixture.repo.pull().expect("pull");
+        assert!(
+            fixture.repo.root.join("theirs.txt").exists(),
+            "pulling should bring the file across"
+        );
+        let level = fixture.repo.branches().expect("branches");
+        let trial = level.iter().find(|b| b.name == "trial").expect("branch");
+        assert_eq!((trial.ahead, trial.behind), (0, 0));
+    }
+
+    /// The reason `--ff-only`: a pull that merges can leave a conflicted
+    /// working tree behind a button click, which is not a thing a button should
+    /// be able to do.
+    #[test]
+    fn pulling_refuses_to_merge_diverged_histories() {
+        let fixture = Fixture::new("diverged");
+        let origin = fixture.with_origin();
+        fixture.repo.push("origin", "trial", true).expect("push");
+
+        let elsewhere = fixture.repo.root.with_extension("clone");
+        let url = origin.to_string_lossy().replace('\\', "/");
+        // `--branch trial` because a bare repository's HEAD still names
+        // whatever branch `git init` chose, and nothing was ever pushed to
+        // that one — cloning without this lands on an unborn branch, and the
+        // clone's push then fails with "src refspec trial does not match any".
+        run(
+            &std::env::temp_dir(),
+            &[
+                "clone",
+                "--quiet",
+                "--branch",
+                "trial",
+                &url,
+                &elsewhere.to_string_lossy(),
+            ],
+        )
+        .expect("clone");
+        run(
+            &elsewhere,
+            &["config", "user.email", "other@example.invalid"],
+        )
+        .expect("config");
+        run(&elsewhere, &["config", "user.name", "Other"]).expect("config");
+        run(&elsewhere, &["config", "commit.gpgsign", "false"]).expect("config");
+        std::fs::write(elsewhere.join("theirs.txt"), "theirs\n").expect("write");
+        run(&elsewhere, &["add", "."]).expect("add");
+        run(&elsewhere, &["commit", "--quiet", "-m", "theirs"]).expect("commit");
+        run(&elsewhere, &["push", "--quiet", "origin", "trial"]).expect("the other clone's push");
+
+        // And a commit of our own, so the two have diverged.
+        fixture.write("ours.txt", "ours\n");
+        fixture.repo.stage(&["ours.txt".to_owned()]).expect("stage");
+        fixture.repo.commit("ours", false).expect("commit");
+
+        let outcome = fixture.repo.pull();
+        assert!(
+            outcome.is_err(),
+            "a diverged pull should be refused, not merged"
+        );
+        assert!(
+            fixture.repo.status().expect("status").is_clean(),
+            "and must leave the working tree exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_remote_branch_is_listed_as_one() {
+        let fixture = Fixture::new("remote-listing");
+        let _origin = fixture.with_origin();
+        fixture.repo.push("origin", "trial", true).expect("push");
+
+        let branches = fixture.repo.branches().expect("branches");
+        let remote = branches
+            .iter()
+            .find(|b| b.name == "origin/trial")
+            .expect("the remote-tracking branch");
+        assert!(remote.is_remote());
+        assert!(!remote.is_head);
     }
 
     /// The two columns are independent, and the panel shows a file in both.

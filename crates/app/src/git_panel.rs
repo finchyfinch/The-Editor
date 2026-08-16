@@ -41,6 +41,18 @@ pub(crate) enum Action {
     Commit { message: String, amend: bool },
     /// Show the history.
     ShowHistory,
+    /// Show the branches.
+    ShowBranches,
+    /// Ask the remote what it has, without taking any of it.
+    Fetch(String),
+    /// Bring the current branch up to date, fast-forward only.
+    Pull,
+    /// Send the current branch to the remote.
+    Push {
+        remote: String,
+        branch: String,
+        set_upstream: bool,
+    },
 }
 
 /// The Source Control tab.
@@ -97,6 +109,10 @@ impl GitPanel {
                 status,
                 error,
                 last_message,
+                branch,
+                remotes,
+                busy,
+                remote_said,
             } => {
                 if let Some(error) = error {
                     // Git's own words, in full. A tidy summary of a git error
@@ -106,13 +122,124 @@ impl GitPanel {
                     });
                     ui.separator();
                 }
-                action = self.commit_box(ui, status, last_message);
+                action = Self::branch_bar(ui, branch, remotes, busy, remote_said);
+                ui.separator();
+                let below = self.commit_box(ui, status, last_message);
+                if action == Action::None {
+                    action = below;
+                }
                 ui.separator();
                 let below = self.body(ui, status, root);
                 if action == Action::None {
                     action = below;
                 }
             }
+        }
+
+        action
+    }
+
+    /// Which branch, how it stands against its upstream, and the three remote
+    /// operations.
+    fn branch_bar(
+        ui: &mut egui::Ui,
+        branch: Option<&editor_vcs::branch::Branch>,
+        remotes: &[String],
+        busy: Option<&str>,
+        remote_said: Option<&str>,
+    ) -> Action {
+        let mut action = Action::None;
+
+        ui.horizontal(|ui| {
+            match branch {
+                Some(branch) => {
+                    ui.strong(&branch.name);
+                    let track = branch.track_summary(
+                        editor_widgets::glyphs::AHEAD,
+                        editor_widgets::glyphs::BEHIND,
+                    );
+                    if !track.is_empty() {
+                        ui.weak(&track);
+                    }
+                    match &branch.upstream {
+                        Some(upstream) => {
+                            ui.weak(format!("tracks {upstream}"));
+                        }
+                        None => {
+                            ui.weak("no upstream");
+                        }
+                    }
+                }
+                None => {
+                    ui.weak("Reading the branch\u{2026}");
+                }
+            }
+
+            if ui.button("Branches\u{2026}").clicked() {
+                action = Action::ShowBranches;
+            }
+            if ui.button("History\u{2026}").clicked() {
+                action = Action::ShowHistory;
+            }
+
+            // The remote operations. Disabled outright when there is nowhere to
+            // send anything, which is the honest state of a repository with no
+            // remote rather than three buttons that all fail the same way.
+            //
+            // Everything is disabled while one is running: the worker does one
+            // thing at a time, and queueing a second push behind a first is a
+            // way to be surprised.
+            let remote = remotes.first();
+            let can = remote.is_some() && busy.is_none();
+
+            ui.separator();
+            if ui
+                .add_enabled(can, egui::Button::new("Fetch"))
+                .on_hover_text("Ask the remote what it has. Changes nothing here.")
+                .on_disabled_hover_text(disabled_reason(remote.is_some(), busy))
+                .clicked()
+                && let Some(remote) = remote
+            {
+                action = Action::Fetch(remote.clone());
+            }
+            if ui
+                .add_enabled(can, egui::Button::new("Pull"))
+                .on_hover_text(
+                    "Bring this branch up to date. Fast-forward only \u{2014} if the histories \
+                     have diverged this refuses rather than merging.",
+                )
+                .on_disabled_hover_text(disabled_reason(remote.is_some(), busy))
+                .clicked()
+            {
+                action = Action::Pull;
+            }
+            if ui
+                .add_enabled(can && branch.is_some(), egui::Button::new("Push"))
+                .on_hover_text("Send this branch to the remote. Never forced.")
+                .on_disabled_hover_text(disabled_reason(remote.is_some(), busy))
+                .clicked()
+                && let (Some(remote), Some(branch)) = (remote, branch)
+            {
+                action = Action::Push {
+                    remote: remote.clone(),
+                    branch: branch.name.clone(),
+                    // A branch that has never been pushed needs telling what it
+                    // tracks, or git refuses with advice about `--set-upstream`.
+                    set_upstream: branch.upstream.is_none(),
+                };
+            }
+
+            if let Some(busy) = busy {
+                ui.weak(busy);
+            }
+        });
+
+        if let Some(said) = remote_said {
+            // Git's own summary. "Everything up-to-date" is the whole point of
+            // pressing the button when nothing needed sending.
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(said);
+            });
         }
 
         action
@@ -195,10 +322,6 @@ impl GitPanel {
                 } else {
                     "Write a message first."
                 });
-
-                if ui.button("History\u{2026}").clicked() {
-                    action = Action::ShowHistory;
-                }
             });
         });
 
@@ -404,7 +527,27 @@ pub(crate) enum State<'a> {
         /// The message of the commit HEAD is on, which is what an amend starts
         /// from. `None` before the first commit, when there is nothing to amend.
         last_message: Option<&'a str>,
+        /// The branch HEAD is on, once the listing has come back.
+        branch: Option<&'a editor_vcs::branch::Branch>,
+        /// The configured remotes. Empty means there is nowhere to push.
+        remotes: &'a [String],
+        /// A remote operation is running, and the worker is busy with it.
+        busy: Option<&'a str>,
+        /// What a remote operation last reported, in git's own words.
+        remote_said: Option<&'a str>,
     },
+}
+
+/// Why a remote button is greyed out. A disabled button with no explanation is
+/// the most annoying thing an interface can do.
+fn disabled_reason(has_remote: bool, busy: Option<&str>) -> &'static str {
+    if !has_remote {
+        "This repository has no remote configured."
+    } else if busy.is_some() {
+        "Waiting for the last remote operation to finish."
+    } else {
+        "Not available."
+    }
 }
 
 /// The path git knows the file by, which is what an action must carry.

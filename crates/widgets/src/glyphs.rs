@@ -44,6 +44,12 @@ pub const TREE_OPEN: &str = "\u{23f7}";
 pub const TREE_CLOSED: &str = "\u{23f5}";
 /// A commit that joined two histories, in the history list.
 pub const MERGE: &str = "\u{1f500}";
+/// Commits this branch has that its upstream does not, and the other way round.
+///
+/// Not `\u{2191}` and `\u{2193}`, which are the obvious pair and are not in the
+/// proportional fonts.
+pub const AHEAD: &str = "\u{2b06}";
+pub const BEHIND: &str = "\u{2b07}";
 /// The editor's fold column, painted in the code font.
 ///
 /// Deliberately lighter than [`TREE_OPEN`]: this one sits beside every foldable
@@ -71,6 +77,8 @@ mod tests {
         ("TREE_OPEN", super::TREE_OPEN, Family::Proportional),
         ("TREE_CLOSED", super::TREE_CLOSED, Family::Proportional),
         ("MERGE", super::MERGE, Family::Proportional),
+        ("AHEAD", super::AHEAD, Family::Proportional),
+        ("BEHIND", super::BEHIND, Family::Proportional),
         ("FOLD_OPEN", super::FOLD_OPEN, Family::Monospace),
         ("FOLD_CLOSED", super::FOLD_CLOSED, Family::Monospace),
         // `editor_lsp::diagnostics::Severity::glyph`, drawn in the status bar,
@@ -177,6 +185,7 @@ mod tests {
             ("up arrow", "\u{2191}", Family::Proportional),
             ("undo arrow", "\u{21b6}", Family::Proportional),
             ("card index", "\u{1f5c3}", Family::Proportional),
+            ("right arrow", "\u{2192}", Family::Proportional),
             // Guesses this very test rejected while it was being written,
             // which is the best evidence it is worth having.
             ("large filled circle", "\u{2b24}", Family::Proportional),

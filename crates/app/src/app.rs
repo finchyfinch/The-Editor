@@ -25,6 +25,7 @@ use editor_widgets::find_bar::{self, FindBar};
 use editor_widgets::{file_tree::FileTree, tab_bar, theme as ui_theme};
 use eframe::egui;
 
+use crate::branches_view::{self, BranchesView};
 use crate::commands::{self, CommandId};
 use crate::completion;
 use crate::debugger::{self, Breakpoints, DebugView};
@@ -240,6 +241,10 @@ pub(crate) struct EditorApp {
     git_panel: GitPanel,
     /// The commit history, in a window of its own.
     history: HistoryView,
+    /// The branches, likewise.
+    branches: BranchesView,
+    /// A branch awaiting a yes/no before it is deleted with its commits.
+    pending_force_delete: Option<String>,
     /// Whether the editor shows who last touched each line.
     show_blame: bool,
     /// Whether the window had focus last frame, so returning to it can be
@@ -432,6 +437,8 @@ impl EditorApp {
             },
             git_panel: GitPanel::default(),
             history: HistoryView::default(),
+            branches: BranchesView::default(),
+            pending_force_delete: None,
             show_blame: false,
             was_focused: true,
             from_command_line: open,
@@ -1032,6 +1039,9 @@ impl EditorApp {
         // rather than per file: discovery is one subprocess and the answer is
         // what decides whether any of the rest is worth doing.
         self.git.set_project(Some(&folder));
+        // The branch and how it stands against its upstream go in the status
+        // bar, which is on screen whether or not the panel ever is.
+        self.git.refresh_branches();
 
         if let Some(watcher) = self.watcher.as_mut()
             && let Err(e) = watcher.set_root(&folder)
@@ -3419,6 +3429,122 @@ impl EditorApp {
                     self.git.refresh_log(history_view::PAGE);
                 }
             }
+            git_panel::Action::ShowBranches => {
+                self.branches.open();
+                self.git.refresh_branches();
+            }
+            git_panel::Action::Fetch(remote) => {
+                self.git.act(editor_vcs::tracker::Action::Fetch(remote));
+            }
+            git_panel::Action::Pull => self.git.act(editor_vcs::tracker::Action::Pull),
+            git_panel::Action::Push {
+                remote,
+                branch,
+                set_upstream,
+            } => self.git.act(editor_vcs::tracker::Action::Push {
+                remote,
+                branch,
+                set_upstream,
+            }),
+        }
+    }
+
+    /// The branches window, and what it needs to draw.
+    fn branches_window(&mut self, ctx: &egui::Context) {
+        if !self.branches.is_open() {
+            return;
+        }
+
+        let state = if self.git.has_repo() {
+            if self.git.branches_known() {
+                branches_view::State::Ready {
+                    branches: self.git.branches(),
+                    busy: self.git.busy(),
+                }
+            } else {
+                branches_view::State::Waiting
+            }
+        } else {
+            branches_view::State::NoRepository
+        };
+
+        match self.branches.ui(ctx, state) {
+            branches_view::Action::None => {}
+            branches_view::Action::Refresh => self.git.refresh_branches(),
+            branches_view::Action::Checkout(name) => {
+                self.git.act(editor_vcs::tracker::Action::Checkout(name));
+            }
+            branches_view::Action::Create { name, switch } => {
+                self.git
+                    .act(editor_vcs::tracker::Action::CreateBranch { name, switch });
+                // Emptied optimistically rather than on success, unlike the
+                // commit message: a rejected name is rejected *before* git sees
+                // it, by the box itself, so anything that gets this far is one
+                // git will take or refuse for a reason that retyping will not
+                // fix.
+                self.branches.created();
+            }
+            branches_view::Action::Delete { name, force: false } => {
+                // Unforced first. Git refuses when the branch has commits
+                // nothing else can reach, and that refusal is the prompt: it
+                // says which branch and why, better than a dialog written in
+                // advance could.
+                self.git
+                    .act(editor_vcs::tracker::Action::DeleteBranch { name, force: false });
+            }
+            branches_view::Action::Delete { name, force: true } => {
+                self.pending_force_delete = Some(name);
+            }
+        }
+    }
+
+    /// Confirm before deleting a branch whose commits nothing else can reach.
+    ///
+    /// Milder than the discard prompt, and deliberately: the commits survive in
+    /// the reflog for a while, so this is recoverable by someone who knows how,
+    /// where discarded changes are recoverable by nobody.
+    fn force_delete_prompt(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.pending_force_delete.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+
+        egui::Modal::new(egui::Id::new("confirm_force_delete")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Delete this branch and its commits?");
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&name);
+                ui.label("has commits that are not merged anywhere else.");
+            });
+            ui.add_space(6.0);
+            ui.label(
+                "Deleting it makes them unreachable. Git's reflog can still find them for a \
+                 while, but nothing in The Editor can.",
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    decision = Some(false);
+                }
+                if ui.button("Delete anyway").clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+
+        match decision {
+            None => {}
+            Some(false) => self.pending_force_delete = None,
+            Some(true) => {
+                let name = self.pending_force_delete.take().unwrap_or_default();
+                self.git
+                    .act(editor_vcs::tracker::Action::DeleteBranch { name, force: true });
+            }
         }
     }
 
@@ -3889,6 +4015,7 @@ impl EditorApp {
                 if !self.git.log_known() {
                     self.git.refresh_log(history_view::PAGE);
                 }
+                self.git.refresh_branches();
             }
             CommandId::ToggleBlame => {
                 self.show_blame = !self.show_blame;
@@ -4241,7 +4368,22 @@ impl EditorApp {
         let checkers = self.checker_summary();
         let has_run = self.runner.output().line_count() > 1;
         let run_label = self.runner.label().to_owned();
-        let branch = self.git.branch().map(str::to_owned);
+        // The branch, and how it stands against its upstream once the listing
+        // has come back. The name alone comes from a cheaper question, so it is
+        // on screen from the first frame and the counts fill in behind it.
+        let branch = self.git.branch().map(|name| {
+            let track = self.git.current_branch().map_or_else(String::new, |b| {
+                b.track_summary(
+                    editor_widgets::glyphs::AHEAD,
+                    editor_widgets::glyphs::BEHIND,
+                )
+            });
+            if track.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name}  {track}")
+            }
+        });
 
         let row = ui.text_style_height(&egui::TextStyle::Body);
 
@@ -4833,6 +4975,20 @@ impl eframe::App for EditorApp {
         self.runner.set_context(&ctx);
         self.poll_watcher();
         self.git.poll();
+        // Git refusing to delete an unmerged branch is not a dead end: it is the
+        // moment to ask whether to force it. Tried the safe way first and only
+        // offering the dangerous one when the safe one is impossible is the
+        // whole shape of this interaction.
+        if let Some(editor_vcs::tracker::Action::DeleteBranch { name, force: false }) =
+            self.git.take_failed()
+            && self
+                .git
+                .error()
+                .is_some_and(|e| e.contains("not fully merged"))
+        {
+            self.git.clear_error();
+            self.pending_force_delete = Some(name);
+        }
         if self.git.take_committed() {
             // Only on a commit that actually landed. One a hook refused leaves
             // the message alone, so it can be tried again after the fix.
@@ -4886,6 +5042,7 @@ impl eframe::App for EditorApp {
             || self.settings_form.is_open()
             || self.pending_delete.is_some()
             || self.pending_discard.is_some()
+            || self.pending_force_delete.is_some()
             || self.palette.is_open()
             || self.new_file.is_open()
             || self.venv_dialog.is_open()
@@ -5078,6 +5235,10 @@ impl eframe::App for EditorApp {
                                         status: self.git.status(),
                                         error: self.git.error(),
                                         last_message: self.git.last_message(),
+                                        branch: self.git.current_branch(),
+                                        remotes: self.git.remotes(),
+                                        busy: self.git.busy(),
+                                        remote_said: self.git.remote_said(),
                                     }
                                 } else {
                                     git_panel::State::Waiting
@@ -5110,6 +5271,7 @@ impl eframe::App for EditorApp {
                 if !self.git.log_known() {
                     self.git.refresh_log(history_view::PAGE);
                 }
+                self.git.refresh_branches();
             }
             self.apply_packages_action(packages_action);
             self.apply_git_action(git_action);
@@ -5180,6 +5342,7 @@ impl eframe::App for EditorApp {
             .ui(&ctx, "third_party", "Third-Party Licences", THIRD_PARTY);
         self.diff_window(&ctx);
         self.history_window(&ctx);
+        self.branches_window(&ctx);
         self.rename_ui(&ctx);
         // After the editor has painted, so the caret rect it anchors to is
         // from this frame rather than the last one.
@@ -5192,6 +5355,7 @@ impl eframe::App for EditorApp {
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
         self.discard_prompt(&ctx);
+        self.force_delete_prompt(&ctx);
         self.search.poll();
         if self.packages.poll() {
             // pip's update check talks to the network and takes seconds; keep
