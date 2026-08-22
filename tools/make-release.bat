@@ -37,8 +37,11 @@ if not defined VERSION (
 set NAME=the-editor-%VERSION%-windows-x64
 set STAGE=dist\%NAME%
 
+rem --locked so a release is built from the dependency versions in Cargo.lock
+rem and not from whatever resolved on the day. A release that cannot be built
+rem twice from the same commit is not a release.
 echo Building The Editor %VERSION% ...
-cargo build --release --package the-editor
+cargo build --release --locked --package the-editor
 if errorlevel 1 (
     echo.
     echo Build failed. Nothing has been staged.
@@ -46,8 +49,18 @@ if errorlevel 1 (
 )
 
 rem Tests are not optional for something about to be handed to someone else.
+rem
+rem --all-targets rather than a bare `cargo test`, for two reasons. It picks up
+rem crates\widgets\benches\budgets.rs, which enforces the performance budgets
+rem in PLAN.md 2.4 and which a bare `cargo test` does not build at all -- those
+rem numbers were being shipped unchecked. And it leaves out the doc-tests,
+rem which is where the row of "running 0 tests" came from: every fenced block
+rem in the doc comments is ```text -- a protocol sample or a diagram -- so
+rem there is not one runnable example in the workspace and cargo was announcing
+rem ten empty runs to say so. If a real ``` rust example is ever written, add a
+rem `cargo test --workspace --doc` step here; --all-targets will not run it.
 echo Running the test suite ...
-cargo test --workspace --quiet
+cargo test --workspace --all-targets --quiet --locked
 if errorlevel 1 (
     echo.
     echo Tests failed. Refusing to package a build that does not pass them.

@@ -143,6 +143,16 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Changed
 
+- **The release script runs the performance budgets, and stopped announcing
+  ten empty test runs.** `tools\make-release.bat` ran `cargo test --workspace`,
+  which does not build bench targets — so the PLAN.md §2.4 budgets were being
+  shipped unmeasured — and did run the ten per-crate doc-test targets, which
+  have nothing to run because every fenced block in the doc comments is
+  `text` rather than a compiled example. Under `--quiet` those arrived as
+  unlabelled "running 0 tests" blocks. It now runs `--all-targets`, which is
+  the other way round on both counts, and builds and tests `--locked` so a
+  release is built from the dependency versions in `Cargo.lock`.
+
 - **The C runtime is linked statically on Windows.** The executable previously
   imported `VCRUNTIME140.dll` and would not start on a machine that had never
   had a Visual Studio redistributable installed — for something distributed as
@@ -166,6 +176,32 @@ Entries are written as each milestone lands, not retroactively at release time.
   waiting. The panel now says so under the file's name.
 
 ### Fixed
+
+- **The window came back the size of the screen and could not be got out of
+  it.** Quitting maximized wrote the *maximized* size down as the window's own
+  size, so the next launch restored a window the size of the screen and
+  "restore down" had nothing smaller to go back to — it un-maximized to the
+  same near-fullscreen rectangle, hanging a few pixels over every edge, and
+  once it was closed in that state it started that way for good. The size and
+  position now come from the last frame the window was *not* maximized, which
+  is what restore-down is asking for, and the maximized flag rides on top of
+  them: quit maximized, and it opens maximized over the window you had, with
+  that window still underneath it. A remembered size that fills the monitor is
+  read as one of the old bad ones and dropped, so an existing session corrects
+  itself on the first launch rather than the first resize.
+
+- **Find said "0 of 3" while showing three matches.** The count and the strong
+  highlight both come from the bar's current match, and nothing set one until
+  somebody stepped — so a search that had just found matches sat on none of
+  them, and reported a position no match has. The match list is only rebuilt
+  when the query, options, or document change, and rebuilding it now anchors to
+  the caret when there is no current match to keep: the first result is
+  selected as soon as it is found, and `Ctrl+F` on a selected word lands on
+  that word rather than the one after it, because the bar is handed the start
+  of the selection rather than its far end. Typing another character refines
+  onto the same occurrence for the same reason — it used to re-anchor past the
+  match it had just revealed, so extending a query walked down the file a
+  match at a time.
 
 - **Discarded changes came back after a restart.** Choosing "Don't Save" on the
   way out and starting up again offered the same changes back, as unsaved work

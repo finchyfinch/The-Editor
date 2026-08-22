@@ -85,8 +85,17 @@ impl FindBar {
         self.current.and_then(|i| self.matches.get(i)).cloned()
     }
 
+    /// One-based index of the current match, for the "3 of 12" readout.
+    #[must_use]
+    pub fn position(&self) -> Option<usize> {
+        self.current.map(|i| i + 1)
+    }
+
     /// Recompute the match list if the query or the document has changed.
-    fn refresh(&mut self, doc: &Document) {
+    ///
+    /// `caret` anchors the current match when there is not one already, so a
+    /// search that finds something always has one of those matches selected.
+    fn refresh(&mut self, doc: &Document, caret: usize) {
         let key = (self.query.clone(), doc.version());
         if self.cached_for.as_ref() == Some(&key) {
             return;
@@ -105,10 +114,17 @@ impl FindBar {
                 self.matches = matcher.find_all(doc.text());
                 self.error = None;
                 // Keep the current match if it still exists, so replacing one
-                // occurrence does not jump the view back to the top.
+                // occurrence does not jump the view back to the top. Failing
+                // that, anchor to the caret: opening the bar on a selection,
+                // or reopening it with the previous query, finds matches
+                // without anyone having stepped through them yet, and a search
+                // that found something is always sitting on one of the results
+                // -- the readout said "0 of 3", a position no match has, and
+                // the editor had nothing to highlight as current.
                 self.current = self
                     .current
-                    .map(|i| i.min(self.matches.len().saturating_sub(1)));
+                    .map(|i| i.min(self.matches.len().saturating_sub(1)))
+                    .or_else(|| Matcher::next_from(&self.matches, caret));
                 if self.matches.is_empty() {
                     self.current = None;
                 }
@@ -121,13 +137,14 @@ impl FindBar {
         }
     }
 
-    /// Draw the bar. `caret` is where the editor's cursor is, so the first
-    /// Enter jumps to the next match after it rather than back to the top.
+    /// Draw the bar. `caret` is where the editor's selection starts, so a
+    /// fresh search lands on the match the user is already sitting on rather
+    /// than on the one after it or back at the top of the file.
     pub fn ui(&mut self, ui: &mut egui::Ui, doc: &Document, caret: usize) -> Action {
         if !self.open {
             return Action::None;
         }
-        self.refresh(doc);
+        self.refresh(doc, caret);
 
         let mut action = Action::None;
         // Whether one of this bar's own text fields owns the keyboard. Enter
@@ -167,10 +184,14 @@ impl FindBar {
                     }
                     if find.changed() {
                         self.cached_for = None;
-                        self.refresh(doc);
-                        // Re-anchor to the caret as the query changes, so
-                        // typing walks forward through the file.
-                        self.current = Matcher::next_from(&self.matches, caret);
+                        // Re-anchor as the query changes: the old index means
+                        // nothing once the match list is a different list.
+                        // Anchoring to the caret -- which sits at the start of
+                        // the match just revealed -- refines the search in
+                        // place, so typing another character narrows onto the
+                        // same occurrence instead of skipping to the next one.
+                        self.current = None;
+                        self.refresh(doc, caret);
                         if let Some(range) = self.current_match() {
                             action = Action::Reveal(range);
                         }
@@ -198,7 +219,7 @@ impl FindBar {
                         .is_some();
                     if options_changed {
                         self.cached_for = None;
-                        self.refresh(doc);
+                        self.refresh(doc, caret);
                     }
 
                     ui.separator();
@@ -220,17 +241,22 @@ impl FindBar {
                         action = Action::Reveal(range);
                     }
 
-                    match (&self.error, self.matches.len()) {
-                        (Some(message), _) => {
+                    match (&self.error, self.matches.len(), self.position()) {
+                        (Some(message), ..) => {
                             ui.colored_label(ui.visuals().error_fg_color, message);
                         }
-                        (None, 0) if !self.query.is_empty() => {
+                        (None, 0, _) if !self.query.is_empty() => {
                             ui.weak("No results");
                         }
-                        (None, 0) => {}
-                        (None, total) => {
-                            let position = self.current.map_or(0, |i| i + 1);
+                        (None, 0, _) => {}
+                        (None, total, Some(position)) => {
                             ui.weak(format!("{position} of {total}"));
+                        }
+                        // `refresh` anchors the current match whenever there is
+                        // one to anchor to, so this only says what it does know
+                        // rather than counting from a match that isn't there.
+                        (None, total, None) => {
+                            ui.weak(format!("{total} matches"));
                         }
                     }
 
@@ -400,7 +426,7 @@ mod tests {
     fn refresh_finds_every_match() {
         let doc = doc_with("one two one three one");
         let mut bar = bar_for("one");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert_eq!(bar.matches().len(), 3);
         assert!(bar.error.is_none());
     }
@@ -409,10 +435,10 @@ mod tests {
     fn results_are_cached_until_the_query_or_document_changes() {
         let doc = doc_with("aaa");
         let mut bar = bar_for("a");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         let key = bar.cached_for.clone();
 
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert_eq!(
             bar.cached_for, key,
             "an unchanged query and document must not re-search"
@@ -420,7 +446,7 @@ mod tests {
 
         bar.query.pattern = "aa".to_owned();
         bar.cached_for = None;
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert_ne!(bar.cached_for, key);
     }
 
@@ -428,7 +454,7 @@ mod tests {
     fn editing_the_document_invalidates_the_cache() {
         let mut doc = doc_with("target");
         let mut bar = bar_for("target");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert_eq!(bar.matches().len(), 1);
 
         doc.apply(
@@ -436,7 +462,7 @@ mod tests {
             Selection::at(0),
             Selection::at(7),
         );
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert_eq!(
             bar.matches().len(),
             2,
@@ -445,12 +471,40 @@ mod tests {
     }
 
     #[test]
+    fn searching_selects_the_first_match_rather_than_none_of_them() {
+        let doc = doc_with("one two one three one");
+        let mut bar = bar_for("one");
+        bar.refresh(&doc, 0);
+
+        assert_eq!(bar.current_match(), Some(0..3));
+        assert_eq!(
+            bar.position(),
+            Some(1),
+            "a search that found three matches is sitting on one of them"
+        );
+    }
+
+    #[test]
+    fn searching_from_mid_file_selects_the_match_at_the_caret() {
+        let doc = doc_with("x .... x .... x");
+        let mut bar = bar_for("x");
+        bar.refresh(&doc, 7);
+
+        assert_eq!(
+            bar.current_match(),
+            Some(7..8),
+            "opening the bar on a word should land on that word"
+        );
+        assert_eq!(bar.position(), Some(2));
+    }
+
+    #[test]
     fn stepping_forward_wraps_at_the_end() {
         let doc = doc_with("x x x");
         let mut bar = bar_for("x");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
 
-        assert_eq!(bar.step(0, 1), Some(0..1));
+        assert_eq!(bar.current_match(), Some(0..1));
         assert_eq!(bar.step(0, 1), Some(2..3));
         assert_eq!(bar.step(0, 1), Some(4..5));
         assert_eq!(bar.step(0, 1), Some(0..1), "wraps to the first match");
@@ -460,9 +514,8 @@ mod tests {
     fn stepping_backward_wraps_at_the_start() {
         let doc = doc_with("x x x");
         let mut bar = bar_for("x");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
 
-        bar.current = Some(0);
         assert_eq!(bar.step(0, -1), Some(4..5), "wraps to the last match");
     }
 
@@ -470,13 +523,33 @@ mod tests {
     fn the_first_step_starts_from_the_caret_not_the_top_of_the_file() {
         let doc = doc_with("x .... x .... x");
         let mut bar = bar_for("x");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 8);
 
         assert_eq!(
-            bar.step(8, 1),
+            bar.current_match(),
             Some(14..15),
             "searching from mid-file should not jump backwards first"
         );
+        assert_eq!(
+            bar.step(8, 1),
+            Some(0..1),
+            "and the step after that wraps rather than repeating a match"
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_the_current_match_where_it_was() {
+        let doc = doc_with("one one one");
+        let mut bar = bar_for("one");
+        bar.refresh(&doc, 0);
+        bar.step(0, 1);
+        assert_eq!(bar.position(), Some(2));
+
+        // A replacement invalidates the cache; re-searching must not drag the
+        // view back to the top.
+        bar.cached_for = None;
+        bar.refresh(&doc, 0);
+        assert_eq!(bar.position(), Some(2));
     }
 
     #[test]
@@ -490,7 +563,7 @@ mod tests {
             },
             ..FindBar::default()
         };
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
 
         assert!(bar.error.is_some());
         assert!(bar.matches().is_empty());
@@ -501,16 +574,17 @@ mod tests {
     fn an_empty_query_matches_nothing_rather_than_everything() {
         let doc = doc_with("some text");
         let mut bar = bar_for("");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert!(bar.matches().is_empty());
         assert!(bar.error.is_none());
+        assert_eq!(bar.position(), None, "nothing searched, nothing current");
     }
 
     #[test]
     fn replace_all_produces_one_edit_per_match() {
         let doc = doc_with("one one one");
         let mut bar = bar_for("one");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         bar.replacement = "two".to_owned();
 
         match bar.replace_all(&doc) {
@@ -534,7 +608,7 @@ mod tests {
             replacement: "$2$1".to_owned(),
             ..FindBar::default()
         };
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
 
         match bar.replace_all(&doc) {
             Some(Action::ReplaceAll(edits)) => {
@@ -549,7 +623,7 @@ mod tests {
     fn replace_one_targets_the_current_match() {
         let doc = doc_with("one one one");
         let mut bar = bar_for("one");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         bar.replacement = "two".to_owned();
         bar.current = Some(1);
 
@@ -566,7 +640,7 @@ mod tests {
     fn replace_all_on_no_matches_does_nothing() {
         let doc = doc_with("nothing here");
         let mut bar = bar_for("absent");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert!(bar.replace_all(&doc).is_none());
     }
 
@@ -574,7 +648,7 @@ mod tests {
     fn closing_clears_the_highlights() {
         let doc = doc_with("x x");
         let mut bar = bar_for("x");
-        bar.refresh(&doc);
+        bar.refresh(&doc, 0);
         assert!(!bar.matches().is_empty());
 
         bar.close();

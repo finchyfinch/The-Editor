@@ -60,6 +60,25 @@ impl WindowGeometry {
                 .all(|v| v.is_finite())
     }
 
+    /// True if this remembered size is really the screen's rather than the
+    /// user's own.
+    ///
+    /// Only ever asked of a geometry that was saved maximized, and only to
+    /// spot the sessions written before the normal size was tracked apart from
+    /// the maximized one: those recorded the size of the maximized window as
+    /// the size to come back to, so restoring it gave a window the size of the
+    /// screen that "restore down" could not get out of. A window that fills
+    /// nearly the whole monitor is taken to be one of those. A user really can
+    /// size a normal window that big, and this loses it once — against a
+    /// restore-down that stays broken until they do.
+    #[must_use]
+    pub fn fills_the_screen(&self, screen_width: f32, screen_height: f32) -> bool {
+        /// Fraction of each side counted as "the whole screen". Below the
+        /// space a maximized window gives up to the taskbar and the title bar.
+        const FILLS: f32 = 0.9;
+        self.width >= screen_width * FILLS && self.height >= screen_height * FILLS
+    }
+
     /// True if this window would be visible on a desktop of the given size.
     ///
     /// Requires a reasonable strip of the title bar to be reachable, so a
@@ -546,6 +565,35 @@ mod tests {
             ..geometry()
         };
         assert!(partly_left.is_on_screen(screen.0, screen.1));
+    }
+
+    #[test]
+    fn a_remembered_size_the_size_of_the_screen_is_recognised() {
+        let screen = (1920.0, 1080.0);
+
+        // What an older build wrote for a window that was closed maximized:
+        // the maximized size, less the taskbar and the title bar.
+        let was_maximized = WindowGeometry {
+            width: 1920.0,
+            height: 1000.0,
+            maximized: true,
+            ..geometry()
+        };
+        assert!(was_maximized.fills_the_screen(screen.0, screen.1));
+
+        // A large window, but one somebody could have dragged to that size.
+        let large = WindowGeometry {
+            width: 1600.0,
+            height: 900.0,
+            maximized: true,
+            ..geometry()
+        };
+        assert!(
+            !large.fills_the_screen(screen.0, screen.1),
+            "a window this size is a window, and restore-down should give it back"
+        );
+
+        assert!(!geometry().fills_the_screen(screen.0, screen.1));
     }
 
     #[test]

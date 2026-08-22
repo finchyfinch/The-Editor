@@ -297,6 +297,22 @@ pub(crate) struct EditorApp {
     /// Set once the session has been written on quit, so it is not written
     /// again by a second close request.
     session_saved: bool,
+    /// Where the window was the last time it was a *normal* window.
+    ///
+    /// This, and not the size it happens to have right now, is what gets
+    /// remembered: a maximized window's size belongs to the screen, and
+    /// writing it down as the user's own size is what made restore-down give
+    /// back a window the size of the screen. Sampled every frame the window is
+    /// not maximized, and seeded from the session so quitting maximized twice
+    /// running does not forget the size underneath.
+    restored_window: Option<WindowGeometry>,
+    /// The geometry asked for on the first frame, held until the window
+    /// actually has it. Until then the window still describes itself as it was
+    /// *built* — the fallback size in `main` — and filing that away as the
+    /// user's chosen size would throw away what the session just restored.
+    awaiting_window: Option<WindowGeometry>,
+    /// Whether the window is maximized right now, sampled with the geometry.
+    window_maximized: bool,
 
     /// Recently opened files, newest first. Persisted in the session file.
     recent: Vec<PathBuf>,
@@ -507,6 +523,9 @@ impl EditorApp {
             dirty_seen: Vec::new(),
             restore: settings.restore_session().then(|| session.clone()),
             session_saved: false,
+            restored_window: None,
+            awaiting_window: None,
+            window_maximized: false,
             recent: Vec::new(),
             pending_recent: None,
             pending_delete: None,
@@ -1006,11 +1025,29 @@ impl EditorApp {
                 // position, and let the window manager place it.
                 tracing::info!("remembered window position is off-screen; ignoring it");
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                geometry.width,
-                geometry.height,
-            )));
+
+            // The size to come back to when un-maximized, which is only the
+            // remembered one if the remembered one is a real window rather
+            // than the screen written down by an older build — see
+            // `fills_the_screen`. Dropping it leaves the window at the size it
+            // was built with, which is at least a window.
+            let stale = geometry.maximized
+                && monitor.is_some_and(|size| geometry.fills_the_screen(size.x, size.y));
+            let normal = (!stale).then_some(geometry);
+            if let Some(normal) = normal {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    normal.width,
+                    normal.height,
+                )));
+            }
+            self.restored_window = normal.map(|g| WindowGeometry {
+                maximized: false,
+                ..g
+            });
+            self.awaiting_window = self.restored_window;
+
             if geometry.maximized {
+                // After the size, so the window has somewhere to go back to.
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             }
         }
@@ -1040,9 +1077,13 @@ impl EditorApp {
         self.show_output = session.show_output;
     }
 
-    /// Gather the current state for writing out.
-    fn current_session(&self, ctx: &egui::Context) -> Session {
-        let window = ctx.input(|i| {
+    /// Note where the window is, if it is a normal window right now.
+    ///
+    /// Runs every frame. A maximized window is skipped rather than recorded:
+    /// its size and position are the screen's, and the point of remembering
+    /// geometry is to give the user back the window *they* sized.
+    fn track_window(&mut self, ctx: &egui::Context) {
+        let Some((geometry, maximized)) = ctx.input(|i| {
             let viewport = i.viewport();
             // Position comes from the outer rect — that is where the window
             // actually is — but the size comes from the *inner* rect, because
@@ -1051,13 +1092,48 @@ impl EditorApp {
             // the height of its own title bar on every launch.
             let outer = viewport.outer_rect?;
             let inner = viewport.inner_rect?;
-            Some(WindowGeometry {
-                x: outer.min.x,
-                y: outer.min.y,
-                width: inner.width(),
-                height: inner.height(),
-                maximized: viewport.maximized.unwrap_or(false),
-            })
+            Some((
+                WindowGeometry {
+                    x: outer.min.x,
+                    y: outer.min.y,
+                    width: inner.width(),
+                    height: inner.height(),
+                    maximized: false,
+                },
+                viewport.maximized.unwrap_or(false),
+            ))
+        }) else {
+            return;
+        };
+
+        self.window_maximized = maximized;
+        if maximized {
+            return;
+        }
+        // Wait for the restored geometry to arrive before believing what the
+        // window says about itself; see `awaiting_window`. A maximized restore
+        // clears this on the first un-maximize, which is the first moment the
+        // remembered size is on screen to be seen.
+        if let Some(wanted) = self.awaiting_window {
+            let close = |a: f32, b: f32| (a - b).abs() <= 2.0;
+            if !close(geometry.width, wanted.width) || !close(geometry.height, wanted.height) {
+                return;
+            }
+            self.awaiting_window = None;
+        }
+        self.restored_window = Some(geometry);
+    }
+
+    /// Gather the current state for writing out.
+    fn current_session(&self) -> Session {
+        // The *normal* geometry, with whether the window is maximized on top
+        // of it — the two are independent, and a maximized window still has a
+        // size to come back to. Both come from `track_window` rather than from
+        // the viewport here, because by the time the window is closing it is
+        // too late to ask what size it used to be.
+        let window = self.restored_window.map(|geometry| WindowGeometry {
+            maximized: self.window_maximized,
+            ..geometry
         });
 
         Session {
@@ -1080,11 +1156,11 @@ impl EditorApp {
         }
     }
 
-    fn save_session(&mut self, ctx: &egui::Context) {
+    fn save_session(&mut self) {
         if self.session_saved || !self.settings.restore_session() {
             return;
         }
-        let session = self.current_session(ctx);
+        let session = self.current_session();
         if let Err(e) = session.save(&self.paths.session_file()) {
             tracing::warn!("could not save the session: {e}");
         }
@@ -5018,7 +5094,11 @@ impl EditorApp {
                 // The parse tree was brought up to date by `sync_highlighters`
                 // earlier this frame, so it is safe to paint from here.
                 if entry.find.is_open() {
-                    let caret = entry.view.selection.head;
+                    // The *start* of the selection, not its head: Find opened
+                    // on a selected word should land on that word, and the
+                    // head sits at its far end, one character past the only
+                    // match the user cared about.
+                    let caret = entry.view.selection.start();
                     let mut action = entry.find.ui(ui, &entry.doc, caret);
                     // A keyboard Find Next arrives as a pending step rather
                     // than a click, so it takes the same path.
@@ -5381,6 +5461,7 @@ impl eframe::App for EditorApp {
         if let Some(session) = self.restore.take() {
             self.restore_session(&session, &ctx);
         }
+        self.track_window(&ctx);
         self.report_startup();
         self.open_from_command_line();
         self.runner.set_context(&ctx);
@@ -5425,7 +5506,7 @@ impl eframe::App for EditorApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
             // Written before the unsaved prompt, so the session survives even
             // if the user then cancels the quit and closes some other way.
-            self.save_session(&ctx);
+            self.save_session();
             if self.docs.iter().any(|d| d.doc.is_dirty()) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending = Some(Pending::Quit);
