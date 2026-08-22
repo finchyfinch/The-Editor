@@ -79,11 +79,29 @@ somewhere unrelated.
 in `self` and leaves the caret ready for the next argument. `@classmethod`
 gets `cls`; `@staticmethod` gets neither, and so does a plain function.
 
+**Python docstrings.** Typing `"""` on the first line of a `def` or `class`
+body writes the skeleton of a docstring from the signature above it: an entry
+per parameter with its type and whether it has a default, the return type,
+what the body raises, and `Yields` instead of `Returns` for a generator. A
+class describes what building one takes, which is `__init__`'s parameters.
+`self` and `cls` are left out. The caret lands on the summary line, which is
+the one part no signature can supply. One `Ctrl+Z` takes the whole thing back.
+
+Three layouts are offered — Google, NumPy and Sphinx's reST — in
+**Settings > Python**, along with **Off**, which leaves the quotes to you.
+Typing `"""` anywhere else is just a string: the closing three go in with the
+opening three and the caret sits between them, which is the one part of this
+that applies to every triple-quoted string.
+
 **Rename** (`F2`) asks the language server, so it renames the *symbol* rather
 than the text — a variable called `id` will not take the `id` out of
 `identity`. It needs the file saved first, because the server reads from disk.
 There is no find-and-replace fallback: that is how the wrong things get
 renamed.
+
+**The gutter** is not text, and the pointer says so: an arrow over the line
+numbers, a hand over the breakpoint strip and over a fold chevron, and the
+I-beam back again over the code.
 
 **Folding.** A chevron appears beside every line that opens something
 foldable — a class, a function, an `if`. Click it, or press `Ctrl+Shift+[` to

@@ -202,6 +202,18 @@ pub(crate) struct Command {
     pub(crate) category: &'static str,
     /// The accelerator, shown in menus and the shortcut reference.
     pub(crate) shortcut: Option<KeyboardShortcut>,
+    /// A second binding that also triggers this command, and is deliberately
+    /// not shown anywhere: menus and the shortcut reference list one
+    /// accelerator per command, because two makes the reference harder to read
+    /// for something nobody needs to be told.
+    ///
+    /// This exists for a key that is one key on some keyboards and two on
+    /// others. `+` is Shift+`=` on the usual layouts but has a key to itself on
+    /// a numeric keypad, so Zoom In answers to `Ctrl+=` -- the one that is
+    /// reachable everywhere, and the one the menu lists -- and to `Ctrl+Plus`
+    /// besides, for the keyboards where that is a keystroke of its own.
+    /// Browsers accept both and so does this.
+    pub(crate) secondary: Option<KeyboardShortcut>,
     /// Whether [`triggered`] should claim this shortcut globally.
     ///
     /// Clipboard shortcuts are `false`: egui synthesises `Event::Copy`,
@@ -563,7 +575,22 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Toggle Hidden Files",
         None,
     ),
-    cmd(CommandId::ZoomIn, "View", "Zoom In", ctrl(Key::Plus)),
+    // Ctrl+= rather than Ctrl+Plus, and that is not a typo.
+    //
+    // A `+` is a shifted `=` on the usual layouts, so "Ctrl+Plus" is really
+    // Ctrl+Shift+= -- which is Unfold All two entries above, and wins because
+    // it demands more modifiers. Advertising Ctrl+Plus therefore advertised a
+    // key that unfolds the file. Ctrl+Plus stays as the unlisted second
+    // binding for the keyboards that have a `+` of their own, a numeric keypad
+    // among them, where it is reachable without shift and collides with
+    // nothing.
+    cmd_also(
+        CommandId::ZoomIn,
+        "View",
+        "Zoom In",
+        ctrl(Key::Equals),
+        ctrl(Key::Plus),
+    ),
     cmd(CommandId::ZoomOut, "View", "Zoom Out", ctrl(Key::Minus)),
     cmd(CommandId::ZoomReset, "View", "Reset Zoom", ctrl(Key::Num0)),
     cmd(
@@ -617,7 +644,22 @@ const fn cmd(
         title,
         category,
         shortcut,
+        secondary: None,
         global: true,
+    }
+}
+
+/// A command with a second, unlisted binding. See [`Command::secondary`].
+const fn cmd_also(
+    id: CommandId,
+    category: &'static str,
+    title: &'static str,
+    shortcut: Option<KeyboardShortcut>,
+    secondary: Option<KeyboardShortcut>,
+) -> Command {
+    Command {
+        secondary,
+        ..cmd(id, category, title, shortcut)
     }
 }
 
@@ -642,6 +684,31 @@ pub(crate) fn get(id: CommandId) -> &'static Command {
         .expect("every CommandId is in the registry; the exhaustiveness test enforces it")
 }
 
+/// Every binding the application claims globally, in the order [`triggered`]
+/// checks them: most modifiers first.
+///
+/// Both of a command's bindings are candidates in their own right and are
+/// sorted together -- a secondary binding is no less specific than a primary
+/// one, and the same rule has to cover it.
+///
+/// A function rather than something written out at the one call site, because
+/// the tests below check this order and a copy of it in the tests is a copy
+/// that can agree with itself while disagreeing with what runs.
+fn claimed_bindings() -> Vec<(KeyboardShortcut, CommandId)> {
+    let mut candidates: Vec<(KeyboardShortcut, CommandId)> = registry()
+        .iter()
+        .filter(|cmd| cmd.global)
+        .flat_map(|cmd| {
+            [cmd.shortcut, cmd.secondary]
+                .into_iter()
+                .flatten()
+                .map(|sc| (sc, cmd.id))
+        })
+        .collect();
+    candidates.sort_by_key(|(sc, _)| std::cmp::Reverse(specificity(*sc)));
+    candidates
+}
+
 /// The command whose shortcut was just pressed, if any.
 ///
 /// Consuming the shortcut prevents it also reaching a focused text field.
@@ -656,24 +723,19 @@ pub(crate) fn triggered(ctx: &eframe::egui::Context) -> Option<CommandId> {
     // Sorting here rather than reordering the registry, because the registry's
     // order is what the menus and the palette read, and a future binding added
     // in the obvious place would silently reintroduce this.
-    let mut candidates: Vec<&Command> = registry()
-        .iter()
-        .filter(|cmd| cmd.global && cmd.shortcut.is_some())
-        .collect();
-    candidates.sort_by_key(|cmd| std::cmp::Reverse(specificity(cmd)));
+    let candidates = claimed_bindings();
 
     // A focused text field owns the keys that mean something inside text.
     // Asked once, before the loop, because it does not change mid-frame.
     let in_text_field = ctx.text_edit_focused();
 
-    candidates.into_iter().find_map(|cmd| {
-        let sc = cmd.shortcut?;
+    candidates.into_iter().find_map(|(sc, id)| {
         if in_text_field && edits_text(sc) {
             // Left in the queue rather than consumed, so the field itself gets
             // it later in the frame.
             return None;
         }
-        ctx.input_mut(|i| i.consume_shortcut(&sc)).then_some(cmd.id)
+        ctx.input_mut(|i| i.consume_shortcut(&sc)).then_some(id)
     })
 }
 
@@ -706,8 +768,7 @@ fn edits_text(shortcut: KeyboardShortcut) -> bool {
 }
 
 /// How many modifiers a binding demands. More is more specific.
-fn specificity(cmd: &Command) -> u32 {
-    let Some(sc) = cmd.shortcut else { return 0 };
+fn specificity(sc: KeyboardShortcut) -> u32 {
     let m = sc.modifiers;
     u32::from(m.shift)
         + u32::from(m.alt)
@@ -728,29 +789,20 @@ mod tests {
     /// registry order that was Undo.
     #[test]
     fn a_shortcut_with_more_modifiers_is_checked_first() {
-        let mut candidates: Vec<&Command> = registry()
-            .iter()
-            .filter(|cmd| cmd.global && cmd.shortcut.is_some())
-            .collect();
-        candidates.sort_by_key(|cmd| std::cmp::Reverse(specificity(cmd)));
+        let candidates = claimed_bindings();
 
         // For every pair sharing a key, the one demanding more modifiers must
         // come first in the order `triggered` walks.
-        for (i, a) in candidates.iter().enumerate() {
-            for b in &candidates[i + 1..] {
-                let (Some(sa), Some(sb)) = (a.shortcut, b.shortcut) else {
-                    continue;
-                };
+        for (i, (sa, ida)) in candidates.iter().enumerate() {
+            for (sb, idb) in &candidates[i + 1..] {
                 if sa.logical_key != sb.logical_key {
                     continue;
                 }
                 assert!(
-                    specificity(a) >= specificity(b),
-                    "{:?} ({} modifiers) is checked after {:?} ({}), so it can never fire",
-                    b.id,
-                    specificity(b),
-                    a.id,
-                    specificity(a),
+                    specificity(*sa) >= specificity(*sb),
+                    "{idb:?} ({} modifiers) is checked after {ida:?} ({}), so it can never fire",
+                    specificity(*sb),
+                    specificity(*sa),
                 );
             }
         }
@@ -759,14 +811,7 @@ mod tests {
     #[test]
     fn the_pairs_that_actually_collide_are_ordered_correctly() {
         // Named explicitly, because these are the ones a user notices.
-        let order: Vec<CommandId> = {
-            let mut c: Vec<&Command> = registry()
-                .iter()
-                .filter(|cmd| cmd.global && cmd.shortcut.is_some())
-                .collect();
-            c.sort_by_key(|cmd| std::cmp::Reverse(specificity(cmd)));
-            c.into_iter().map(|cmd| cmd.id).collect()
-        };
+        let order: Vec<CommandId> = claimed_bindings().into_iter().map(|(_, id)| id).collect();
         let before = |a: CommandId, b: CommandId| {
             let ia = order.iter().position(|id| *id == a);
             let ib = order.iter().position(|id| *id == b);
@@ -828,12 +873,55 @@ mod tests {
     fn no_two_commands_share_a_shortcut() {
         let mut seen: Vec<(KeyboardShortcut, CommandId)> = Vec::new();
         for cmd in registry() {
-            let Some(sc) = cmd.shortcut else { continue };
-            if let Some((_, other)) = seen.iter().find(|(s, _)| *s == sc) {
-                panic!("{:?} and {other:?} both bind the same shortcut", cmd.id);
+            // Secondary bindings counted too: they are consumed exactly like
+            // primary ones, so a clash between a secondary and somebody else's
+            // primary is the same bug and just as invisible.
+            for sc in [cmd.shortcut, cmd.secondary].into_iter().flatten() {
+                if let Some((_, other)) = seen.iter().find(|(s, _)| *s == sc) {
+                    panic!("{:?} and {other:?} both bind the same shortcut", cmd.id);
+                }
+                seen.push((sc, cmd.id));
             }
-            seen.push((sc, cmd.id));
         }
+    }
+
+    /// The key Zoom In is advertised under has to be one that reaches it.
+    ///
+    /// `+` is Shift+`=` on the usual layouts, so a Ctrl+Plus binding is really
+    /// Ctrl+Shift+= -- and Unfold All binds exactly that and wins on
+    /// specificity. Zoom In was listed in the View menu under a key that
+    /// unfolds the file, and the Ctrl+= people press instead reached nothing
+    /// here at all: egui's own zoom handler took it and moved a zoom factor
+    /// this application believes it owns, which is how the two came apart.
+    #[test]
+    fn zooming_in_is_advertised_under_a_key_that_actually_zooms() {
+        let zoom_in = get(CommandId::ZoomIn);
+        assert_eq!(
+            zoom_in.shortcut,
+            Some(KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals)),
+            "the listed accelerator must not be the shifted spelling"
+        );
+
+        // And the shifted spelling still belongs to Unfold All, which is what
+        // makes the above necessary rather than merely tidy.
+        let unfold = get(CommandId::UnfoldAll);
+        assert_eq!(
+            unfold.shortcut,
+            Some(KeyboardShortcut::new(
+                Modifiers::COMMAND.plus(Modifiers::SHIFT),
+                Key::Plus
+            )),
+        );
+        let order: Vec<CommandId> = claimed_bindings()
+            .into_iter()
+            .filter(|(sc, _)| sc.logical_key == Key::Plus)
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![CommandId::UnfoldAll, CommandId::ZoomIn],
+            "Ctrl+Shift+Plus must be checked before Ctrl+Plus, or Unfold All can never fire"
+        );
     }
 
     #[test]

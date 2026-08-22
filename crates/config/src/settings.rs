@@ -78,6 +78,11 @@ renderer = \"glow\"
 [python]
 # Leave empty to auto-detect: a .venv in the project, else python on PATH.
 interpreter = \"\"
+# Typing \"\"\" on the first line of a def or class body writes a docstring
+# skeleton from the signature above it: one entry per parameter, the return
+# type, and anything the body raises. \"google\", \"numpy\", \"sphinx\", or
+# \"off\" to leave the quotes alone.
+docstrings = \"google\"
 
 [lsp]
 # Language servers to leave alone, by id: \"ruff\", \"pyright\", \"pylsp\",
@@ -142,6 +147,56 @@ impl UnderlineDiagnostics {
             Self::All => "Errors and warnings",
             Self::Errors => "Errors only",
             Self::None => "Nothing",
+        }
+    }
+}
+
+/// How a generated docstring is laid out. Defined where the generating is.
+/// How a generated docstring is laid out.
+///
+/// Three are offered because there is no winner: Google's is the most
+/// readable, NumPy's is the convention across the scientific stack, and
+/// Sphinx's reST is what older codebases and `autodoc` expect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DocstringStyle {
+    /// `Args:` / `Returns:`, indented under each heading.
+    #[default]
+    Google,
+    /// `Parameters` / `Returns` over a row of dashes.
+    Numpy,
+    /// `:param x:` / `:rtype:`, which is what Sphinx `autodoc` reads.
+    Sphinx,
+}
+
+impl DocstringStyle {
+    pub const ALL: [Self; 3] = [Self::Google, Self::Numpy, Self::Sphinx];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::Numpy => "numpy",
+            Self::Sphinx => "sphinx",
+        }
+    }
+
+    /// Parse the name a settings file uses.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "google" => Some(Self::Google),
+            "numpy" => Some(Self::Numpy),
+            "sphinx" | "rest" => Some(Self::Sphinx),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Google => "Google",
+            Self::Numpy => "NumPy",
+            Self::Sphinx => "Sphinx (reST)",
         }
     }
 }
@@ -495,6 +550,24 @@ impl Settings {
         self.set("editor", "underline_diagnostics", value(level.as_str()));
     }
 
+    /// How to lay out a generated docstring, or `None` to generate none.
+    ///
+    /// An unrecognised name reads as the default rather than as "off": a typo
+    /// in a config file should not silently switch a feature off.
+    #[must_use]
+    pub fn docstrings(&self) -> Option<DocstringStyle> {
+        match self.str_at("python", "docstrings") {
+            Some("off" | "none") => None,
+            Some(name) => Some(DocstringStyle::parse(name).unwrap_or_default()),
+            None => Some(DocstringStyle::default()),
+        }
+    }
+
+    pub fn set_docstrings(&mut self, style: Option<DocstringStyle>) {
+        let name = style.map_or("off", DocstringStyle::as_str);
+        self.set("python", "docstrings", value(name));
+    }
+
     /// Server ids the user has switched off.
     #[must_use]
     pub fn disabled_servers(&self) -> Vec<String> {
@@ -732,6 +805,43 @@ whatever = true
         for pref in ThemePreference::ALL {
             s.set_theme(pref);
             assert_eq!(from_toml(&s.to_toml()).theme(), pref);
+        }
+    }
+
+    #[test]
+    fn docstrings_default_to_google_and_can_be_turned_off() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.docstrings(),
+            Some(DocstringStyle::Google),
+            "the documented default"
+        );
+
+        settings.set_docstrings(None);
+        assert_eq!(settings.docstrings(), None);
+        assert!(
+            settings.to_toml().contains("docstrings = \"off\""),
+            "off is written out as a word, not by deleting the key"
+        );
+
+        settings.set_docstrings(Some(DocstringStyle::Sphinx));
+        assert_eq!(settings.docstrings(), Some(DocstringStyle::Sphinx));
+    }
+
+    /// A typo in a hand-edited config should not silently switch a feature
+    /// off — that is indistinguishable from a bug in the editor.
+    #[test]
+    fn an_unrecognised_docstring_style_falls_back_rather_than_off() {
+        let settings = from_toml("[python]\ndocstrings = \"gooogle\"\n");
+        assert_eq!(settings.docstrings(), Some(DocstringStyle::Google));
+    }
+
+    #[test]
+    fn every_docstring_style_survives_being_written_and_read_back() {
+        for style in DocstringStyle::ALL {
+            let mut settings = Settings::default();
+            settings.set_docstrings(Some(style));
+            assert_eq!(settings.docstrings(), Some(style), "{style:?}");
         }
     }
 }

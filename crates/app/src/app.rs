@@ -428,6 +428,24 @@ impl EditorApp {
             style.spacing.button_padding = egui::vec2(8.0, 4.0);
         });
 
+        // Zoom has one owner, and it is this application.
+        //
+        // egui runs its own Cmd+Plus/Minus/0 handler at the end of every pass,
+        // which moves `Context::zoom_factor` directly and tells nobody. The
+        // View menu's zoom commands move `ui.ui_scale` in the settings, which
+        // is persisted and pushed into the same zoom factor by
+        // `sync_appearance`. Two owners of one number, each unaware of the
+        // other, and they come apart in the ordinary course of use: egui also
+        // binds Cmd+= (a `+` is a shifted `=`, so Ctrl+= never reached the
+        // command table), so every press of the obvious zoom-in key moved the
+        // display without moving the setting. Once the setting had drifted to
+        // the bottom of its range, zooming out stopped doing anything at all
+        // -- the value clamped, `sync_appearance` saw nothing change, and
+        // nothing was pushed to the context -- while zoom in still worked,
+        // because that was egui's handler all along.
+        cc.egui_ctx
+            .options_mut(|options| options.zoom_with_keyboard = false);
+
         let mut app = Self {
             paths,
             log_dir,
@@ -575,6 +593,7 @@ impl EditorApp {
             show_line_numbers: true,
             language: LanguageId::PlainText,
             auto_close_brackets: self.settings.auto_close_brackets(),
+            docstrings: self.settings.docstrings(),
             reduce_motion: self.settings.reduce_motion(),
         };
 
@@ -772,10 +791,27 @@ impl EditorApp {
                 self.active = None;
             }
             Pending::Quit => {
-                self.quit_confirmed = true;
+                self.confirm_quit();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+    }
+
+    /// Agree to the window closing, and take this session's recovery copies
+    /// with it.
+    ///
+    /// The clearing is part of confirming rather than something each caller
+    /// remembers, because there are two ways out of the application and only
+    /// one of them used to do it. Quitting with nothing unsaved cleared the
+    /// store; quitting *after choosing not to save* set the flag by hand and
+    /// returned, and the flag is what stops the close-requested branch running
+    /// a second time — so the clearing it does was skipped, and the copies
+    /// survived. The next start then offered back, as unsaved work rescued
+    /// from a crash, precisely the changes the user had just told it to throw
+    /// away.
+    fn confirm_quit(&mut self) {
+        self.quit_confirmed = true;
+        self.recovery.clear();
     }
 
     /// The Save / Don't Save / Cancel prompt.
@@ -3212,9 +3248,8 @@ impl EditorApp {
             .and_then(|e| e.to_str())
             .map_or(LanguageId::PlainText, LanguageId::from_extension);
 
-        let recovery_id = self.claim_recovery_id();
-        self.docs.push(OpenDoc {
-            recovery_id,
+        let entry = OpenDoc {
+            recovery_id: self.claim_recovery_id(),
             highlighter: new_highlighter(language, &doc),
             doc,
             view: EditorView::default(),
@@ -3226,8 +3261,35 @@ impl EditorApp {
             syntax_due: None,
             disk: DiskState::Unchanged,
             line_count_seen: None,
-        });
-        self.active = Some(self.docs.len() - 1);
+        };
+
+        // The session restore ran earlier in this same frame and has already
+        // reopened the tabs that were open when the crash happened -- and the
+        // file being recovered is very likely one of them, read back from disk
+        // without the changes that are about to be put back. Taking over that
+        // tab rather than adding a second one is the difference between
+        // recovering a file and appearing to open it twice, with the same name
+        // on two tabs and the newer text on whichever one you happen to click.
+        //
+        // Only a buffer with a path can be matched, which is the right rule
+        // rather than a limitation: a buffer that was never saved is not in
+        // the session file either, so there is nothing for it to collide with.
+        let slot = match tab_showing(&self.docs, entry.doc.path()) {
+            Some(slot) => {
+                // The id the reopened tab was given is going out with it. It
+                // has nothing written against it yet -- the tab was opened
+                // clean this session -- but discarding it keeps the store's
+                // bookkeeping honest rather than relying on that.
+                self.recovery.discard(self.docs[slot].recovery_id);
+                self.docs[slot] = entry;
+                slot
+            }
+            None => {
+                self.docs.push(entry);
+                self.docs.len() - 1
+            }
+        };
+        self.active = Some(slot);
         self.sync_watched_files();
     }
 
@@ -4522,7 +4584,7 @@ impl EditorApp {
     }
 
     fn nudge_scale(&mut self, delta: f32) {
-        let next = self.settings.ui_scale() + delta;
+        let next = stepped_scale(self.settings.ui_scale(), delta);
         self.settings.set_ui_scale(next);
         self.persist_settings();
     }
@@ -4540,8 +4602,15 @@ impl EditorApp {
         let scale = self.settings.ui_scale();
         let font_size = self.settings.ui_font_size();
 
+        // Compared against the context's own zoom rather than only against
+        // what was last applied, so the setting stays the authority on the
+        // number even if something else moves it. Tracking "what did I last
+        // push" alone is what let the two come apart in the first place: a
+        // zoom factor changed behind this function's back is a difference it
+        // could not see, and so never corrected.
         let changed = self.applied_theme != Some(resolved)
             || (self.applied_scale - scale).abs() > f32::EPSILON
+            || (ctx.zoom_factor() - scale).abs() > f32::EPSILON
             || (self.applied_ui_font - font_size).abs() > f32::EPSILON;
 
         if changed {
@@ -5361,11 +5430,10 @@ impl eframe::App for EditorApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending = Some(Pending::Quit);
             } else {
-                self.quit_confirmed = true;
                 // Nothing unsaved, and the window is going: this session's
                 // recovery copies would be offered back as crash debris on the
                 // next start, which is worse than useless.
-                self.recovery.clear();
+                self.confirm_quit();
             }
         }
 
@@ -6059,6 +6127,28 @@ fn plain_path(path: PathBuf) -> PathBuf {
     };
     let is_drive = matches!(rest.as_bytes(), [c, b':', b'\\', ..] if c.is_ascii_alphabetic());
     if is_drive { PathBuf::from(rest) } else { path }
+}
+
+/// One step of the zoom, rounded back onto the step.
+///
+/// A tenth is not an `f32`, so adding 0.1 over and over walks 1.1 to 1.1000001
+/// to 1.2000002 and on. The drift is invisible in the rendering and loud
+/// everywhere a number is compared: the value that should read 1.0 no longer
+/// equals the 1.0 that the reset command sets, that the settings slider shows,
+/// and that is written to the settings file.
+fn stepped_scale(scale: f32, delta: f32) -> f32 {
+    ((scale + delta) * 10.0).round() / 10.0
+}
+
+/// The tab already showing `path`, if one is.
+///
+/// The rule, separated from the application state so it can be stated plainly:
+/// a buffer belongs to its file, and a file gets one tab. A buffer with no path
+/// matches nothing -- two untitled buffers are two different pieces of work,
+/// however alike they look.
+fn tab_showing(docs: &[OpenDoc], path: Option<&Path>) -> Option<usize> {
+    let path = path?;
+    docs.iter().position(|d| d.doc.path() == Some(path))
 }
 
 /// What to do about a file that changed underneath an open document.
@@ -6790,6 +6880,91 @@ mod tests {
         // Anything that was never verbatim passes through untouched.
         let plain = PathBuf::from("/home/g/a.py");
         assert_eq!(plain_path(plain.clone()), plain);
+    }
+
+    // ---- zoom ---------------------------------------------------------------
+
+    /// Zooming in and back out again returns to exactly where it started, for
+    /// any number of steps. Without the rounding the value drifts a little
+    /// further from a round number on every press, and eventually the zoom
+    /// people had at 1.0 is a number nothing else in the application agrees
+    /// with.
+    #[test]
+    fn zooming_in_and_out_again_comes_back_to_exactly_where_it_started() {
+        for steps in 1..40 {
+            let mut scale = 1.0_f32;
+            for _ in 0..steps {
+                scale = stepped_scale(scale, 0.1);
+            }
+            for _ in 0..steps {
+                scale = stepped_scale(scale, -0.1);
+            }
+            assert_eq!(scale, 1.0, "after {steps} steps out and back");
+        }
+    }
+
+    /// Every step is a round tenth, so the settings file, the slider and the
+    /// menu all show the same number the user just chose.
+    #[test]
+    fn every_zoom_step_is_a_round_tenth() {
+        let mut scale = 1.0_f32;
+        for _ in 0..20 {
+            scale = stepped_scale(scale, 0.1);
+            assert_eq!(
+                scale * 10.0,
+                (scale * 10.0).round(),
+                "{scale} is not a tenth"
+            );
+        }
+    }
+
+    // ---- recovering into the tabs that are already open -----------------------
+
+    fn open_doc(path: Option<&str>) -> OpenDoc {
+        let path = path.map(PathBuf::from);
+        OpenDoc {
+            recovery_id: 1,
+            doc: Document::recovered(path, "text"),
+            view: EditorView::default(),
+            language: LanguageId::PlainText,
+            highlighter: None,
+            find: FindBar::default(),
+            pending_find_step: None,
+            preview: false,
+            syntax_version: None,
+            syntax_due: None,
+            disk: DiskState::Unchanged,
+            line_count_seen: None,
+        }
+    }
+
+    /// The session restore reopens the tabs that were open when the crash
+    /// happened, so by the time the recovery prompt is answered the file being
+    /// recovered is usually already on screen -- read back from disk, without
+    /// the changes. Restoring must take that tab over rather than adding a
+    /// second one, or accepting the recovery leaves the same file open twice
+    /// with different text on each tab.
+    #[test]
+    fn a_recovered_file_finds_the_tab_the_session_restore_already_opened() {
+        let docs = vec![
+            open_doc(Some("/project/other.py")),
+            open_doc(Some("/project/main.py")),
+        ];
+        assert_eq!(
+            tab_showing(&docs, Some(Path::new("/project/main.py"))),
+            Some(1)
+        );
+        assert_eq!(tab_showing(&docs, Some(Path::new("/project/new.py"))), None);
+    }
+
+    /// A buffer that was never saved has no file to collide over. It is not in
+    /// the session file either, so there is nothing on screen for it to be a
+    /// second copy of, and it always gets a tab of its own -- even beside
+    /// another untitled buffer.
+    #[test]
+    fn an_unsaved_buffer_never_takes_over_somebody_elses_tab() {
+        let docs = vec![open_doc(None), open_doc(Some("/project/main.py"))];
+        assert_eq!(tab_showing(&docs, None), None);
     }
 
     /// A clean buffer is re-read without asking; a dirty one never is. Getting

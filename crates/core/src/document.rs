@@ -11,6 +11,7 @@
 //! display and save.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
@@ -159,10 +160,32 @@ pub struct Document {
     disk_mtime: Option<SystemTime>,
 }
 
+/// Source of document versions.
+///
+/// Global rather than per-document, so that a version identifies *a text*
+/// rather than a position in one document's history. Everything derived from a
+/// document is cached against this number — the fold ranges, the search
+/// results, the outline, the copy a language server has been sent — and
+/// reloading a file after another program changed it replaces the `Document`
+/// behind a view that keeps all of them. With a counter per document the
+/// replacement started at 0 again, so every one of those caches was told
+/// nothing had changed: the fold chevrons stayed on the lines the old text put
+/// them on, beside blank lines in the new one.
+///
+/// Starts at 1, leaving 0 to mean "no version" — which is what a recovered
+/// buffer uses to be dirty from the first frame.
+static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
+
+/// The next version, unique across every document in the process.
+fn next_version() -> u64 {
+    NEXT_VERSION.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Document {
     /// A new unsaved document.
     #[must_use]
     pub fn untitled() -> Self {
+        let version = next_version();
         Self {
             path: None,
             text: Rope::new(),
@@ -172,8 +195,8 @@ impl Document {
             large: false,
             history: History::default(),
             pending: Vec::new(),
-            version: 0,
-            saved_version: 0,
+            version,
+            saved_version: version,
             disk_mtime: None,
         }
     }
@@ -200,7 +223,8 @@ impl Document {
             large: false,
             history: History::default(),
             pending: Vec::new(),
-            version: 1,
+            version: next_version(),
+            // Never written to `path`, so no version of it has been saved.
             saved_version: 0,
             // Unknown rather than "now": claiming to have read the file at this
             // moment would suppress the very warning the user needs if the file
@@ -255,6 +279,9 @@ impl Document {
             None
         };
 
+        // The text on disk and the text in the buffer are the same one, so
+        // both counters start at the same version and the document is clean.
+        let opened = next_version();
         Ok(Self {
             path: Some(path.to_path_buf()),
             text: Rope::from_str(&normalised),
@@ -264,8 +291,8 @@ impl Document {
             large,
             history: History::default(),
             pending: Vec::new(),
-            version: 0,
-            saved_version: 0,
+            version: opened,
+            saved_version: opened,
             disk_mtime: meta.modified().ok(),
         })
     }
@@ -335,7 +362,7 @@ impl Document {
         let applied = edit::apply(&mut self.text, tx);
         self.history
             .push(tx.clone(), applied.inverse, before, after);
-        self.version = self.version.wrapping_add(1);
+        self.version = next_version();
         self.pending.extend(applied.changes.iter().cloned());
         applied.changes
     }
@@ -356,11 +383,14 @@ impl Document {
         !self.pending.is_empty()
     }
 
-    /// A counter bumped by every mutation.
+    /// A number identifying this document's current text.
     ///
     /// Lets a consumer cache something derived from the text — search results,
     /// a symbol list — and notice cheaply when it has gone stale, without
-    /// comparing the contents.
+    /// comparing the contents. Unique across documents as well as across
+    /// edits, so a cache held by a view whose document was swapped underneath
+    /// it — which is what reloading from disk does — sees a version it has
+    /// never been given before rather than the replacement's first one.
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
@@ -371,7 +401,7 @@ impl Document {
     pub fn undo(&mut self) -> Option<Selection> {
         let step = self.history.undo()?;
         let applied = edit::apply(&mut self.text, &step.transaction);
-        self.version = self.version.wrapping_add(1);
+        self.version = next_version();
         self.pending.extend(applied.changes);
         Some(step.selection.clamped(self.text.len_chars()))
     }
@@ -380,7 +410,7 @@ impl Document {
     pub fn redo(&mut self) -> Option<Selection> {
         let step = self.history.redo()?;
         let applied = edit::apply(&mut self.text, &step.transaction);
-        self.version = self.version.wrapping_add(1);
+        self.version = next_version();
         self.pending.extend(applied.changes);
         Some(step.selection.clamped(self.text.len_chars()))
     }
@@ -513,7 +543,7 @@ impl Document {
     pub fn set_line_ending(&mut self, ending: LineEnding) {
         if self.line_ending != ending {
             self.line_ending = ending;
-            self.version = self.version.wrapping_add(1);
+            self.version = next_version();
         }
     }
 
@@ -909,5 +939,44 @@ mod tests {
     #[test]
     fn an_untitled_document_is_never_reported_as_changed_or_deleted() {
         assert_eq!(Document::untitled().disk_state(), DiskState::Unchanged);
+    }
+
+    /// Versions identify a text, not a place in one document's history. A
+    /// reload swaps the `Document` behind a view that is caching folds, search
+    /// results and an outline against this number; when each document counted
+    /// from zero, the replacement's first version was one the view had already
+    /// seen and every cache stayed put.
+    #[test]
+    fn no_two_documents_share_a_version() {
+        let a = Document::untitled();
+        let b = Document::untitled();
+        assert_ne!(a.version(), b.version());
+        assert_ne!(a.version(), Document::recovered(None, "x").version());
+    }
+
+    /// And an edit never produces a version that some earlier document already
+    /// used, which is the same guarantee seen from the other side.
+    #[test]
+    fn an_edit_produces_a_version_nobody_has_seen() {
+        let mut doc = Document::untitled();
+        let seen = doc.version();
+        let other = Document::untitled().version();
+        doc.apply(
+            &Transaction::insert(0, "hello"),
+            Selection::at(0),
+            Selection::at(5),
+        );
+        assert_ne!(doc.version(), seen);
+        assert_ne!(doc.version(), other);
+    }
+
+    /// A freshly opened or new document is clean; a recovered one is not.
+    #[test]
+    fn dirtiness_survives_the_change_of_counter() {
+        assert!(!Document::untitled().is_dirty());
+        assert!(
+            Document::recovered(None, "work").is_dirty(),
+            "recovered text has never been written to its path"
+        );
     }
 }

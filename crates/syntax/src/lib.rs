@@ -6,6 +6,7 @@
 //! `Tree::edit` on every transaction. See PLAN.md §3.5.
 
 pub mod brackets;
+pub mod docstring;
 pub mod errors;
 pub mod highlight;
 pub mod hover;

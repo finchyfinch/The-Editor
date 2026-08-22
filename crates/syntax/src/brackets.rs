@@ -107,17 +107,20 @@ fn ends_are_brackets(node: &Node<'_>, text: &Rope) -> Option<BracketPair> {
 /// is a function body, a block, an object, an element, without naming any of
 /// them.
 ///
-/// Three refinements, all learned by looking at the output. The root is
+/// Four refinements, all learned by looking at the output. The root is
 /// excluded, or the first line of every file offers to fold the whole file
 /// away. Where several nodes start on one line the *narrowest* wins: a `def`
 /// line begins both the definition and, in Python, the body block that runs
 /// past the end of the `if` inside it, and folding at `if True:` should
 /// collapse the `if`, not everything after it.
 ///
-/// And Python's `block` is skipped, because it is the body of the `def` or
-/// `if` above it and starts on the body's first statement: folding it would
-/// leave a chevron beside `x = 1` and hide only what came after. Fold the
-/// header instead.
+/// Python's `block` is skipped, because it is the body of the `def` or `if`
+/// above it and starts on the body's first statement: folding it would leave a
+/// chevron beside `x = 1` and hide only what came after. Fold the header
+/// instead.
+///
+/// And ERROR nodes are skipped, because their extent is where the parser gave
+/// up rather than anything foldable.
 #[must_use]
 pub fn fold_ranges(tree: &Tree, text: &Rope) -> Vec<FoldRange> {
     let mut found: Vec<FoldRange> = Vec::new();
@@ -143,6 +146,23 @@ pub fn fold_ranges(tree: &Tree, text: &Rope) -> Vec<FoldRange> {
         // every final method in a class. In Rust a `block` shares its header's
         // line and is deduplicated anyway, so naming it costs nothing there.
         let is_a_body = node.kind() == "block";
+
+        if node.is_error() || node.is_missing() {
+            // Nothing inside an error region is foldable, and neither is the
+            // region itself. An ERROR node's extent is where the parser gave
+            // up, not a structure: one unclosed bracket puts every statement
+            // to the end of the file inside one, and each multi-line node the
+            // recovery invents offers a chevron beside a line that is plainly
+            // one statement. What it recovers in there is not worth keeping
+            // either — an unclosed `(` produced a `call` whose function was an
+            // integer.
+            //
+            // So the whole subtree goes, children included. A file mid-edit
+            // loses the folds below the error until the bracket is closed,
+            // which is the same bargain the rest of this module makes: no
+            // marker is better than a marker that hides the wrong lines.
+            continue;
+        }
 
         if last > first && node.child_count() > 0 && node.id() != root && !is_a_body {
             found.push(FoldRange { first, last });
@@ -352,6 +372,78 @@ class A:
             assert!(
                 folds.windows(2).all(|w| w[0].first <= w[1].first),
                 "{folds:?}"
+            );
+        });
+    }
+
+    /// A file the grammar cannot fully parse still gets folds where the
+    /// structure is intact — but not a chevron beside every plain statement in
+    /// the wreckage. The ERROR node covering them spans many lines and has
+    /// children, which was enough to qualify.
+    #[test]
+    fn a_parse_error_does_not_make_every_statement_foldable() {
+        let source = "def f(self):
+    x = (1, 2
+    print(mame_exe_path)
+
+    xml_cache_path = os.path.join(_path_to_cache, 'x.xml')
+    logger.info(_('Trying to read the XML cache'))
+    data, cache_valid = self._read_and_validate(xml_cache_path)
+    return data
+";
+        with_tree(LanguageId::Python, source, |tree, text| {
+            let folds = fold_ranges(tree, text);
+            for line in [2, 3, 4, 5, 6, 7] {
+                assert!(
+                    !folds.iter().any(|f| f.first == line),
+                    "line {line} is one statement and cannot fold: {folds:?}"
+                );
+            }
+            assert!(
+                folds.iter().any(|f| f.first == 0),
+                "the def is still foldable: {folds:?}"
+            );
+        });
+    }
+
+    /// An unclosed bracket swallows the rest of the file into one ERROR, and
+    /// the nodes tree-sitter invents in there are nonsense — this one built a
+    /// `call` whose function was an integer, spanning three lines. Better no
+    /// chevron than one that hides lines nobody grouped together.
+    #[test]
+    fn an_unclosed_bracket_offers_no_folds_at_all() {
+        let source = "x = (1, 2
+
+def g():
+    return 1
+";
+        with_tree(LanguageId::Python, source, |tree, text| {
+            let folds = fold_ranges(tree, text);
+            assert!(folds.is_empty(), "got {folds:?}");
+        });
+    }
+
+    /// The error is contained where the parser can contain it: a broken line
+    /// inside a function does not cost the function its own fold.
+    #[test]
+    fn structure_around_an_error_still_folds() {
+        let source = "def f():
+    y = ]
+    return 1
+
+
+def g():
+    return 2
+";
+        with_tree(LanguageId::Python, source, |tree, text| {
+            let folds = fold_ranges(tree, text);
+            assert!(
+                folds.iter().any(|f| f.first == 0),
+                "the broken function still folds: {folds:?}"
+            );
+            assert!(
+                folds.iter().any(|f| f.first == 5 && f.last == 6),
+                "and so does the good one after it: {folds:?}"
             );
         });
     }

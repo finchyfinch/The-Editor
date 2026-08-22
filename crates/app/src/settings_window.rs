@@ -16,6 +16,7 @@
 //! silently does nothing is worse than not offering it, which is why
 //! `editor.word_wrap` and `ui.syntax_theme` are absent until they are built.
 
+use editor_config::settings::DocstringStyle;
 use editor_config::settings::Renderer;
 use editor_config::settings::Settings;
 use editor_config::settings::UnderlineDiagnostics;
@@ -518,6 +519,33 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
 
     changed |= row(
         ui,
+        "Python docstrings",
+        "Typing \"\"\" on the first line of a def or class body writes a docstring \
+         skeleton from the signature above it: one entry per parameter, the \
+         return type, and anything the body raises. The layouts differ only in \
+         how they are written down -- pick whichever the project already uses.",
+        |ui| {
+            let mut style = settings.docstrings();
+            let before = style;
+            let label = style.map_or("Off", DocstringStyle::label);
+            egui::ComboBox::from_id_salt("docstrings")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut style, None, "Off");
+                    for option in DocstringStyle::ALL {
+                        ui.selectable_value(&mut style, Some(option), option.label());
+                    }
+                });
+            if style != before {
+                settings.set_docstrings(style);
+                return true;
+            }
+            false
+        },
+    );
+
+    changed |= row(
+        ui,
         "Graphics backend",
         "glow (OpenGL) starts about sixteen times faster than wgpu and looks \
          identical, which is why it is the default. Switch to wgpu only if the \
@@ -626,6 +654,11 @@ mod tests {
 
         settings.set_auto_close_brackets(false);
         assert!(!settings.auto_close_brackets());
+
+        settings.set_docstrings(Some(DocstringStyle::Numpy));
+        assert_eq!(settings.docstrings(), Some(DocstringStyle::Numpy));
+        settings.set_docstrings(None);
+        assert_eq!(settings.docstrings(), None);
         settings.set_reduce_motion(true);
         assert!(settings.reduce_motion());
         settings.set_renderer(Renderer::Wgpu);

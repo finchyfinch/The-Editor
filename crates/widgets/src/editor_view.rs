@@ -19,6 +19,7 @@ use editor_core::edit::Transaction;
 use editor_core::selection::Selection;
 use editor_core::word;
 use editor_syntax::LanguageId;
+use editor_syntax::docstring;
 use editor_syntax::highlight::Highlighter;
 use editor_syntax::indent::{self, IndentOptions};
 use editor_syntax::methods;
@@ -47,6 +48,41 @@ struct Resting {
     at: egui::Pos2,
     /// When it arrived here.
     since: std::time::Instant,
+}
+
+/// What the pointer is over, left to right across the view.
+///
+/// One description of the geometry, shared by the click handler and the
+/// pointer shape. They were separate arithmetic to begin with, which is the
+/// arrangement where the cursor promises a click that does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zone {
+    /// Blame and the change bar: something to read, not something to act on.
+    Annotation,
+    /// The breakpoint strip.
+    Breakpoints,
+    /// The line numbers.
+    Numbers,
+    /// The fold chevrons, at the right-hand edge of the gutter.
+    Folds,
+    /// The code itself.
+    Text,
+}
+
+/// One frame's worth of pointer gesture, lifted out of an [`egui::Response`].
+///
+/// A plain record rather than the response itself, so the rules about what a
+/// click or a drag does to the selection can be exercised without a window.
+#[derive(Debug, Clone, Copy, Default)]
+struct Gesture {
+    clicked: bool,
+    double_clicked: bool,
+    dragged: bool,
+    /// First frame of a drag. The one that has to plant a fresh anchor, since
+    /// the press before it left the old selection untouched.
+    drag_started: bool,
+    alt: bool,
+    shift: bool,
 }
 
 /// Something the pointer has settled on, for the application to describe.
@@ -81,6 +117,9 @@ pub struct EditorOptions {
     /// Drives the indentation, comment and bracket rules.
     pub language: LanguageId,
     pub auto_close_brackets: bool,
+    /// Write a docstring skeleton when `"""` is typed under a `def` or
+    /// `class`, in this layout. `None` leaves the quotes alone.
+    pub docstrings: Option<docstring::Style>,
     /// Stop the caret blinking and other repeating animation.
     pub reduce_motion: bool,
 }
@@ -94,6 +133,7 @@ impl Default for EditorOptions {
             show_line_numbers: true,
             language: LanguageId::PlainText,
             auto_close_brackets: true,
+            docstrings: Some(docstring::Style::Google),
             reduce_motion: false,
         }
     }
@@ -154,6 +194,11 @@ pub struct EditorView {
     /// Line count as of the last rebuild, so collapsed folds can be moved with
     /// the lines they were put on.
     folds_line_count: usize,
+    /// Whether `folds` was read off a tree that had not finished reparsing.
+    ///
+    /// Tracked because catching up does not change the document version, so
+    /// the version check alone would never look at the tree again.
+    folds_stale: bool,
     /// Which line each visible row shows. The identity while nothing is
     /// folded, which is almost always.
     fold_map: crate::folding::FoldMap,
@@ -661,11 +706,24 @@ impl EditorView {
             .show(ui, |ui| {
                 // Claim the whole document; the scroll area decides what of it
                 // is on screen.
+                //
+                // At least the height of the viewport, for the same reason the
+                // width is at least its width: the blank space under a short
+                // file is part of the editor, and clicking it means "put the
+                // caret at the end", the way it does in every other editor.
+                // Allocated to exactly the text's height, that space belonged
+                // to the scroll area's background instead -- the click landed
+                // on nothing, the caret did not move, and the editor did not
+                // even take focus, so the next thing typed went nowhere.
+                //
+                // The rows past the end of the text are only ever hit-tested,
+                // never painted: the paint loop's last row is capped by the
+                // document, not by this rectangle.
                 let widest = 120.0 * space_width;
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(
                         (gutter_width + widest).max(ui.available_width()),
-                        row_height * row_count as f32,
+                        (row_height * row_count as f32).max(ui.available_height()),
                     ),
                     egui::Sense::click_and_drag(),
                 );
@@ -697,11 +755,20 @@ impl EditorView {
                     });
                 }
 
-                // The code pane *is* text, so here the I-beam is correct.
-                let response = response.on_hover_cursor(egui::CursorIcon::Text);
-                self.describe_for_screen_readers(ui, doc, &response);
-
                 let text_left = rect.left() + gutter_width;
+
+                // The pointer says what a click here would do. Mid-drag it
+                // says nothing new: the drag began in the text and is still a
+                // selection however far into the gutter it wanders.
+                let icon = if response.dragged() {
+                    egui::CursorIcon::Text
+                } else {
+                    response.hover_pos().map_or(egui::CursorIcon::Text, |pos| {
+                        self.cursor_icon(doc, pos, rect, text_left, row_height)
+                    })
+                };
+                let response = response.on_hover_cursor(icon);
+                self.describe_for_screen_readers(ui, doc, &response);
                 self.track_pointer(ui, doc, &response, &font, rect, text_left, row_height);
                 let visible = ui.clip_rect().intersect(rect);
                 let rows_per_page = (visible.height() / row_height).floor().max(1.0) as usize;
@@ -881,6 +948,57 @@ impl EditorView {
         })
     }
 
+    /// Which column `x` falls in.
+    ///
+    /// The order of these tests is the order the gutter is laid out in, so a
+    /// column that has been given no width simply never matches.
+    fn zone_at(&self, x: f32, rect: egui::Rect, text_left: f32, row_height: f32) -> Zone {
+        let gutter_left = rect.left() + self.blame_width + CHANGE_COLUMN;
+        if x < gutter_left {
+            Zone::Annotation
+        } else if x < gutter_left + row_height {
+            Zone::Breakpoints
+        } else if x >= text_left {
+            Zone::Text
+        } else if x >= text_left - row_height {
+            Zone::Folds
+        } else {
+            Zone::Numbers
+        }
+    }
+
+    /// The document line drawn at height `y`.
+    fn line_at_pos(&self, y: f32, rect: egui::Rect, row_height: f32) -> usize {
+        let row = ((y - rect.top()) / row_height).floor().max(0.0) as usize;
+        self.fold_map.line_at(row)
+    }
+
+    /// The pointer to show at `pos`.
+    ///
+    /// An I-beam over the code, because the code is text. A hand over the two
+    /// things in the gutter that act on a click — and only where they actually
+    /// would: the fold column is mostly empty, and a hand beside a line with no
+    /// chevron on it promises something that does not happen. Everywhere else
+    /// the ordinary arrow, which is what a column you can only read deserves.
+    fn cursor_icon(
+        &self,
+        doc: &Document,
+        pos: egui::Pos2,
+        rect: egui::Rect,
+        text_left: f32,
+        row_height: f32,
+    ) -> egui::CursorIcon {
+        let line = self.line_at_pos(pos.y, rect, row_height);
+        match self.zone_at(pos.x, rect, text_left, row_height) {
+            Zone::Text => egui::CursorIcon::Text,
+            Zone::Breakpoints if line < doc.line_count() => egui::CursorIcon::PointingHand,
+            Zone::Folds if self.folds.iter().any(|f| f.first == line) => {
+                egui::CursorIcon::PointingHand
+            }
+            _ => egui::CursorIcon::Default,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse(
         &mut self,
@@ -901,64 +1019,116 @@ impl EditorView {
 
         response.request_focus();
 
-        // The blame and change columns are at the very left and take no clicks:
-        // both are something to read, not something to act on.
-        let gutter_left = rect.left() + self.blame_width + CHANGE_COLUMN;
-        if response.clicked() && pos.x < gutter_left {
-            return false;
-        }
-
-        // A click in the breakpoint column sets one, which is how every other
-        // editor does it and the first thing anyone tries. Handled before the
-        // caret moves, so the click does not also jump the caret to line 1.
-        if response.clicked() && pos.x < gutter_left + row_height {
-            let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
-            let line = self.fold_map.line_at(row);
-            if line < doc.line_count() {
-                self.toggle_breakpoint = Some(line);
+        // The gutter takes clicks of its own. Dragging through it is still a
+        // selection, so only a click is intercepted here.
+        if response.clicked() {
+            let line = self.line_at_pos(pos.y, rect, row_height);
+            match self.zone_at(pos.x, rect, text_left, row_height) {
+                // Blame and the change bar are something to read.
+                Zone::Annotation => return false,
+                // Setting a breakpoint by clicking the gutter is how every
+                // other editor does it and the first thing anyone tries.
+                // Handled before the caret moves, so the click does not also
+                // jump the caret to line 1.
+                Zone::Breakpoints => {
+                    if line < doc.line_count() {
+                        self.toggle_breakpoint = Some(line);
+                    }
+                    return false;
+                }
+                Zone::Folds => {
+                    if self.folds.iter().any(|f| f.first == line) {
+                        self.toggle_fold(line);
+                    }
+                    return false;
+                }
+                // A click on a line number puts the caret at the start of that
+                // line, which is what falling through does.
+                Zone::Numbers | Zone::Text => {}
             }
-            return false;
-        }
-
-        // The fold column sits at the right-hand edge of the gutter, just
-        // before the text.
-        if response.clicked() && pos.x >= text_left - row_height && pos.x < text_left {
-            let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
-            let line = self.fold_map.line_at(row);
-            if self.folds.iter().any(|f| f.first == line) {
-                self.toggle_fold(line);
-            }
-            return false;
         }
 
         let offset = self.offset_at_pos(ui, doc, font, pos, rect, text_left, row_height);
 
         let (alt, shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
 
-        if alt && response.dragged() {
+        // Where the button went down, for a drag that is only just starting.
+        // `interact_pointer_pos` follows the live pointer, and egui does not
+        // call a press a drag until it has travelled past the drag threshold,
+        // so by this frame `pos` can already be a character or two along from
+        // the character the user actually pressed on.
+        let press_offset = if response.drag_started() {
+            ui.input(|i| i.pointer.press_origin())
+                .map_or(offset, |origin| {
+                    self.offset_at_pos(ui, doc, font, origin, rect, text_left, row_height)
+                })
+        } else {
+            offset
+        };
+
+        self.apply_pointer(
+            doc,
+            Gesture {
+                clicked: response.clicked(),
+                double_clicked: response.double_clicked(),
+                dragged: response.dragged(),
+                drag_started: response.drag_started(),
+                alt,
+                shift,
+            },
+            offset,
+            press_offset,
+        );
+        false
+    }
+
+    /// What a pointer gesture does to the selection.
+    ///
+    /// Split out of [`Self::handle_mouse`] because everything above it is
+    /// hit-testing that needs a live egui context, while this is a rule about
+    /// anchors that can be stated — and tested — in offsets alone.
+    fn apply_pointer(&mut self, doc: &Document, g: Gesture, offset: usize, press_offset: usize) {
+        if g.alt && g.dragged {
             // Alt+drag is a column selection: the rectangle between where the
             // drag began and where the pointer is, one caret per line. Held
             // separately from `column_anchor` because the offset the drag
             // started at is not recoverable from the selection once the first
             // frame of the drag has rewritten it.
-            let anchor = *self.column_anchor.get_or_insert(offset);
+            if g.drag_started {
+                // Anchor this drag, not the one before it.
+                self.column_anchor = None;
+            }
+            let anchor = *self.column_anchor.get_or_insert(press_offset);
             self.select_column(doc, anchor, offset);
             self.goal_column = None;
             self.touch();
-            return false;
+            return;
         }
         self.column_anchor = None;
 
-        if response.double_clicked() {
+        if g.double_clicked {
             self.collapse_cursors();
             self.selection = word_at(doc, offset);
-        } else if alt && response.clicked() {
+        } else if g.alt && g.clicked {
             // Alt+click adds a caret, and Alt+clicking one that is already
             // there takes it away again — otherwise a misplaced caret can only
             // be undone by starting over.
             self.toggle_cursor_at(offset);
-        } else if response.dragged() || shift {
+        } else if g.dragged || g.shift {
             // Dragging or shift-clicking extends from the existing anchor.
+            //
+            // A drag that is only just starting has no anchor of its own yet,
+            // so it drops one where the button went down. Without that it goes
+            // on extending whatever the previous drag selected: the press
+            // itself changes nothing (egui reports a click on release, and a
+            // drag only once the pointer has moved), so by the time the drag
+            // is recognised the stale anchor is still sitting there. Shift is
+            // the exception — shift+drag is asking to extend what is already
+            // selected.
+            if g.drag_started && !g.shift {
+                self.collapse_cursors();
+                self.selection = Selection::at(press_offset);
+            }
             self.selection = self.selection.extended_to(offset);
         } else {
             self.collapse_cursors();
@@ -967,7 +1137,6 @@ impl EditorView {
 
         self.goal_column = None;
         self.touch();
-        false
     }
 
     /// Add a caret at `offset`, or remove the one already there.
@@ -1038,6 +1207,37 @@ impl EditorView {
         self.install_cursors(cursors, primary);
     }
 
+    /// Where the caret goes for a click in the blank space under the text, or
+    /// `None` if this click is on a row that has text in it.
+    ///
+    /// Below the last row there is no line to measure against and no column the
+    /// pointer can be said to be over, so the caret goes to the end of the last
+    /// line rather than to whatever column the x happens to fall in. That is
+    /// what every other editor does, and the only answer that does not depend
+    /// on how far along an empty strip you clicked.
+    ///
+    /// `line_at` clamps to the last *visible* row, so with the tail of the file
+    /// folded away this lands at the end of the fold's header rather than
+    /// somewhere inside text the user cannot see.
+    ///
+    /// Split out of [`Self::offset_at_pos`] for the reason [`Self::apply_pointer`]
+    /// is split out of [`Self::handle_mouse`]: measuring a column needs a live
+    /// egui context to lay text out, while this is a rule about offsets that can
+    /// be stated -- and tested -- without one.
+    fn offset_below_last_row(
+        &self,
+        doc: &Document,
+        y: f32,
+        rect: egui::Rect,
+        row_height: f32,
+    ) -> Option<usize> {
+        let row = ((y - rect.top()) / row_height).floor().max(0.0) as usize;
+        if row < self.fold_map.visible_rows() {
+            return None;
+        }
+        Some(doc.offset_at(self.fold_map.line_at(row), usize::MAX))
+    }
+
     /// Map a screen position to a character offset.
     #[allow(clippy::too_many_arguments)]
     fn offset_at_pos(
@@ -1052,6 +1252,10 @@ impl EditorView {
     ) -> usize {
         let row = ((pos.y - rect.top()) / row_height).floor().max(0.0) as usize;
         let line = self.fold_map.line_at(row);
+
+        if let Some(offset) = self.offset_below_last_row(doc, pos.y, rect, row_height) {
+            return offset;
+        }
 
         // Lay the line out and ask the galley, rather than assuming every
         // glyph is one character wide.
@@ -1397,6 +1601,21 @@ impl EditorView {
             return changed;
         }
 
+        // The third quote of a triple. Typing one quote gives a pair to type
+        // between, and the pair is exactly what makes typing a triple awkward:
+        // by the third keystroke the buffer holds two quotes and the caret is
+        // past them, and every further quote either steps over something or
+        // adds another pair. Recognising the triple ends that, and is also the
+        // one moment where what is being written is unambiguous.
+        if matches!(c, '"' | '\'')
+            && opts.language == LanguageId::Python
+            && self.selection.is_empty()
+            && self.secondary.is_empty()
+            && completes_triple_quote(doc, self.selection.head, c)
+        {
+            return self.open_triple_quote(doc, opts, c);
+        }
+
         if let Some(closer) = indent::auto_close(opts.language, c)
             && should_auto_close(doc, self.selection.head, c)
         {
@@ -1449,6 +1668,60 @@ impl EditorView {
             after,
         );
         self.selection = after.clamped(doc.len_chars());
+    }
+
+    /// Finish a triple quote, and fill it in if it is a docstring.
+    ///
+    /// Two quotes are already in the buffer and the third is being typed. The
+    /// closing three go in with it, so the string is terminated from the
+    /// moment it is opened — an unterminated one turns the rest of the file
+    /// into a string, which colours it wrongly and stops it parsing.
+    fn open_triple_quote(&mut self, doc: &mut Document, opts: EditorOptions, quote: char) -> bool {
+        let head = self.selection.head;
+        let opened = head - 2;
+        let line = doc.line_of(opened);
+
+        if let Some(style) = opts.docstrings
+            && quote == '"'
+            // Only when the quotes are the first thing on their line. A triple
+            // quote in the middle of an expression is a string, whatever is
+            // above it.
+            && doc.text().slice(doc.line_start(line)..opened).chars().all(char::is_whitespace)
+            && let Some(definition) = docstring::definition_above(doc.text(), line)
+        {
+            let indent: String = doc
+                .line_text(line)
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let unit = if opts.insert_spaces {
+                " ".repeat(opts.tab_width)
+            } else {
+                "\t".to_owned()
+            };
+            let (body, caret) = docstring::render(&definition, style, &indent, &unit);
+
+            // Added after the two quotes already typed rather than replacing
+            // them, because a plain insertion at the caret folds into the undo
+            // entry those quotes made: one Ctrl+Z then takes back the whole
+            // docstring instead of leaving two quotes behind. A dozen lines
+            // that have to be deleted by hand would be worse than not
+            // offering them.
+            let rest: String = body.chars().skip(2).collect();
+            let changed = self.insert(doc, &rest);
+            self.selection = Selection::at(opened + caret);
+            // The summary typed next is its own entry, not an extension of
+            // this one.
+            doc.break_undo_run();
+            self.scroll_to_caret = true;
+            return changed;
+        }
+
+        let closer: String = std::iter::repeat_n(quote, 4).collect();
+        let changed = self.insert(doc, &closer);
+        // Between the two triples, which is where the string goes.
+        self.selection = Selection::at(head + 1);
+        changed
     }
 
     fn insert(&mut self, doc: &mut Document, text: &str) -> bool {
@@ -1943,9 +2216,14 @@ impl EditorView {
         let line_count = doc.text().len_lines();
         let first = (((visible.top() - rect.top()) / row_height).floor().max(0.0) as usize)
             .saturating_sub(OVERSCAN_ROWS);
+        // Capped by the document rather than by the row map. A keystroke is
+        // handled earlier in this same frame and applies to `doc` at once,
+        // while the map is rebuilt at the top of the *next* one: backspacing a
+        // selection that spans lines leaves rows here with no line behind
+        // them, and painting one asked the rope for a line past its end.
         let last = ((((visible.bottom() - rect.top()) / row_height).ceil() as usize)
             + OVERSCAN_ROWS)
-            .min(self.fold_map.visible_rows());
+            .min(self.fold_map.rows_within(line_count));
 
         // Highlight exactly the rows about to be painted, and nothing else.
         // This is where "cost tracks the viewport, not the file" is enforced.
@@ -2443,7 +2721,15 @@ impl EditorView {
         let version = doc.version();
         let line_count = doc.line_count();
 
-        if self.folds_version != Some(version) {
+        // A reparse that ran out of time leaves a tree whose extents have been
+        // stretched to fit the edit but whose structure is the one from before
+        // it, and folds read off that sit on lines that open nothing. The
+        // catch-up reparse repairs the tree without touching the document, so
+        // the version check alone would never look at it again — the folds
+        // would stay wrong until the next keystroke.
+        let tree_stale = highlighter.is_some_and(Highlighter::is_stale);
+
+        if self.folds_need_rebuild(version, tree_stale) {
             // Move the collapsed folds with the lines they were put on, before
             // rebuilding against the new tree. Same approximation as the
             // breakpoint gutter: derived from the change in line count rather
@@ -2467,6 +2753,7 @@ impl EditorView {
                 .retain(|line| self.folds.iter().any(|f| f.first == *line));
             self.folds_version = Some(version);
             self.folds_line_count = line_count;
+            self.folds_stale = tree_stale;
             self.rebuild_fold_map(line_count);
         } else if self.fold_map.visible_rows() > line_count
             || (self.fold_map.is_identity() && !self.collapsed.is_empty())
@@ -2474,6 +2761,15 @@ impl EditorView {
             // The document is the same but the map is not: a fold was toggled.
             self.rebuild_fold_map(line_count);
         }
+    }
+
+    /// Whether the fold list has to be walked out of the tree again.
+    ///
+    /// A separate predicate because the second half of it is the easy thing to
+    /// forget: the document is the only obvious input, and the tree changing
+    /// under a document that did not is exactly the case that went unnoticed.
+    fn folds_need_rebuild(&self, version: u64, tree_stale: bool) -> bool {
+        self.folds_version != Some(version) || (self.folds_stale && !tree_stale)
     }
 
     fn rebuild_fold_map(&mut self, line_count: usize) {
@@ -2717,6 +3013,18 @@ fn char_before(doc: &Document, offset: usize) -> Option<char> {
 /// bracket, or the end of the line. Quotes additionally refuse to close when
 /// the character before is a word character, so `it's` and `don't` type
 /// normally.
+/// True when typing `quote` at `offset` would be the third of a triple.
+///
+/// The two before it have to be the same quote, and the one before *those*
+/// must not be: `""""` is not a triple being opened, it is a triple that is
+/// already there being typed past.
+fn completes_triple_quote(doc: &Document, offset: usize, quote: char) -> bool {
+    offset >= 2
+        && char_before(doc, offset) == Some(quote)
+        && char_before(doc, offset - 1) == Some(quote)
+        && char_before(doc, offset - 2) != Some(quote)
+}
+
 fn should_auto_close(doc: &Document, offset: usize, open: char) -> bool {
     if matches!(open, '"' | '\'' | '`')
         && char_before(doc, offset).is_some_and(|c| c.is_alphanumeric() || c == '_')
@@ -4059,5 +4367,848 @@ mod tests {
             view.move_horizontal(&doc, 1, false);
         }
         assert_eq!(view.selection.head, doc.len_chars());
+    }
+
+    // ---- pointer selection -------------------------------------------------
+
+    /// egui reports a drag as: nothing at all on the press, one frame that
+    /// starts the drag once the pointer has moved past the threshold, then a
+    /// frame per move after that. `moved_to` is where the pointer had already
+    /// got to when that first frame arrived, which is not quite where the
+    /// button went down.
+    fn start_drag(view: &mut EditorView, doc: &Document, pressed_at: usize, moved_to: usize) {
+        view.apply_pointer(
+            doc,
+            Gesture {
+                dragged: true,
+                drag_started: true,
+                ..Gesture::default()
+            },
+            moved_to,
+            pressed_at,
+        );
+    }
+
+    fn drag_to(view: &mut EditorView, doc: &Document, offset: usize) {
+        view.apply_pointer(
+            doc,
+            Gesture {
+                dragged: true,
+                ..Gesture::default()
+            },
+            offset,
+            offset,
+        );
+    }
+
+    fn drag(view: &mut EditorView, doc: &Document, from: usize, to: usize) {
+        start_drag(view, doc, from, from);
+        drag_to(view, doc, to);
+    }
+
+    /// The bug this section exists for: dragging over one word and then over
+    /// another used to leave both — and everything between them — selected,
+    /// because the second drag never planted an anchor of its own.
+    #[test]
+    fn a_second_drag_replaces_the_first_selection_rather_than_extending_it() {
+        let doc = doc_with("one two three four");
+        let mut view = EditorView::default();
+
+        drag(&mut view, &doc, 0, 3);
+        assert_eq!(view.selection, Selection::new(0, 3), "\"one\" is selected");
+
+        drag(&mut view, &doc, 8, 13);
+        assert_eq!(
+            view.selection,
+            Selection::new(8, 13),
+            "the second drag selects \"three\" alone, not \"one two three\""
+        );
+    }
+
+    /// The press itself is silent, so the anchor has to come from the frame
+    /// that notices the drag — and by then the pointer has already travelled a
+    /// few pixels, which can be a character.
+    #[test]
+    fn a_drag_anchors_where_the_button_went_down_not_where_it_was_noticed() {
+        let doc = doc_with("one two three four");
+        let mut view = EditorView::default();
+
+        start_drag(&mut view, &doc, 4, 5);
+        drag_to(&mut view, &doc, 7);
+        assert_eq!(
+            view.selection,
+            Selection::new(4, 7),
+            "the selection starts at the pressed character, not the next one"
+        );
+    }
+
+    /// Shift is the one gesture that is asking to extend, so it keeps the
+    /// anchor it already had.
+    #[test]
+    fn shift_dragging_still_extends_the_existing_selection() {
+        let doc = doc_with("one two three four");
+        let mut view = EditorView::default();
+
+        drag(&mut view, &doc, 0, 3);
+        view.apply_pointer(
+            &doc,
+            Gesture {
+                dragged: true,
+                drag_started: true,
+                shift: true,
+                ..Gesture::default()
+            },
+            13,
+            8,
+        );
+        assert_eq!(
+            view.selection,
+            Selection::new(0, 13),
+            "shift+drag reaches out from the old anchor"
+        );
+    }
+
+    /// A fresh drag is a fresh single selection, so any extra carets go with
+    /// the old one — the same as a plain click.
+    #[test]
+    fn a_new_drag_drops_the_extra_carets() {
+        let doc = doc_with("one two three four");
+        let mut view = EditorView::default();
+        view.install_cursors(vec![Selection::at(0), Selection::at(8)], 0);
+        assert_eq!(view.cursor_count(), 2);
+
+        drag(&mut view, &doc, 4, 7);
+        assert_eq!(view.cursor_count(), 1);
+        assert_eq!(view.selection, Selection::new(4, 7));
+    }
+
+    /// Alt+drag had the same stale anchor, held in `column_anchor` instead of
+    /// in the selection: a second rectangle grew out of where the first began.
+    #[test]
+    fn a_second_alt_drag_starts_a_new_rectangle() {
+        let doc = doc_with(
+            "aaaa
+bbbb
+cccc
+dddd
+",
+        );
+        let mut view = EditorView::default();
+
+        let alt_drag = |view: &mut EditorView, from: usize, to: usize| {
+            view.apply_pointer(
+                &doc,
+                Gesture {
+                    dragged: true,
+                    drag_started: true,
+                    alt: true,
+                    ..Gesture::default()
+                },
+                from,
+                from,
+            );
+            view.apply_pointer(
+                &doc,
+                Gesture {
+                    dragged: true,
+                    alt: true,
+                    ..Gesture::default()
+                },
+                to,
+                to,
+            );
+        };
+
+        // A column down the first two lines, then one down the last two.
+        alt_drag(&mut view, 0, 6);
+        assert_eq!(view.cursor_count(), 2);
+
+        alt_drag(&mut view, 10, 16);
+        assert_eq!(
+            view.cursor_count(),
+            2,
+            "the second rectangle covers its own two lines, not all four"
+        );
+        let (cursors, _) = view.cursors();
+        assert_eq!(cursors[0].start(), 10, "and it starts where it was drawn");
+    }
+
+    /// Folding is skipped on frames where nothing has changed, which is what
+    /// keeps scrolling a large file free.
+    #[test]
+    fn folds_are_not_rebuilt_on_an_ordinary_frame() {
+        let view = EditorView {
+            folds_version: Some(7),
+            ..EditorView::default()
+        };
+        assert!(!view.folds_need_rebuild(7, false));
+        assert!(view.folds_need_rebuild(8, false), "an edit rebuilds them");
+    }
+
+    /// The catch-up reparse repairs the tree without touching the document, so
+    /// a rebuild keyed on the document version alone would leave the folds
+    /// read off the half-finished tree in place until the next keystroke.
+    #[test]
+    fn folds_are_rebuilt_when_a_late_reparse_catches_up() {
+        let view = EditorView {
+            folds_version: Some(7),
+            folds_stale: true,
+            ..EditorView::default()
+        };
+
+        assert!(
+            !view.folds_need_rebuild(7, true),
+            "still parsing: nothing better to read yet"
+        );
+        assert!(
+            view.folds_need_rebuild(7, false),
+            "the tree caught up, so the folds taken off the old one are wrong"
+        );
+    }
+
+    /// And once they have been rebuilt from a finished tree, that is the end
+    /// of it — no rebuild on every frame thereafter.
+    #[test]
+    fn catching_up_rebuilds_once_and_then_settles() {
+        let view = EditorView {
+            folds_version: Some(7),
+            folds_stale: false,
+            ..EditorView::default()
+        };
+        assert!(!view.folds_need_rebuild(7, false));
+    }
+
+    /// Reloading a file after another program changed it replaces the
+    /// `Document` behind the view, and the replacement starts its own version
+    /// counter. The folds are cached against that counter, so an unedited
+    /// buffer reloading to unedited-but-different text produced two documents
+    /// both claiming to be version 0 — and the chevrons stayed where the old
+    /// text had put them, beside blank lines in the new one.
+    #[test]
+    fn folds_are_rebuilt_when_the_document_underneath_is_replaced() {
+        let before = doc_with(
+            "def a():
+    pass
+",
+        );
+        let mut view = EditorView::default();
+        let h = Highlighter::new(LanguageId::Python, before.text()).expect("grammar");
+        view.sync_folds(&before, Some(&h));
+        assert!(
+            view.folds.iter().any(|f| f.first == 0),
+            "the def on line 0 folds: {:?}",
+            view.folds
+        );
+
+        // The same file with one line added at the top, as a reload would
+        // bring it: every fold has moved down one.
+        let after = doc_with(
+            "import os
+def a():
+    pass
+",
+        );
+        let h = Highlighter::new(LanguageId::Python, after.text()).expect("grammar");
+        view.sync_folds(&after, Some(&h));
+        assert!(
+            view.folds.iter().any(|f| f.first == 1),
+            "the def is on line 1 now: {:?}",
+            view.folds
+        );
+        assert!(
+            !view.folds.iter().any(|f| f.first == 0),
+            "and nothing folds on line 0, which is an import: {:?}",
+            view.folds
+        );
+    }
+
+    // ---- painting a document that just got shorter -------------------------
+
+    /// Backspacing a selection that spans lines took the whole application
+    /// down. The row map is built at the top of the frame; the keystroke is
+    /// handled later in that same frame and shortens the document at once. In
+    /// a file short enough that its last line is on screen, the paint loop
+    /// then walked to a row the document no longer had, and asked the rope for
+    /// the byte offset of a line past its end — which is a panic, and a panic
+    /// in the paint pass is the process.
+    #[test]
+    fn painting_after_a_multi_line_delete_stays_inside_the_document() {
+        // The file that found it: a docstring of three lines inside a def.
+        let source = "a = 5
+b = 10
+c = 20
+
+def add_numbers(a, b, c):
+    \"\"\"
+
+    \"\"\"
+    result = a + b + c
+    return result
+
+print(add_numbers(a, b, c))
+";
+        let mut doc = doc_with(source);
+        let mut view = EditorView::default();
+        let highlighter = Highlighter::new(LanguageId::Python, doc.text()).expect("grammar");
+
+        // The frame begins: the row map is built for the document as it is.
+        view.sync_folds(&doc, Some(&highlighter));
+        let rows_before = view.fold_map.visible_rows();
+        assert_eq!(rows_before, doc.line_count());
+
+        // The selection in the report: the whole docstring, from the opening
+        // quotes to the closing ones.
+        let start = doc.line_start(5) + 4;
+        let end = doc.line_start(7) + 7;
+        view.selection = Selection::new(start, end);
+        assert!(press(
+            &mut view,
+            &mut doc,
+            egui::Key::Backspace,
+            egui::Modifiers::NONE
+        ));
+        assert_eq!(
+            doc.line_count(),
+            rows_before - 2,
+            "two lines went, and the map still describes them"
+        );
+
+        // What the paint loop does with each row it is about to draw. The last
+        // call is the one that panicked.
+        let line_count = doc.text().len_lines();
+        for row in 0..view.fold_map.rows_within(line_count) {
+            let line = view.fold_map.line_at(row);
+            assert!(line < line_count, "row {row} has no line behind it");
+            let _ = doc.text().line_to_byte(line);
+            let _ = doc.line_text(line);
+        }
+    }
+
+    /// The same guarantee with a fold closed, where a row and its line are
+    /// different numbers.
+    #[test]
+    fn a_shortened_document_is_safe_to_paint_with_a_fold_closed() {
+        let mut doc = doc_with(
+            "def a():
+    x = 1
+    y = 2
+    z = 3
+
+def b():
+    pass
+",
+        );
+        let mut view = EditorView::default();
+        let highlighter = Highlighter::new(LanguageId::Python, doc.text()).expect("grammar");
+        view.sync_folds(&doc, Some(&highlighter));
+        view.toggle_fold(0);
+        assert!(!view.fold_map.is_identity(), "the first def is closed");
+
+        // Delete the last two lines, as a selection to the end of the file.
+        let start = doc.line_start(5);
+        view.selection = Selection::new(start, doc.len_chars());
+        press(
+            &mut view,
+            &mut doc,
+            egui::Key::Backspace,
+            egui::Modifiers::NONE,
+        );
+
+        let line_count = doc.text().len_lines();
+        for row in 0..view.fold_map.rows_within(line_count) {
+            let line = view.fold_map.line_at(row);
+            assert!(line < line_count, "row {row} has no line behind it");
+            let _ = doc.text().line_to_byte(line);
+        }
+    }
+
+    // ---- the pointer over the gutter ---------------------------------------
+
+    /// A view laid out the way `render` lays one out, so the zone arithmetic
+    /// is exercised on real geometry rather than on numbers chosen to pass.
+    fn gutter_view(doc: &Document) -> (EditorView, egui::Rect, f32, f32) {
+        let row_height = 16.0;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 400.0));
+        let mut view = EditorView::default();
+        let highlighter = Highlighter::new(LanguageId::Python, doc.text()).expect("grammar");
+        view.sync_folds(doc, Some(&highlighter));
+        // Breakpoints, numbers and folds: two row-height columns either side of
+        // room for four digits.
+        let text_left = rect.left() + row_height * 2.0 + 40.0;
+        (view, rect, text_left, row_height)
+    }
+
+    fn at(x: f32, line: usize, row_height: f32) -> egui::Pos2 {
+        egui::pos2(x, line as f32 * row_height + 1.0)
+    }
+
+    #[test]
+    fn the_pointer_is_an_i_beam_over_the_code_and_an_arrow_over_the_numbers() {
+        let doc = doc_with(
+            "def f():
+    pass
+",
+        );
+        let (view, rect, text_left, row_height) = gutter_view(&doc);
+
+        assert_eq!(
+            view.cursor_icon(
+                &doc,
+                at(text_left + 30.0, 0, row_height),
+                rect,
+                text_left,
+                row_height
+            ),
+            egui::CursorIcon::Text,
+            "the code pane is text"
+        );
+        assert_eq!(
+            view.cursor_icon(
+                &doc,
+                at(text_left - row_height - 10.0, 0, row_height),
+                rect,
+                text_left,
+                row_height
+            ),
+            egui::CursorIcon::Default,
+            "a line number is not something to click"
+        );
+    }
+
+    /// The two parts of the gutter that act on a click say so.
+    #[test]
+    fn the_pointer_is_a_hand_over_a_breakpoint_and_over_a_chevron() {
+        let doc = doc_with(
+            "def f():
+    pass
+",
+        );
+        let (view, rect, text_left, row_height) = gutter_view(&doc);
+        assert!(
+            view.folds.iter().any(|f| f.first == 0),
+            "line 0 opens a fold: {:?}",
+            view.folds
+        );
+
+        let breakpoints = rect.left() + row_height / 2.0;
+        assert_eq!(
+            view.cursor_icon(
+                &doc,
+                at(breakpoints, 0, row_height),
+                rect,
+                text_left,
+                row_height
+            ),
+            egui::CursorIcon::PointingHand
+        );
+        let chevron = text_left - row_height / 2.0;
+        assert_eq!(
+            view.cursor_icon(
+                &doc,
+                at(chevron, 0, row_height),
+                rect,
+                text_left,
+                row_height
+            ),
+            egui::CursorIcon::PointingHand
+        );
+    }
+
+    /// Most of the fold column is empty, and a hand beside a line with no
+    /// chevron promises a click that does nothing.
+    #[test]
+    fn the_fold_column_is_only_a_hand_where_there_is_a_chevron() {
+        let doc = doc_with(
+            "def f():
+    pass
+",
+        );
+        let (view, rect, text_left, row_height) = gutter_view(&doc);
+        let chevron = text_left - row_height / 2.0;
+        assert_eq!(
+            view.cursor_icon(
+                &doc,
+                at(chevron, 1, row_height),
+                rect,
+                text_left,
+                row_height
+            ),
+            egui::CursorIcon::Default,
+            "line 1 is the body, and folds nothing"
+        );
+    }
+
+    /// Below the last line the breakpoint column still reads as clickable,
+    /// because a click there still does something: the row map clamps a
+    /// pointer past the end to the last line, deliberately, so that clicking
+    /// under a short file means "the end" rather than nothing. The pointer
+    /// follows the click rather than second-guessing it.
+    #[test]
+    fn the_gutter_below_the_last_line_follows_what_a_click_would_do() {
+        let doc = doc_with(
+            "def f():
+    pass
+",
+        );
+        let (mut view, rect, text_left, row_height) = gutter_view(&doc);
+        let breakpoints = rect.left() + row_height / 2.0;
+        assert_eq!(
+            view.cursor_icon(
+                &doc,
+                at(breakpoints, 40, row_height),
+                rect,
+                text_left,
+                row_height
+            ),
+            egui::CursorIcon::PointingHand
+        );
+
+        // And it does: the same position resolves to the last line.
+        let line = view.line_at_pos(at(breakpoints, 40, row_height).y, rect, row_height);
+        assert_eq!(line, doc.line_count() - 1);
+        view.toggle_breakpoint = None;
+    }
+
+    // ---- clicking under the last line --------------------------------------
+
+    /// The blank space under a short file is part of the editor, and clicking
+    /// it puts the caret at the end of the last line -- which is what every
+    /// other editor does, and what the row map was already clamping towards.
+    ///
+    /// What was missing was the space itself: the editor allocated exactly the
+    /// height of its text, so a click below it landed on the scroll area's
+    /// background instead. The caret did not move and the editor did not take
+    /// focus, so the next thing typed went nowhere at all.
+    #[test]
+    fn a_click_under_the_last_line_puts_the_caret_at_the_end_of_it() {
+        let doc = doc_with(
+            "def f():
+    pass
+",
+        );
+        let (view, rect, _text_left, row_height) = gutter_view(&doc);
+
+        // Well below the three rows this file occupies, and far to the left of
+        // where the text ends, so a column-mapped answer would differ.
+        let y = 40.0 * row_height;
+        assert_eq!(
+            view.offset_below_last_row(&doc, y, rect, row_height),
+            Some(doc.len_chars()),
+            "the file ends with a newline, so the last line is the empty one"
+        );
+    }
+
+    /// The same file without its trailing newline: the last line has text on
+    /// it, and the caret goes after that text rather than to the start of it.
+    #[test]
+    fn the_caret_lands_after_the_text_on_the_last_line_not_before_it() {
+        let doc = doc_with(
+            "def f():
+    pass",
+        );
+        let (view, rect, _text_left, row_height) = gutter_view(&doc);
+
+        let offset = view
+            .offset_below_last_row(&doc, 40.0 * row_height, rect, row_height)
+            .expect("below the last row");
+        assert_eq!(offset, doc.len_chars());
+        let (line, column) = doc.line_col(offset);
+        assert_eq!((line, column), (2, 9), "end of `    pass`");
+    }
+
+    /// A click on a row that has text in it is not this rule's business, and
+    /// must fall through to the galley so the column is measured properly.
+    #[test]
+    fn a_click_on_a_row_with_text_in_it_is_left_to_the_galley() {
+        let doc = doc_with(
+            "def f():
+    pass
+",
+        );
+        let (view, rect, _text_left, row_height) = gutter_view(&doc);
+        for row in 0..view.fold_map.visible_rows() {
+            assert_eq!(
+                view.offset_below_last_row(&doc, at(0.0, row, row_height).y, rect, row_height),
+                None,
+                "row {row} has text on it"
+            );
+        }
+    }
+
+    /// With the tail of the file folded away, the blank space below belongs to
+    /// the last row that is actually on screen. Jumping to the end of the
+    /// document would put the caret inside text the user cannot see, and
+    /// scroll a fold open to show them where it went.
+    #[test]
+    fn a_click_under_a_folded_tail_stops_at_the_last_visible_row() {
+        // No trailing newline, so the fold really does reach the end of the
+        // file: a final empty line would still be a visible row below it.
+        let doc = doc_with(
+            "x = 1
+def f():
+    pass
+    pass",
+        );
+        let (mut view, rect, _text_left, row_height) = gutter_view(&doc);
+        view.toggle_fold(1);
+        view.sync_folds(&doc, None);
+        assert!(
+            view.fold_map.visible_rows() < doc.line_count(),
+            "something has to be hidden for this test to mean anything"
+        );
+
+        let offset = view
+            .offset_below_last_row(&doc, 40.0 * row_height, rect, row_height)
+            .expect("below the last visible row");
+        assert_eq!(
+            doc.line_col(offset),
+            (2, 9),
+            "the end of `def f():`, not the end of the file"
+        );
+    }
+
+    /// The pointer and the click handler read the same geometry, so a hand
+    /// always means a click that lands.
+    #[test]
+    fn every_zone_the_pointer_calls_clickable_is_one_the_click_handler_acts_on() {
+        let doc = doc_with(
+            "def f():
+    pass
+",
+        );
+        let (view, rect, text_left, row_height) = gutter_view(&doc);
+        for x in [
+            rect.left() + 1.0,
+            rect.left() + row_height / 2.0,
+            text_left - row_height - 5.0,
+            text_left - row_height / 2.0,
+            text_left + 5.0,
+        ] {
+            let pos = at(x, 0, row_height);
+            let zone = view.zone_at(x, rect, text_left, row_height);
+            let hand = view.cursor_icon(&doc, pos, rect, text_left, row_height)
+                == egui::CursorIcon::PointingHand;
+            assert_eq!(
+                hand,
+                matches!(zone, Zone::Breakpoints | Zone::Folds),
+                "at x={x} the pointer and the zone disagree ({zone:?})"
+            );
+        }
+    }
+
+    // ---- triple quotes and docstrings --------------------------------------
+
+    /// Type `text` a character at a time, the way a keyboard delivers it.
+    fn type_each(view: &mut EditorView, doc: &mut Document, opts: EditorOptions, text: &str) {
+        for c in text.chars() {
+            view.type_text(doc, opts, &c.to_string());
+        }
+    }
+
+    fn python_with(style: Option<docstring::Style>) -> EditorOptions {
+        EditorOptions {
+            language: LanguageId::Python,
+            docstrings: style,
+            ..EditorOptions::default()
+        }
+    }
+
+    /// The friction this replaces: with quotes auto-closing, three keystrokes
+    /// used to leave four quotes and a caret in the middle of them, and the
+    /// closing three had to be fought for. Three keystrokes now open and close
+    /// the string.
+    #[test]
+    fn typing_three_quotes_opens_and_closes_the_string() {
+        let mut doc = doc_with("x = ");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        type_each(&mut view, &mut doc, python_with(None), "\"\"\"");
+
+        assert_eq!(doc.text().to_string(), "x = \"\"\"\"\"\"");
+        assert_eq!(
+            view.selection.head, 7,
+            "the caret sits between the two triples"
+        );
+    }
+
+    /// And typing the closing quotes by hand steps over the ones already
+    /// there rather than adding a second set.
+    #[test]
+    fn typing_the_closing_quotes_walks_over_them() {
+        let mut doc = doc_with("x = ");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        let opts = python_with(None);
+        type_each(&mut view, &mut doc, opts, "\"\"\"hi\"\"\"");
+        assert_eq!(doc.text().to_string(), "x = \"\"\"hi\"\"\"");
+        assert_eq!(view.selection.head, doc.len_chars());
+    }
+
+    #[test]
+    fn single_quotes_make_a_triple_too() {
+        let mut doc = doc_with("x = ");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        type_each(&mut view, &mut doc, python_with(None), "'''");
+        assert_eq!(doc.text().to_string(), "x = ''''''");
+    }
+
+    /// The headline: the skeleton comes from the signature.
+    #[test]
+    fn a_docstring_under_a_def_is_written_from_its_signature() {
+        let mut doc = doc_with("def add(a: int, b: int = 2) -> int:\n    \n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1) + 4);
+        type_each(
+            &mut view,
+            &mut doc,
+            python_with(Some(docstring::Style::Google)),
+            "\"\"\"",
+        );
+
+        assert_eq!(
+            doc.text().to_string(),
+            concat!(
+                "def add(a: int, b: int = 2) -> int:\n",
+                "    \"\"\"\n",
+                "\n",
+                "    Args:\n",
+                "        a (int): _description_\n",
+                "        b (int, optional): _description_\n",
+                "\n",
+                "    Returns:\n",
+                "        int: _description_\n",
+                "    \"\"\"\n",
+            )
+        );
+        let caret_line = doc.line_of(view.selection.head);
+        assert_eq!(caret_line, 1, "the caret is on the summary line");
+        assert_eq!(
+            view.selection.head,
+            doc.line_start(1) + 7,
+            "just past the opening quotes, ready for the summary"
+        );
+    }
+
+    /// A method is indented further, and every line of its docstring has to
+    /// be indented with it.
+    #[test]
+    fn a_docstring_is_indented_to_the_body_it_is_written_in() {
+        let mut doc = doc_with("class A:\n    def f(self, a):\n        \n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(2) + 8);
+        type_each(
+            &mut view,
+            &mut doc,
+            python_with(Some(docstring::Style::Google)),
+            "\"\"\"",
+        );
+
+        let text = doc.text().to_string();
+        assert!(text.contains("        \"\"\"\n"), "{text}");
+        assert!(text.contains("        Args:\n"), "{text}");
+        assert!(text.contains("            a: _description_\n"), "{text}");
+        assert!(
+            !text.contains("self: _description_"),
+            "self is not something a caller passes:\n{text}"
+        );
+    }
+
+    /// Off means off: the quotes still pair, and nothing is written.
+    #[test]
+    fn the_setting_turns_the_writing_off_without_the_pairing() {
+        let mut doc = doc_with("def f(a):\n    \n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1) + 4);
+        type_each(&mut view, &mut doc, python_with(None), "\"\"\"");
+        assert_eq!(doc.text().to_string(), "def f(a):\n    \"\"\"\"\"\"\n");
+    }
+
+    /// A triple quote that is not in a docstring's position is just a string.
+    #[test]
+    fn a_string_elsewhere_in_a_body_is_left_alone() {
+        let mut doc = doc_with("def f(a):\n    x = \n");
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1) + 8);
+        type_each(
+            &mut view,
+            &mut doc,
+            python_with(Some(docstring::Style::Google)),
+            "\"\"\"",
+        );
+        assert_eq!(doc.text().to_string(), "def f(a):\n    x = \"\"\"\"\"\"\n");
+    }
+
+    /// Nor is one written in a language that has no docstrings — or triples.
+    #[test]
+    fn a_language_without_triple_quotes_is_untouched() {
+        let mut doc = doc_with("let x = ");
+        let mut view = EditorView::default();
+        view.set_caret(doc.len_chars());
+        let opts = EditorOptions {
+            language: LanguageId::Rust,
+            ..EditorOptions::default()
+        };
+        type_each(&mut view, &mut doc, opts, "\"\"\"");
+        assert_eq!(
+            doc.text().to_string(),
+            "let x = \"\"\"\"",
+            "ordinary quote pairing, three times"
+        );
+    }
+
+    /// Ctrl+Z takes the whole docstring back in one go, rather than a line at
+    /// a time — a dozen lines that have to be deleted by hand would be worse
+    /// than not offering them. It leaves the two quotes that opened it, which
+    /// is the state the keystroke before it produced: a run of typing never
+    /// merges across a newline, deliberately, so the docstring cannot join the
+    /// entry those quotes made. A second Ctrl+Z takes those.
+    #[test]
+    fn one_undo_takes_back_the_whole_docstring() {
+        let mut doc = doc_with("def f(a, b):\n    \n");
+        let before = doc.text().to_string();
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1) + 4);
+        type_each(
+            &mut view,
+            &mut doc,
+            python_with(Some(docstring::Style::Google)),
+            "\"\"\"",
+        );
+        assert!(doc.text().to_string().contains("Args:"));
+
+        assert!(view.undo(&mut doc));
+        assert_eq!(
+            doc.text().to_string(),
+            "def f(a, b):
+    \"\"
+",
+            "the docstring goes in one step, quotes and all"
+        );
+        assert!(view.undo(&mut doc));
+        assert_eq!(
+            doc.text().to_string(),
+            before,
+            "and the quotes with a second"
+        );
+    }
+
+    #[test]
+    fn each_style_writes_its_own_layout() {
+        for (style, marker) in [
+            (docstring::Style::Google, "Args:"),
+            (docstring::Style::Numpy, "Parameters"),
+            (docstring::Style::Sphinx, ":param a:"),
+        ] {
+            let mut doc = doc_with("def f(a):\n    \n");
+            let mut view = EditorView::default();
+            view.set_caret(doc.line_start(1) + 4);
+            type_each(&mut view, &mut doc, python_with(Some(style)), "\"\"\"");
+            assert!(
+                doc.text().to_string().contains(marker),
+                "{style:?} should write {marker}:\n{}",
+                doc.text()
+            );
+        }
     }
 }

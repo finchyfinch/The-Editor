@@ -71,7 +71,11 @@ pub(crate) struct Recovery {
     /// The exclusive lock proving this session is running. Held open for the
     /// process's whole life and released by the operating system when it ends,
     /// which is what makes a crash detectable the instant it happens.
-    _lock: Option<std::fs::File>,
+    ///
+    /// Released by hand in [`Recovery::clear`], which is the one case where the
+    /// process outlives the need for it: the handle is open on a file *inside*
+    /// the directory being deleted.
+    lock: Option<std::fs::File>,
     /// When the pending write is due, if anything is waiting.
     due: Option<Instant>,
     last_heartbeat: Instant,
@@ -92,7 +96,7 @@ impl Recovery {
         std::fs::create_dir_all(&dir).ok();
 
         let recovery = Self {
-            _lock: None,
+            lock: None,
             dir,
             due: None,
             last_heartbeat: Instant::now(),
@@ -106,10 +110,7 @@ impl Recovery {
             .open(recovery.dir.join(ALIVE))
             .ok()
             .filter(|file| file.try_lock().is_ok());
-        Self {
-            _lock: lock,
-            ..recovery
-        }
+        Self { lock, ..recovery }
     }
 
     /// Note that something was edited. The write happens [`DELAY`] later.
@@ -207,7 +208,15 @@ impl Recovery {
 
     /// Remove this session's directory. Called on a clean exit — after which
     /// there is, by definition, nothing to recover.
-    pub(crate) fn clear(&self) {
+    ///
+    /// The lock goes first, and it has to: it is a handle on the `alive` file
+    /// *inside* the directory, and Windows will not delete a directory that
+    /// something still has open. Leaving it held made this a silent no-op
+    /// there — the failure is discarded, `collect` skips a directory with no
+    /// recovery files in it, and so nothing looked wrong while the backups
+    /// folder filled up with one empty directory per run.
+    pub(crate) fn clear(&mut self) {
+        drop(self.lock.take());
         std::fs::remove_dir_all(&self.dir).ok();
     }
 
@@ -221,6 +230,14 @@ impl Recovery {
 ///
 /// Skips `mine`, and skips any directory still being kept warm — that is
 /// another window with unsaved work in it, not debris.
+///
+/// Tidies as it goes, the way [`dispose`] does: a dead session's directory with
+/// no recovery files in it is removed. That is the state a clean exit leaves
+/// behind on a machine where [`Recovery::clear`] could not delete the directory
+/// -- which was every Windows machine until the lock was released first -- and
+/// without sweeping them the folder stays as full as the bug left it. It is
+/// also, on any platform, what a session that died before writing anything
+/// leaves: an empty directory nothing will ever come back for.
 pub(crate) fn collect(backups: &Path, mine: Option<&Path>) -> Vec<Recovered> {
     let Ok(entries) = std::fs::read_dir(backups) else {
         return Vec::new();
@@ -245,14 +262,32 @@ pub(crate) fn collect(backups: &Path, mine: Option<&Path>) -> Vec<Recovered> {
         let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // Counted rather than derived from what parsed: a `.recover` file this
+        // version cannot read is still somebody's unsaved work, and a
+        // directory holding one must survive to be read by hand or by a later
+        // version. Only a directory with no recovery files at all is debris.
+        let mut had_recovery_file = false;
         for file in files.flatten() {
             let path = file.path();
             if path.extension().and_then(|e| e.to_str()) != Some("recover") {
                 continue;
             }
+            had_recovery_file = true;
             if let Some(recovered) = read_one(&path) {
                 found.push(recovered);
             }
+        }
+        // Old enough to be sure, as well as empty. A session claims its
+        // directory and writes `alive` a few calls before it manages to lock
+        // it, and in that window `is_alive` answers "dead" about a window that
+        // is in fact opening: sweeping then would delete a live session's
+        // directory out from under it and leave it writing recovery copies
+        // into a folder that is not there. This is the same doubt [`STALE`]
+        // already exists for, so it is the same answer -- and it costs
+        // nothing, because the directories actually being swept up are from
+        // previous runs and are minutes or months old.
+        if !had_recovery_file && !heartbeat_is_fresh(&dir.join(ALIVE)) {
+            std::fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -475,9 +510,139 @@ mod tests {
         let backups = temp("clean-exit");
         let mut recovery = Recovery::new(&backups);
         recovery.store(1, 1, None, "a", "text\n");
+        let dir = recovery.dir().to_path_buf();
+        assert!(dir.is_dir(), "there is a directory to remove to begin with");
+
         recovery.clear();
 
         assert!(collect(&backups, None).is_empty());
+
+        // Asserting on `collect` alone is not enough, and for a long time it
+        // was all this test did. `collect` reports nothing to recover from a
+        // directory with no recovery files in it whether that directory is
+        // there or not -- so on Windows, where the removal was failing
+        // silently against this session's own open lock, the observable
+        // behaviour stayed correct while the backups folder grew by one empty
+        // directory every single run.
+        assert!(
+            !dir.exists(),
+            "the session directory itself is gone, not merely emptied"
+        );
+        assert_eq!(
+            std::fs::read_dir(&backups)
+                .expect("read backups")
+                .flatten()
+                .count(),
+            0,
+            "nothing whatever left behind in the backups folder"
+        );
+        std::fs::remove_dir_all(&backups).ok();
+    }
+
+    /// Backdate a session's heartbeat, so it reads as one from a previous run
+    /// rather than one from a moment ago.
+    fn age(dir: &Path) {
+        let path = dir.join(ALIVE);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open alive");
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - STALE * 2))
+            .expect("backdate");
+    }
+
+    /// The directories a machine has already accumulated are swept up on the
+    /// next start, so fixing the leak also clears what the leak produced.
+    #[test]
+    fn a_dead_session_that_left_nothing_behind_is_swept_away() {
+        let backups = temp("sweep");
+        let debris = backups.join("session-999-0");
+        std::fs::create_dir_all(&debris).expect("create dir");
+        std::fs::write(debris.join(ALIVE), b".").expect("write");
+        age(&debris);
+
+        assert!(collect(&backups, None).is_empty());
+        assert!(!debris.exists(), "an empty dead session is debris");
+
+        std::fs::remove_dir_all(&backups).ok();
+    }
+
+    /// A directory that never got an `alive` file at all is a session that
+    /// died between claiming its folder and announcing itself. Nothing is ever
+    /// coming back for it, and there is no timestamp to wait on.
+    #[test]
+    fn a_session_that_never_announced_itself_is_swept_too() {
+        let backups = temp("sweep-unborn");
+        let debris = backups.join("session-997-0");
+        std::fs::create_dir_all(&debris).expect("create dir");
+
+        assert!(collect(&backups, None).is_empty());
+        assert!(!debris.exists());
+
+        std::fs::remove_dir_all(&backups).ok();
+    }
+
+    /// A window that has only just opened has not written anything yet, and on
+    /// some filesystems cannot prove it is running by holding a lock. Sweeping
+    /// it would delete a live session's directory out from under it — so an
+    /// empty directory is left alone until it is old enough to be sure about.
+    #[test]
+    fn a_session_too_young_to_judge_is_left_alone_even_though_it_is_empty() {
+        let backups = temp("sweep-young");
+        let opening = backups.join("session-996-0");
+        std::fs::create_dir_all(&opening).expect("create dir");
+        // Written just now, and nobody holding the lock: exactly the state a
+        // session is in for the moment between claiming its folder and locking
+        // it.
+        std::fs::write(opening.join(ALIVE), b".").expect("write");
+
+        assert!(collect(&backups, None).is_empty());
+        assert!(
+            opening.is_dir(),
+            "a fresh heartbeat means it may be a window that is still opening"
+        );
+
+        // And once it is plainly from another run, it goes.
+        age(&opening);
+        assert!(collect(&backups, None).is_empty());
+        assert!(!opening.exists());
+
+        std::fs::remove_dir_all(&backups).ok();
+    }
+
+    /// Sweeping must not take unsaved work with it. A recovery file this
+    /// version cannot parse is still somebody's text, and the directory has to
+    /// survive for it to be read by hand -- or by a later version that can.
+    #[test]
+    fn a_directory_holding_an_unreadable_recovery_file_is_not_swept() {
+        let backups = temp("sweep-keeps");
+        let dir = backups.join("session-998-0");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join(ALIVE), b".").expect("write");
+        std::fs::write(dir.join("a.recover"), b"truncated by the crash").expect("write");
+
+        assert!(collect(&backups, None).is_empty(), "nothing parses");
+        assert!(
+            dir.join("a.recover").is_file(),
+            "but the file is still there to be looked at"
+        );
+
+        std::fs::remove_dir_all(&backups).ok();
+    }
+
+    /// A live session's directory is never swept, even before it has written
+    /// anything: it is empty because nothing has been typed into that window
+    /// yet, not because the session is gone.
+    #[test]
+    fn a_running_session_with_nothing_written_yet_is_left_alone() {
+        let backups = temp("sweep-live");
+        let live = Recovery::new(&backups);
+        let dir = live.dir().to_path_buf();
+
+        assert!(collect(&backups, None).is_empty());
+        assert!(dir.is_dir(), "the session is still running");
+
+        drop(live);
         std::fs::remove_dir_all(&backups).ok();
     }
 

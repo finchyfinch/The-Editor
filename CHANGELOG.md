@@ -10,6 +10,47 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Added
 
+- **Python docstrings are written from the signature.** Typing `"""` on the
+  first line of a `def` or `class` body fills in an entry per parameter with
+  its annotation and whether it has a default, the return type, whatever the
+  body raises, and `Yields` in place of `Returns` for a generator. A class
+  documents what building one takes, which is `__init__`'s parameters rather
+  than the base classes in its own header; `self` and `cls` are left out
+  because nobody passes them. The caret lands on the summary line, which is the
+  one part a signature cannot supply, and one `Ctrl+Z` takes the whole thing
+  back.
+
+  Google, NumPy and Sphinx reST layouts, chosen in **Settings > Python**
+  alongside **Off**. Read from the text rather than from the parse tree, for
+  the same reason the `self` rule is: at the moment the third quote is typed
+  the string is unterminated and the file does not parse.
+
+- **Typing a triple quote no longer fights back.** With quotes auto-closing,
+  three keystrokes used to leave four quotes and a caret in the middle of them,
+  and the closing three had to be fought for. The third quote of a triple now
+  opens and closes the string in one go, leaving the caret between the two —
+  and typing the closing three by hand still steps over the ones already there.
+
+- **The pointer changes over the gutter.** A hand over the breakpoint strip and
+  over a fold chevron, an arrow over the line numbers and the blame column, and
+  the I-beam over the code. The chevron column is mostly empty, so the hand
+  appears only beside lines that have one: a hand promising a click that does
+  nothing is worse than no hand at all. The pointer and the click handler now
+  read one description of the gutter's geometry rather than two.
+
+- **Clicking below the last line puts the caret at the end of it.** The blank
+  space under a short file is part of the editor now, the way it is in every
+  other editor. It was not before: the text area was allocated at exactly the
+  height of its text, so a click underneath landed on the scroll area's
+  background instead. Nothing happened at all — the caret did not move and the
+  editor did not even take focus, so the next thing typed went nowhere.
+
+  The caret goes to the end of the last line rather than to the column the
+  pointer happened to be over, because down there is no column to be over. With
+  the tail of the file folded away it stops at the end of the last row that is
+  actually on screen, rather than jumping into text that is hidden.
+
+
 - **`tools\make-release.bat`** builds, tests, and stages a Windows release into
   `dist\` — a folder, a zip, and its SHA-256. The checksum matters more than
   usual because the binary is deliberately unsigned, so a published hash is the
@@ -126,6 +167,106 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **Discarded changes came back after a restart.** Choosing "Don't Save" on the
+  way out and starting up again offered the same changes back, as unsaved work
+  rescued from a crash. Quitting clears this session's recovery copies, and has
+  to: they exist to survive a crash, and a window that closed on purpose did
+  not have one. But the clearing lived in the branch that quits when nothing is
+  unsaved, and the branch that quits *after* the user declines to save set the
+  "quitting" flag by hand — which is the same flag that stops the first branch
+  running a second time. So the one route where the copies certainly had to go
+  was the one route that kept them. Confirming a quit now clears the store
+  wherever it is confirmed from.
+
+- **Session directories piled up in the backups folder.** A clean exit deletes
+  this session's recovery directory. On Windows it silently did not: the
+  session is still holding an open handle on the `alive` file *inside* that
+  directory — the lock by which another instance can tell a crash from a second
+  window — and Windows will not delete a directory that something has open. The
+  failure was discarded, and nothing looked wrong, because a directory with no
+  recovery files in it is skipped when the next start goes looking for work to
+  recover. The lock is now released before the removal, and the directories
+  already accumulated are swept up on the next start — but only once they are
+  old enough to be certain about, so that a window still in the act of opening
+  is never mistaken for debris and deleted out from under itself.
+
+- **Restoring recovered work opened the file twice.** After a crash, the
+  session restore reopens the tabs that were open at the time — including,
+  usually, the very file the recovery prompt is about, read back from disk
+  without the changes. Accepting the recovery then added a *second* tab for it,
+  so the same file sat open twice under the same name with different text on
+  each, and which one you got depended on which tab you clicked. The recovered
+  buffer now takes over the tab already showing that file. A buffer that was
+  never saved still gets a tab of its own: it has no file to collide over, and
+  is not in the session file either.
+
+- **Zoom drifted until it stuck at the smallest size.** Zooming in and out for
+  a while ended with the interface at its minimum, after which zooming in
+  worked and zooming out did nothing whatever.
+
+  Two owners of one number. `Ctrl+Plus` is `Ctrl+Shift+=` on the usual
+  keyboards, and `Ctrl+Shift+=` is Fold/Unfold All — so the View menu's Zoom In
+  was listed under a key that unfolds the file, and the `Ctrl+=` people press
+  instead was picked up by egui's own zoom handler, which moves its zoom factor
+  and tells the application nothing. Zoom *out* was the application's, and
+  moved a saved setting. So the display crept up on every zoom in and was
+  yanked back down to the setting on every zoom out, while the setting itself
+  marched down to the bottom of its range and clamped there — at which point
+  zooming out changed nothing, so nothing was pushed to the display, while
+  zooming in still worked because that had been egui all along.
+
+  Zoom In is now bound to `Ctrl+=`, which is both what people press and what
+  the menu shows; `Ctrl+Plus` remains as an unlisted second binding for
+  keyboards that have a `+` of their own. egui's built-in zoom shortcuts are
+  switched off, the setting is the single authority on the zoom factor and is
+  re-asserted if anything else moves it, and each step is rounded back onto a
+  tenth so that zooming out and back in returns to exactly 1.0 rather than to
+  something that merely looks like it.
+
+- **Backspacing a selection that spanned lines closed the application.** The
+  row map is built at the top of a frame; the keystroke is handled later in
+  that same frame and shortens the document immediately. In a file short enough
+  for its last line to be on screen, the paint loop then walked to a row the
+  document no longer had and asked the rope for the byte offset of a line past
+  its end. Every accessor on the document itself clamps, but that one call went
+  straight to the rope, so it panicked — and a panic in the paint pass takes the
+  process with it. The painter now stops at the end of the document rather than
+  at the end of the map.
+
+- **Fold arrows appeared beside blank lines and single statements.** Three
+  causes, each of them a fold read off a description of the file that was not
+  the file.
+
+  **Document versions are now unique across documents, not per document.**
+  Everything derived from a buffer is cached against `Document::version` — the
+  fold ranges, the search results, the outline, the copy a language server has
+  been sent. Reloading a file after another program changed it builds a new
+  `Document` and puts it behind the view that holds all of those caches, and
+  each document used to start counting at zero: the replacement's first version
+  was one the view had already seen, so nothing was recomputed. The chevrons
+  stayed on the lines the *old* text had put them on, which in a file that had
+  gained a line was beside blank ones.
+
+  **Nodes inside a parse error are no longer offered as folds.** One unclosed
+  bracket puts every statement after it inside a single ERROR node spanning
+  hundreds of lines, and the multi-line nodes tree-sitter invents while
+  recovering put a chevron beside plainly one-line statements.
+
+  **And the fold list is rebuilt when a reparse that ran out of time catches
+  up.** Catching up does not change the document, so a rebuild keyed on the
+  document version alone left the folds taken off the half-finished tree in
+  place until the next keystroke.
+
+- **A second drag extended the first selection instead of replacing it.**
+  Dragging over one stretch of text and then over another left everything
+  between them highlighted, because a new drag never planted an anchor of its
+  own: the press changes nothing on its own, so by the time the pointer had
+  moved far enough to count as a drag, the previous selection's anchor was
+  still in place and got extended. A drag now anchors where the button went
+  down — and where it actually went down, not where the pointer had drifted to
+  by the frame the drag was recognised. Shift+drag still extends, which is what
+  it is for. Alt+drag column selections had the same fault and are fixed with
+  it.
 - **The console never said when debugging had ended.** A debug session shared
   the console with the runner but announced nothing, so a program that had run
   to completion looked exactly like one still paused. The session now echoes

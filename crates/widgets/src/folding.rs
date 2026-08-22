@@ -83,6 +83,24 @@ impl FoldMap {
         }
     }
 
+    /// How many rows are worth painting in a document of `line_count` lines.
+    ///
+    /// Ordinarily every one of them, but the map is rebuilt at the top of a
+    /// frame and a keystroke handled later in that same frame changes the
+    /// document immediately. Backspacing a selection that spans lines leaves
+    /// this map describing rows the document no longer has, and [`Self::line_at`]
+    /// clamps to the map's own line count rather than the document's — so the
+    /// paint loop asked the rope for a line past its end, which is a panic
+    /// rather than a blank row.
+    pub(crate) fn rows_within(&self, line_count: usize) -> usize {
+        if self.is_identity() {
+            return self.line_count.min(line_count);
+        }
+        // `rows` is ascending, so this is the first row showing a line the
+        // document no longer has.
+        self.rows.partition_point(|line| *line < line_count)
+    }
+
     /// The document line drawn at `row`.
     ///
     /// Clamped rather than optional: this is called from click handling, where
@@ -307,5 +325,35 @@ mod tests {
     fn no_change_means_no_movement() {
         let before = collapsed(&[1, 2, 3]);
         assert_eq!(shift(&before, 0, 0), before);
+    }
+
+    /// A keystroke is applied to the document in the same frame that paints
+    /// it, but the row map was built before the keystroke. After deleting
+    /// lines the map outlives them by a frame, and the painter has to stop at
+    /// the end of the document rather than at the end of the map.
+    #[test]
+    fn rows_are_capped_by_the_document_not_by_the_map() {
+        let map = FoldMap::identity(13);
+        assert_eq!(map.visible_rows(), 13);
+        assert_eq!(map.rows_within(11), 11, "two lines have just been deleted");
+        assert_eq!(map.rows_within(13), 13, "and nothing is capped otherwise");
+        assert_eq!(map.rows_within(20), 13, "a longer document adds no rows");
+    }
+
+    /// Same again with a fold in the way, where rows and lines differ.
+    #[test]
+    fn a_folded_map_is_capped_by_the_document_too() {
+        let folds = [FoldRange { first: 1, last: 3 }];
+        let collapsed = BTreeSet::from([1]);
+        let map = FoldMap::new(10, &folds, &collapsed);
+        // Lines 2 and 3 are hidden, so the visible lines are 0,1,4,5,6,7,8,9.
+        assert_eq!(map.visible_rows(), 8);
+        assert_eq!(map.rows_within(10), 8);
+        assert_eq!(
+            map.rows_within(5),
+            3,
+            "rows showing lines 0, 1 and 4 survive a document cut to five lines"
+        );
+        assert_eq!(map.rows_within(0), 0);
     }
 }
