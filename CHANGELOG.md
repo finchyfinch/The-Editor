@@ -8,6 +8,8 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-25
+
 ### Added
 
 - **Python docstrings are written from the signature.** Typing `"""` on the
@@ -769,4 +771,5 @@ Entries are written as each milestone lands, not retroactively at release time.
 - Rendering spike (`cargo spike`) validating virtualised painting of a
   `ropey::Rope` with a working caret, and measuring paint and edit cost.
 
-[Unreleased]: https://example.invalid/the-editor/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/finchyfinch/The-Editor/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/finchyfinch/The-Editor/releases/tag/v1.0.0
