@@ -1,6 +1,6 @@
 # The Editor
 
-A cross-platform IDE for Python and Rust development, written in Rust.
+An IDE for Python and Rust development, written in Rust.
 
 Copyright © 2026 Gareth Finch. MIT licensed.
 
@@ -9,9 +9,10 @@ tree-sitter highlighting, completion, and diagnostics from `rust-analyzer`,
 Pyright and Ruff; Go to Definition and Find Uses; project-wide search and Go to
 File; a file explorer; an integrated console for running code; and a Python
 debugger with breakpoints, stepping, the call stack and local variables. A
-Windows build is on the [releases page](../../releases); other platforms build
-from source. [CHANGELOG.md](CHANGELOG.md) records what has landed;
-[PLAN.md](PLAN.md) has the full design and the milestone schedule.
+Windows build is on the [releases page](../../releases); Windows is the only
+platform it has been built and run on. [CHANGELOG.md](CHANGELOG.md) records
+what has landed; [PLAN.md](PLAN.md) has the full design and the milestone
+schedule.
 
 ## Building
 
@@ -22,6 +23,10 @@ Requirements:
   - **Windows** — Visual Studio Build Tools with the "Desktop development with C++" workload
   - **Linux** — `build-essential` (plus `libxkbcommon-dev libwayland-dev libxcb1-dev` for winit)
   - **macOS** — Xcode Command Line Tools (`xcode-select --install`)
+
+Windows is the only platform The Editor has been built on. The Linux and macOS
+entries are what the dependencies call for, and the code carries the paths for
+both, but neither has been compiled or run.
 
 ```bash
 cargo build --workspace
