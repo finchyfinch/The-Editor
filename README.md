@@ -4,16 +4,21 @@ A cross-platform IDE for Python and Rust development, written in Rust.
 
 Copyright © 2026 Gareth Finch. MIT licensed.
 
-**Status: pre-release.** M0 (bootstrap) is complete — the workspace builds and
-opens a window. The editor itself starts at M2. See [PLAN.md](PLAN.md) for the
-full design and milestone schedule.
+**Status: v1.0.0.** The Editor handles day-to-day Python and Rust work:
+tree-sitter highlighting, completion, and diagnostics from `rust-analyzer`,
+Pyright and Ruff; Go to Definition and Find Uses; project-wide search and Go to
+File; a file explorer; an integrated console for running code; and a Python
+debugger with breakpoints, stepping, the call stack and local variables. A
+Windows build is on the [releases page](../../releases); other platforms build
+from source. [CHANGELOG.md](CHANGELOG.md) records what has landed;
+[PLAN.md](PLAN.md) has the full design and the milestone schedule.
 
 ## Building
 
 Requirements:
 
 - Rust 1.97.1 (pinned in `rust-toolchain.toml`; `rustup` picks it up automatically)
-- A C toolchain, because the tree-sitter grammars adopted in M3 compile C:
+- A C toolchain, because the tree-sitter grammars compile C:
   - **Windows** — Visual Studio Build Tools with the "Desktop development with C++" workload
   - **Linux** — `build-essential` (plus `libxkbcommon-dev libwayland-dev libxcb1-dev` for winit)
   - **macOS** — Xcode Command Line Tools (`xcode-select --install`)
@@ -26,14 +31,6 @@ cargo build --workspace
 
 ```bash
 cargo editor
-```
-
-The rendering spike — the prototype that validates virtualised text rendering
-over a rope — runs separately. Build it in release mode; the timings mean
-nothing otherwise:
-
-```bash
-cargo spike
 ```
 
 ## Checks
@@ -66,11 +63,13 @@ cargo deny check
 | `crates/core` | Buffers, edits, undo, selections, indentation |
 | `crates/syntax` | Language registry and tree-sitter highlighting |
 | `crates/lsp` | Language server client and lifecycle |
+| `crates/debug` | Debug Adapter Protocol client: `debugpy`, breakpoints, stepping |
 | `crates/proc` | Running user code: PTY, run configs, output parsing |
 | `crates/search` | In-file and project-wide search |
 | `crates/config` | Settings, keymap, themes, paths |
+| `crates/testing` | Running pytest and `cargo test`, and reading the results |
+| `crates/vcs` | Git: what the repository says about the files being edited |
 | `crates/widgets` | egui widgets — the only library crate that knows the toolkit |
-| `crates/spike` | Throwaway rendering prototype; deleted after M2 |
 
 Only `crates/widgets` and `crates/app` depend on egui. Keeping that boundary
 intact is what makes the toolkit choice reversible.

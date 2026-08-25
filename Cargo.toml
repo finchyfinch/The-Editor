@@ -21,7 +21,7 @@ rust-version = "1.97"
 authors = ["Gareth Finch"]
 license = "MIT"
 description = "The Editor — a cross-platform IDE for Python and Rust"
-repository = ""
+repository = "https://github.com/finchyfinch/The-Editor"
 publish = false
 
 [workspace.dependencies]
