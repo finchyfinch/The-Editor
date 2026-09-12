@@ -387,7 +387,8 @@ pairs, layered global → project. `.env` file loading is a settings toggle.
 
 Mechanics — deliberately thin, no magic:
 - The base-interpreter dropdown is populated by a discovery scan: `PATH`, the Windows registry
-  (`HKLM/HKCU\SOFTWARE\Python\PythonCore\*\InstallPath`), the `py` launcher (`py -0p`),
+  (`HKLM/HKCU\SOFTWARE\Python\PythonCore\*\InstallPath`), the `py` launcher (`py -0p`), the
+  Python Install Manager's own directories (`%LocalAppData%\Python\bin` and the runtimes beside it),
   `/usr/bin/python3*`, Homebrew, pyenv (`~/.pyenv/versions/*`), and conda envs — each shown with its
   version string, verified by actually running `<path> -c "import sys; print(sys.version)"`.
   Anything not found is reachable via Browse.

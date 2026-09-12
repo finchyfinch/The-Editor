@@ -16,13 +16,13 @@ path = "src/main.rs"
 editor-config.workspace = true
 editor-core.workspace = true
 editor-debug.workspace = true
-editor-lsp = { version = "1.0.0", path = "../lsp" }
-editor-proc = { version = "1.0.0", path = "../proc" }
+editor-lsp = { version = "1.0.1", path = "../lsp" }
+editor-proc = { version = "1.0.1", path = "../proc" }
 editor-search.workspace = true
 editor-syntax.workspace = true
 editor-widgets.workspace = true
-editor-vcs = { version = "1.0.0", path = "../vcs" }
-editor-testing = { version = "1.0.0", path = "../testing" }
+editor-vcs = { version = "1.0.1", path = "../vcs" }
+editor-testing = { version = "1.0.1", path = "../testing" }
 
 anyhow.workspace = true
 eframe = { workspace = true, features = ["glow"] }

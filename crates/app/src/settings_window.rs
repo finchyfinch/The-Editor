@@ -570,6 +570,22 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
 
     changed |= row(
         ui,
+        "Sticky declarations",
+        "Keep the def or class you are inside pinned to the top of the editor \
+         once its own line has scrolled out of sight, up to four levels of \
+         nesting. Click a pinned row to jump back to it.",
+        |ui| {
+            let mut sticky = settings.sticky_scopes();
+            if ui.checkbox(&mut sticky, "").changed() {
+                settings.set_sticky_scopes(sticky);
+                return true;
+            }
+            false
+        },
+    );
+
+    changed |= row(
+        ui,
         "Reduce motion",
         "Stop the caret blinking. Repeating animation is distracting for some \
          people and disabling for a few, and the caret is the one animation \

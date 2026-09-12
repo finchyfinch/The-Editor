@@ -105,6 +105,10 @@ mod tests {
                 end: at + name.len(),
             },
             depth,
+            // Not what these tests are about: `test_at` reads the order and
+            // the depth, never the span.
+            first_line: 0,
+            last_line: 0,
         }
     }
 

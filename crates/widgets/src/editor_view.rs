@@ -107,6 +107,15 @@ const CHANGE_COLUMN: f32 = CHANGE_BAR_WIDTH + 2.0;
 /// the code sideways — the hover has the whole thing.
 const BLAME_COLUMNS: usize = 20;
 
+/// How many declarations the sticky header will pin at once.
+///
+/// The header costs viewport, so it cannot be allowed to grow with the nesting.
+/// Four covers a method inside a class inside a module with one to spare, and
+/// past that the innermost rows are kept: the function you are in is the one
+/// you have lost track of, and the module three levels out is the one you can
+/// still guess.
+const STICKY_MAX_ROWS: usize = 4;
+
 /// Appearance and behaviour knobs, supplied from settings.
 #[derive(Debug, Clone, Copy)]
 pub struct EditorOptions {
@@ -122,6 +131,10 @@ pub struct EditorOptions {
     pub docstrings: Option<docstring::Style>,
     /// Stop the caret blinking and other repeating animation.
     pub reduce_motion: bool,
+    /// Pin the declarations enclosing the top of the viewport to the top of the
+    /// editor, so the `def` or `class` you are inside stays legible after you
+    /// have scrolled past it.
+    pub sticky_scopes: bool,
 }
 
 impl Default for EditorOptions {
@@ -135,6 +148,7 @@ impl Default for EditorOptions {
             auto_close_brackets: true,
             docstrings: Some(docstring::Style::Google),
             reduce_motion: false,
+            sticky_scopes: true,
         }
     }
 }
@@ -188,6 +202,10 @@ pub struct EditorView {
     collapsed: std::collections::BTreeSet<usize>,
     /// Every foldable range, recomputed when the document changes.
     folds: Vec<editor_syntax::brackets::FoldRange>,
+    /// Every declaration in the file and the lines it covers, for the sticky
+    /// header. Read off the same tree as `folds`, at the same moments, and so
+    /// governed by the same staleness rules.
+    scopes: Vec<editor_syntax::symbols::Outline>,
     /// Document version `folds` was computed from, so the tree is walked on
     /// edits rather than on frames.
     folds_version: Option<u64>,
@@ -248,6 +266,14 @@ pub struct EditorView {
     /// easing rather than stopping the instant one frame happens to match the
     /// last.
     last_offset_change: Option<std::time::Instant>,
+    /// Where the sticky header's rows were drawn last frame, and the line each
+    /// one shows.
+    ///
+    /// Kept because only the paint pass knows the band's geometry, and input is
+    /// handled before it. Last frame's rectangles are the right ones to test a
+    /// click against in any case: they are what was on screen when the button
+    /// went down.
+    sticky_hits: Vec<(egui::Rect, usize)>,
     /// Where the caret was painted last frame, in screen coordinates.
     ///
     /// Kept so the completion popup can be anchored under the caret. Only the
@@ -652,7 +678,7 @@ impl EditorView {
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
         let space_width = ui.fonts_mut(|f| f.glyph_width(&font, ' '));
         let line_count = doc.text().len_lines();
-        self.sync_folds(doc, highlighter.as_deref());
+        self.sync_tree_data(doc, highlighter.as_deref());
         // Rows, not lines, from here on. The two are the same number unless
         // something is folded.
         let row_count = self.fold_map.visible_rows();
@@ -908,7 +934,10 @@ impl EditorView {
             self.resting = None;
             return;
         };
-        if response.dragged() || pos.x < text_left {
+        // Nor is one over the sticky header: the offset under it belongs to a
+        // line the reader cannot see, so a popup about it would be about the
+        // wrong symbol entirely.
+        if response.dragged() || pos.x < text_left || self.sticky_at(pos).is_some() {
             self.resting = None;
             return;
         }
@@ -988,6 +1017,11 @@ impl EditorView {
         text_left: f32,
         row_height: f32,
     ) -> egui::CursorIcon {
+        // Before the zones, which describe the text underneath: a pinned row
+        // covers the gutter as well as the code, and all of it is one target.
+        if self.sticky_at(pos).is_some() {
+            return egui::CursorIcon::PointingHand;
+        }
         let line = self.line_at_pos(pos.y, rect, row_height);
         match self.zone_at(pos.x, rect, text_left, row_height) {
             Zone::Text => egui::CursorIcon::Text,
@@ -1018,6 +1052,16 @@ impl EditorView {
         };
 
         response.request_focus();
+
+        // The sticky header takes a click before the text hidden behind it
+        // does. Jumping to the declaration is what a pinned row is for: it is
+        // the line you scrolled away from, and clicking it is how you go back.
+        if response.clicked()
+            && let Some(line) = self.sticky_at(pos)
+        {
+            self.set_caret(doc.line_start(line));
+            return false;
+        }
 
         // The gutter takes clicks of its own. Dragging through it is still a
         // selection, so only a click is intercepted here.
@@ -2225,6 +2269,20 @@ impl EditorView {
             + OVERSCAN_ROWS)
             .min(self.fold_map.rows_within(line_count));
 
+        // The rows the sticky header will pin, worked out before anything is
+        // painted because both the highlighting below and the scroll-to-caret
+        // at the end of this function need to know how many there are.
+        //
+        // From the first row genuinely on screen, not from `first` -- that has
+        // the overscan subtracted, and a row above the viewport has not
+        // scrolled off it.
+        let top_row = ((visible.top() - rect.top()) / row_height).ceil().max(0.0) as usize;
+        let sticky = if opts.sticky_scopes {
+            self.sticky_lines(self.fold_map.line_at(top_row), line_count)
+        } else {
+            Vec::new()
+        };
+
         // Highlight exactly the rows about to be painted, and nothing else.
         // This is where "cost tracks the viewport, not the file" is enforced.
         //
@@ -2232,15 +2290,36 @@ impl EditorView {
         // fold in between that also covers the hidden lines, which costs a
         // little work and keeps the range contiguous -- asking for several
         // disjoint ranges would cost more than the lines are worth.
-        let spans = highlighter.map_or_else(Vec::new, |h| {
-            let from = doc
-                .text()
-                .line_to_byte(self.fold_map.line_at(first).min(line_count));
-            let to = doc
-                .text()
-                .line_to_byte(self.fold_map.line_at(last).min(line_count));
-            h.spans(doc.text(), from..to.max(from), syntax)
-        });
+        let mut highlighter = highlighter;
+        let spans = match highlighter.as_mut() {
+            Some(h) => {
+                let from = doc
+                    .text()
+                    .line_to_byte(self.fold_map.line_at(first).min(line_count));
+                let to = doc
+                    .text()
+                    .line_to_byte(self.fold_map.line_at(last).min(line_count));
+                h.spans(doc.text(), from..to.max(from), syntax)
+            }
+            None => Vec::new(),
+        };
+
+        // One range per pinned row, each a single line, rather than one range
+        // running from the outermost declaration down to the viewport. A class
+        // can be two thousand lines long, and highlighting all of it to draw
+        // four rows is precisely the cost virtualised rendering exists to
+        // avoid.
+        let sticky_spans: Vec<Vec<editor_syntax::highlight::Span>> = sticky
+            .iter()
+            .map(|line| match highlighter.as_mut() {
+                Some(h) => {
+                    let from = doc.text().line_to_byte((*line).min(line_count));
+                    let to = doc.text().line_to_byte((line + 1).min(line_count));
+                    h.spans(doc.text(), from..to.max(from), syntax)
+                }
+                None => Vec::new(),
+            })
+            .collect();
 
         let painter = ui.painter_at(ui.clip_rect());
         let visuals = ui.visuals().clone();
@@ -2638,17 +2717,137 @@ impl EditorView {
             // the visible range moved the caret and left the view behind.
             let y = rect.top() + self.fold_map.row_at(caret_line) as f32 * row_height;
             let x = caret_rect.map_or(text_left, |r| r.left());
-            let target = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1.5, row_height));
             // A couple of rows of context either side, so the target does not
-            // land flush against the top or bottom edge.
-            ui.scroll_to_rect(target.expand2(egui::vec2(0.0, row_height * 2.0)), None);
+            // land flush against the top or bottom edge -- and above it, room
+            // for the sticky header as well, or scrolling up to a caret parks
+            // it behind the band and the file appears not to have moved.
+            let above = row_height * (sticky.len() as f32 + 2.0);
+            let target = egui::Rect::from_min_max(
+                egui::pos2(x, y - above),
+                egui::pos2(x + 1.5, y + row_height * 3.0),
+            );
+            ui.scroll_to_rect(target, None);
         }
+
+        // Last, so it covers the text, the selection and any caret that ran
+        // underneath it. A pinned row that a caret shone through would read as
+        // a caret on the wrong line.
+        self.paint_sticky(
+            ui,
+            doc,
+            &painter,
+            &visuals,
+            syntax,
+            opts,
+            font,
+            &sticky,
+            &sticky_spans,
+            visible,
+            text_left,
+            row_height,
+        );
 
         if response.has_focus() {
             // Keep the blink animating without spinning at the full frame rate.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(120));
         }
+    }
+
+    /// Draw the declarations enclosing the top of the viewport, pinned to it.
+    ///
+    /// The rows are the real lines of the file, highlighted the way they are
+    /// highlighted in place, rather than a rendering of the declaration's name.
+    /// A header made of names has to invent a notation for signatures and
+    /// decorators and gets it subtly wrong; the source line is already the
+    /// notation the reader knows, and it is the line they would have scrolled
+    /// back to look at.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_sticky(
+        &mut self,
+        ui: &egui::Ui,
+        doc: &Document,
+        painter: &egui::Painter,
+        visuals: &egui::Visuals,
+        syntax: &SyntaxTheme,
+        opts: EditorOptions,
+        font: &egui::FontId,
+        lines: &[usize],
+        spans: &[Vec<editor_syntax::highlight::Span>],
+        visible: egui::Rect,
+        text_left: f32,
+        row_height: f32,
+    ) {
+        // Cleared unconditionally, so switching the header off or scrolling
+        // back to the top of a file cannot leave a click target behind on a
+        // band that is no longer drawn.
+        self.sticky_hits.clear();
+        if lines.is_empty() {
+            return;
+        }
+
+        let band = egui::Rect::from_min_max(
+            egui::pos2(visible.left(), visible.top()),
+            egui::pos2(
+                visible.right(),
+                visible.top() + row_height * lines.len() as f32,
+            ),
+        );
+        // Opaque first: the rows this covers are still painted underneath, and
+        // a translucent band would show them through the pinned text. The panel
+        // fill is the editor's own background. The wash over it is what says
+        // these rows are pinned rather than simply the next rows of the file.
+        painter.rect_filled(band, 0.0, visuals.panel_fill);
+        painter.rect_filled(band, 0.0, visuals.faint_bg_color);
+
+        for (row, line) in lines.iter().enumerate() {
+            let y = band.top() + row as f32 * row_height;
+            let text = doc.line_text(*line);
+            let galley = match spans.get(row) {
+                Some(spans) if !spans.is_empty() => {
+                    let job = highlighted_line(
+                        &text,
+                        doc.text().line_to_byte((*line).min(doc.line_count())),
+                        spans,
+                        syntax,
+                        font,
+                        visuals.text_color(),
+                    );
+                    ui.fonts_mut(|f| f.layout_job(job))
+                }
+                _ => painter.layout_no_wrap(text.clone(), font.clone(), visuals.text_color()),
+            };
+
+            // The real line number, not a row index. Half of what makes the
+            // band trustworthy is that it says where in the file the line is,
+            // so the reader can tell it apart from the code below it.
+            if opts.show_line_numbers {
+                painter.text(
+                    egui::pos2(text_left - 12.0, y),
+                    egui::Align2::RIGHT_TOP,
+                    line + 1,
+                    font.clone(),
+                    visuals.weak_text_color(),
+                );
+            }
+            painter.galley(egui::pos2(text_left, y), galley, visuals.text_color());
+
+            self.sticky_hits.push((
+                egui::Rect::from_min_max(
+                    egui::pos2(band.left(), y),
+                    egui::pos2(band.right(), y + row_height),
+                ),
+                *line,
+            ));
+        }
+
+        // A rule under the band, so it reads as a header rather than as code
+        // that has refused to scroll.
+        painter.hline(
+            band.x_range(),
+            band.bottom(),
+            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        );
     }
 
     /// Solid for a moment after any interaction, so the caret is never invisible
@@ -2717,7 +2916,7 @@ impl EditorView {
     /// Walking the tree is not free on a large file, so it happens on edits
     /// rather than on frames — the version check is what makes folding cost
     /// nothing while you are only scrolling.
-    fn sync_folds(&mut self, doc: &Document, highlighter: Option<&Highlighter>) {
+    fn sync_tree_data(&mut self, doc: &Document, highlighter: Option<&Highlighter>) {
         let version = doc.version();
         let line_count = doc.line_count();
 
@@ -2743,9 +2942,15 @@ impl EditorView {
                     delta,
                 );
             }
-            self.folds = highlighter
-                .and_then(Highlighter::tree)
+            let tree = highlighter.and_then(Highlighter::tree);
+            self.folds = tree
                 .map(|tree| editor_syntax::brackets::fold_ranges(tree, doc.text()))
+                .unwrap_or_default();
+            // Walked here rather than per frame for the same reason the folds
+            // are: it is a whole-tree walk, the answer only changes when the
+            // tree does, and the sticky header asks for it on every paint.
+            self.scopes = tree
+                .map(|tree| editor_syntax::symbols::outline(tree, doc.text()))
                 .unwrap_or_default();
             // A fold whose header is no longer a fold has gone; keeping it
             // would hide lines that nothing offers to unhide.
@@ -2761,6 +2966,50 @@ impl EditorView {
             // The document is the same but the map is not: a fold was toggled.
             self.rebuild_fold_map(line_count);
         }
+    }
+
+    /// The lines to pin at the top of the viewport, outermost first.
+    ///
+    /// The declarations `top_line` is inside, minus any whose own header is
+    /// still on screen -- pinning a copy of a row the reader can already see is
+    /// how a sticky header ends up showing the same line twice.
+    ///
+    /// Note what is *not* here: the caret. The question this answers is "what
+    /// am I looking at", which is a property of the scroll position, and a
+    /// header driven by the caret would sit unchanged while the file scrolled
+    /// underneath it.
+    fn sticky_lines(&self, top_line: usize, line_count: usize) -> Vec<usize> {
+        let mut lines: Vec<usize> = editor_syntax::symbols::enclosing(&self.scopes, top_line)
+            .iter()
+            .map(|item| item.first_line)
+            // Capped by the document for the same reason the paint loop's last
+            // row is: the scopes were walked at the top of the frame and a
+            // keystroke handled later in it applies to `doc` at once, so after
+            // deleting a selection that spanned lines these can name lines the
+            // document no longer has.
+            .filter(|first| {
+                *first < top_line && *first < line_count && !self.fold_map.is_hidden(*first)
+            })
+            .collect();
+        // Two declarations can share a first line -- a Rust `fn` written on one
+        // line inside a one-line `mod`, say -- and pinning it twice would be
+        // one wasted row showing the same text.
+        lines.dedup();
+        if lines.len() > STICKY_MAX_ROWS {
+            lines.drain(..lines.len() - STICKY_MAX_ROWS);
+        }
+        lines
+    }
+
+    /// The line the sticky header shows at `pos`, if the header is under it.
+    ///
+    /// From the rectangles the last paint recorded, which is what the reader
+    /// was looking at when they moved the pointer there.
+    fn sticky_at(&self, pos: egui::Pos2) -> Option<usize> {
+        self.sticky_hits
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|(_, line)| *line)
     }
 
     /// Whether the fold list has to be walked out of the tree again.
@@ -3248,12 +3497,94 @@ mod tests {
         let highlighter =
             Highlighter::new(LanguageId::Python, doc.text()).expect("Python has a grammar");
         let mut view = EditorView::default();
-        view.sync_folds(&doc, Some(&highlighter));
+        view.sync_tree_data(&doc, Some(&highlighter));
         (doc, view, highlighter)
     }
 
     const NESTED: &str =
         "class A:\n    def f(self):\n        x = 1\n        y = 2\n\n\ndef g():\n    pass\n";
+
+    /// `NESTED`, zero-based:
+    /// 0 `class A:`
+    /// 1 `    def f(self):`
+    /// 2 `        x = 1`
+    /// 3 `        y = 2`
+    /// 4 blank
+    /// 5 blank
+    /// 6 `def g():`
+    /// 7 `    pass`
+    #[test]
+    fn nothing_is_pinned_at_the_top_of_a_file() {
+        let (doc, view, _h) = with_folds(NESTED);
+        assert!(
+            view.sticky_lines(0, doc.line_count()).is_empty(),
+            "the class line is on screen"
+        );
+    }
+
+    #[test]
+    fn a_declaration_is_pinned_once_its_own_line_has_scrolled_off() {
+        let (doc, view, _h) = with_folds(NESTED);
+        assert_eq!(
+            view.sticky_lines(1, doc.line_count()),
+            vec![0],
+            "the class, not the def"
+        );
+        assert_eq!(
+            view.sticky_lines(2, doc.line_count()),
+            vec![0, 1],
+            "outermost first"
+        );
+        assert_eq!(view.sticky_lines(3, doc.line_count()), vec![0, 1]);
+    }
+
+    /// The blank lines between `A` and `g` are inside neither. A header driven
+    /// by "the nearest declaration above" would pin `f` here, which is a
+    /// function the reader left two lines ago.
+    #[test]
+    fn nothing_is_pinned_between_two_declarations() {
+        let (doc, view, _h) = with_folds(NESTED);
+        assert!(
+            view.sticky_lines(4, doc.line_count()).is_empty(),
+            "got {:?}",
+            view.sticky_lines(4, doc.line_count())
+        );
+        assert!(view.sticky_lines(5, doc.line_count()).is_empty());
+    }
+
+    #[test]
+    fn a_later_declaration_pins_only_itself() {
+        let (doc, view, _h) = with_folds(NESTED);
+        assert_eq!(view.sticky_lines(7, doc.line_count()), vec![6]);
+    }
+
+    /// Deeper than the band is allowed to grow. The innermost declarations are
+    /// the ones kept.
+    #[test]
+    fn the_band_is_capped_and_keeps_the_innermost() {
+        let (doc, view, _h) = with_folds(
+            "class A:
+    class B:
+        class C:
+            class D:
+                class E:
+                    def f(self):
+                        pass
+",
+        );
+        let pinned = view.sticky_lines(6, doc.line_count());
+        assert_eq!(pinned.len(), STICKY_MAX_ROWS);
+        assert_eq!(pinned, vec![2, 3, 4, 5], "C, D, E and f");
+    }
+
+    /// A file with no grammar has no scopes, and must not have a header.
+    #[test]
+    fn a_file_with_no_parse_tree_pins_nothing() {
+        let doc = doc_with(NESTED);
+        let mut view = EditorView::default();
+        view.sync_tree_data(&doc, None);
+        assert!(view.sticky_lines(2, doc.line_count()).is_empty());
+    }
 
     #[test]
     fn a_file_with_structure_has_folds_and_starts_unfolded() {
@@ -3327,7 +3658,7 @@ mod tests {
         );
         let changes = doc.take_changes();
         highlighter.update(&changes, doc.text());
-        view.sync_folds(&doc, Some(&highlighter));
+        view.sync_tree_data(&doc, Some(&highlighter));
 
         assert_eq!(
             view.collapsed.iter().next().copied(),
@@ -3358,7 +3689,7 @@ mod tests {
         );
         let changes = doc.take_changes();
         highlighter.update(&changes, doc.text());
-        view.sync_folds(&doc, Some(&highlighter));
+        view.sync_tree_data(&doc, Some(&highlighter));
 
         assert!(view.collapsed.is_empty(), "the fold went with its code");
         assert!(view.fold_map.is_identity());
@@ -4593,7 +4924,7 @@ dddd
         );
         let mut view = EditorView::default();
         let h = Highlighter::new(LanguageId::Python, before.text()).expect("grammar");
-        view.sync_folds(&before, Some(&h));
+        view.sync_tree_data(&before, Some(&h));
         assert!(
             view.folds.iter().any(|f| f.first == 0),
             "the def on line 0 folds: {:?}",
@@ -4609,7 +4940,7 @@ def a():
 ",
         );
         let h = Highlighter::new(LanguageId::Python, after.text()).expect("grammar");
-        view.sync_folds(&after, Some(&h));
+        view.sync_tree_data(&after, Some(&h));
         assert!(
             view.folds.iter().any(|f| f.first == 1),
             "the def is on line 1 now: {:?}",
@@ -4652,7 +4983,7 @@ print(add_numbers(a, b, c))
         let highlighter = Highlighter::new(LanguageId::Python, doc.text()).expect("grammar");
 
         // The frame begins: the row map is built for the document as it is.
-        view.sync_folds(&doc, Some(&highlighter));
+        view.sync_tree_data(&doc, Some(&highlighter));
         let rows_before = view.fold_map.visible_rows();
         assert_eq!(rows_before, doc.line_count());
 
@@ -4700,7 +5031,7 @@ def b():
         );
         let mut view = EditorView::default();
         let highlighter = Highlighter::new(LanguageId::Python, doc.text()).expect("grammar");
-        view.sync_folds(&doc, Some(&highlighter));
+        view.sync_tree_data(&doc, Some(&highlighter));
         view.toggle_fold(0);
         assert!(!view.fold_map.is_identity(), "the first def is closed");
 
@@ -4731,7 +5062,7 @@ def b():
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 400.0));
         let mut view = EditorView::default();
         let highlighter = Highlighter::new(LanguageId::Python, doc.text()).expect("grammar");
-        view.sync_folds(doc, Some(&highlighter));
+        view.sync_tree_data(doc, Some(&highlighter));
         // Breakpoints, numbers and folds: two row-height columns either side of
         // room for four digits.
         let text_left = rect.left() + row_height * 2.0 + 40.0;
@@ -4951,7 +5282,7 @@ def f():
         );
         let (mut view, rect, _text_left, row_height) = gutter_view(&doc);
         view.toggle_fold(1);
-        view.sync_folds(&doc, None);
+        view.sync_tree_data(&doc, None);
         assert!(
             view.fold_map.visible_rows() < doc.line_count(),
             "something has to be hidden for this test to mean anything"

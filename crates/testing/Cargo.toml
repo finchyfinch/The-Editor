@@ -9,10 +9,10 @@ publish = false
 description = "Running tests, and reading what the test runner said"
 
 [dependencies]
-editor-proc = { version = "1.0.0", path = "../proc" }
+editor-proc = { version = "1.0.1", path = "../proc" }
 # For LanguageId alone: which framework suits a file is a fact about its
 # language, and the language is already decided in one place.
-editor-syntax = { version = "1.0.0", path = "../syntax" }
+editor-syntax = { version = "1.0.1", path = "../syntax" }
 
 [lints]
 workspace = true

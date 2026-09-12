@@ -218,6 +218,8 @@ mod tests {
             kind,
             range: 0..name.len(),
             depth,
+            first_line: 0,
+            last_line: 0,
         }
     }
 

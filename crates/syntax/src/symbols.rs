@@ -237,6 +237,14 @@ pub struct Outline {
     /// How deeply nested the declaration is, for indenting the list. A method
     /// inside a class is 1; a function inside that is 2.
     pub depth: usize,
+    /// The first line the declaration covers -- the one its `def`, `fn` or
+    /// `class` keyword is on, which is not always the line the name is on: a
+    /// decorated or multi-line signature puts them apart.
+    pub first_line: usize,
+    /// The last line the declaration covers, inclusive. Together with
+    /// [`Self::first_line`] this is what makes "which declaration is the caret
+    /// *inside*" answerable, as opposed to "which one is nearest above it".
+    pub last_line: usize,
 }
 
 /// Every declaration in the file, in the order they appear.
@@ -275,11 +283,22 @@ fn walk_outline(
     let mut child_depth = depth;
     if let Some((name, kind)) = listed {
         let range = byte_range_to_chars(text, name.start_byte(), name.end_byte());
+        // The declaration's own extent, not the name's. Clamped and taken from
+        // the last character rather than the end offset for the same reason
+        // `fold_ranges` does it: a node ends *after* its final character, and
+        // on the newline that ends a body that is the line below the one
+        // anybody would call the declaration's last.
+        let span = byte_range_to_chars(text, node.start_byte(), node.end_byte());
+        let len = text.len_chars();
+        let first_line = text.char_to_line(span.start.min(len));
+        let last_line = text.char_to_line(span.end.saturating_sub(1).min(len));
         found.push(Outline {
             name: text.slice(range.clone()).chars().collect(),
             kind,
             range,
             depth,
+            first_line,
+            last_line: last_line.max(first_line),
         });
         child_depth = depth + 1;
     }
@@ -293,6 +312,26 @@ fn walk_outline(
         }
         cursor.goto_parent();
     }
+}
+
+/// The declarations `line` falls inside, outermost first.
+///
+/// This is what a breadcrumb or a sticky header wants, and it is a different
+/// question from the one [`outline`] answers on its own: the declaration
+/// *nearest above* a line is often not one that contains it at all -- scroll
+/// past the end of a class and the nearest thing above you is its last method,
+/// which you left several lines ago.
+///
+/// Nesting is read from the spans rather than from `depth`, so a file that
+/// parses only partly still gives an answer for the parts that did. The result
+/// is in source order, which for nested declarations is outermost first: an
+/// inner declaration starts after the one that encloses it.
+#[must_use]
+pub fn enclosing(outline: &[Outline], line: usize) -> Vec<&Outline> {
+    outline
+        .iter()
+        .filter(|item| item.first_line <= line && line <= item.last_line)
+        .collect()
 }
 
 /// The kind of thing a declaration node declares, or `Unknown` for the ones an
@@ -778,5 +817,87 @@ yy = 2
     #[test]
     fn a_file_with_no_declarations_has_an_empty_outline() {
         assert!(outline_of(crate::LanguageId::Python, "x = 1\ny = 2\n").is_empty());
+    }
+
+    /// Lines, zero-based:
+    /// 0 `class Widget:`
+    /// 1 `    def scaled(self):`
+    /// 2 `        return 1`
+    /// 3 blank
+    /// 4 `def main():`
+    /// 5 `    pass`
+    const NESTED: &str = "class Widget:
+    def scaled(self):
+        return 1
+
+def main():
+    pass
+";
+
+    fn names_enclosing(source: &str, line: usize) -> Vec<String> {
+        let got = outline_of(crate::LanguageId::Python, source);
+        enclosing(&got, line)
+            .iter()
+            .map(|item| item.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_enclosing_declarations_run_outermost_first() {
+        assert_eq!(names_enclosing(NESTED, 2), ["Widget", "scaled"]);
+    }
+
+    /// A declaration's own header line counts as inside it. A header that
+    /// dropped the class the moment its `class` line scrolled *to* the top
+    /// would flicker every time you scrolled through one.
+    #[test]
+    fn a_declarations_own_header_line_is_inside_it() {
+        assert_eq!(names_enclosing(NESTED, 0), ["Widget"]);
+        assert_eq!(names_enclosing(NESTED, 1), ["Widget", "scaled"]);
+    }
+
+    /// The whole point of recording the span. The declaration *nearest above*
+    /// line 3 is `scaled`, but line 3 is not inside it -- it is not inside
+    /// anything.
+    #[test]
+    fn a_line_between_declarations_is_inside_none_of_them() {
+        assert!(names_enclosing(NESTED, 3).is_empty());
+    }
+
+    #[test]
+    fn a_later_top_level_function_does_not_inherit_the_class() {
+        assert_eq!(names_enclosing(NESTED, 5), ["main"]);
+    }
+
+    /// A decorator line is still in the class body, not yet in the function it
+    /// decorates: the grammar starts `function_definition` at `def`. That is
+    /// the answer a header wants -- the row it would pin is the `def` line, and
+    /// there is nothing to pin until you have scrolled past it.
+    #[test]
+    fn a_decorator_line_is_not_yet_inside_the_function() {
+        let source = "class A:
+    @property
+    def size(self):
+        return 1
+";
+        assert_eq!(names_enclosing(source, 1), ["A"], "the decorator");
+        assert_eq!(names_enclosing(source, 2), ["A", "size"], "the def");
+        assert_eq!(names_enclosing(source, 3), ["A", "size"], "the body");
+    }
+
+    #[test]
+    fn rust_items_enclose_their_lines_too() {
+        let got = outline_of(
+            crate::LanguageId::Rust,
+            "fn main() {
+    let x = 1;
+}
+
+fn other() {}
+",
+        );
+        let names: Vec<&str> = enclosing(&got, 1).iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["main"]);
+        assert!(enclosing(&got, 3).is_empty(), "the blank line between them");
     }
 }

@@ -42,8 +42,9 @@ impl Discovered {
 ///
 /// Looks beyond `PATH`, because the interpreter someone wants to build an
 /// environment from is often not the one `PATH` happens to point at: the `py`
-/// launcher knows about every registered install on Windows, and pyenv keeps
-/// its versions well out of the way.
+/// launcher knows about every registered install on Windows, the Python Install
+/// Manager keeps its runtimes under `%LocalAppData%`, and pyenv keeps its
+/// versions well out of the way.
 ///
 /// Each candidate is verified by actually running it, which is what filters out
 /// the Microsoft Store stubs and any stale entry left behind by an uninstall.
@@ -53,6 +54,11 @@ pub fn discover() -> Vec<Discovered> {
 
     if cfg!(windows) {
         candidates.extend(py_launcher_installs());
+        // The Python Install Manager's own directories. Its runtimes are
+        // registered with `py`, so the launcher above usually lists them too --
+        // but only when `py` itself resolves, and on a machine where the
+        // manager's aliases are switched off it does not.
+        candidates.extend(interpreter::install_manager_pythons());
         candidates.extend(glob_dirs(&[
             r"C:\Python",
             r"C:\Program Files\Python",

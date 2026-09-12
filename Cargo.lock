@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "editor-config"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "editor-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "editor-debug"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "editor-lsp",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "editor-lsp"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "editor-core",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "editor-proc"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "portable-pty",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "editor-search"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "editor-core",
  "regex",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "editor-syntax"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "editor-config",
  "editor-core",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "editor-testing"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "editor-proc",
  "editor-syntax",
@@ -944,14 +944,14 @@ dependencies = [
 
 [[package]]
 name = "editor-vcs"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "editor-proc",
 ]
 
 [[package]]
 name = "editor-widgets"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "editor-config",
@@ -3551,7 +3551,7 @@ dependencies = [
 
 [[package]]
 name = "the-editor"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "arboard",

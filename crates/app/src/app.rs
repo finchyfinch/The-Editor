@@ -614,6 +614,7 @@ impl EditorApp {
             auto_close_brackets: self.settings.auto_close_brackets(),
             docstrings: self.settings.docstrings(),
             reduce_motion: self.settings.reduce_motion(),
+            sticky_scopes: self.settings.sticky_scopes(),
         };
 
         // A project's `.editorconfig` outranks these settings for files it

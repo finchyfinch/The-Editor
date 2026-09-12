@@ -63,6 +63,10 @@ insert_final_newline = false
 # Honour a project's .editorconfig, which overrides the indent and save
 # settings above for files it covers.
 use_editorconfig = true
+# Keep the def or class you are inside pinned to the top of the editor once
+# its own line has scrolled out of sight, up to four levels of nesting. Click a
+# pinned row to jump back to it.
+sticky_scopes = true
 # Stop the caret blinking. Repeating animation is distracting for some people
 # and genuinely disabling for a few, and the caret is the one animation that
 # is on screen the whole time you are reading.
@@ -76,7 +80,8 @@ reduce_motion = false
 renderer = \"glow\"
 
 [python]
-# Leave empty to auto-detect: a .venv in the project, else python on PATH.
+# Leave empty to auto-detect: a .venv in the project, else python on PATH,
+# else an installation made by the Windows Python Install Manager.
 interpreter = \"\"
 # Typing \"\"\" on the first line of a def or class body writes a docstring
 # skeleton from the signature above it: one entry per parameter, the return
@@ -105,6 +110,7 @@ mod defaults {
     pub(super) const WORD_WRAP: bool = false;
     pub(super) const AUTO_CLOSE_BRACKETS: bool = true;
     pub(super) const REDUCE_MOTION: bool = false;
+    pub(super) const STICKY_SCOPES: bool = true;
 
     /// Guard rails for hand-edited values. A `ui_scale = 40.0` should clamp to
     /// something usable rather than render an unrecoverable window.
@@ -522,6 +528,17 @@ impl Settings {
         self.set("editor", "renderer", value(renderer.as_str()));
     }
 
+    /// Whether to pin the enclosing declarations to the top of the editor.
+    #[must_use]
+    pub fn sticky_scopes(&self) -> bool {
+        self.bool_at("editor", "sticky_scopes")
+            .unwrap_or(defaults::STICKY_SCOPES)
+    }
+
+    pub fn set_sticky_scopes(&mut self, on: bool) {
+        self.set("editor", "sticky_scopes", value(on));
+    }
+
     /// Whether to suppress repeating animation, chiefly the caret blink.
     #[must_use]
     pub fn reduce_motion(&self) -> bool {
@@ -717,6 +734,7 @@ mod tests {
         assert_eq!(s.tab_width(), 4);
         assert!(s.insert_spaces());
         assert!(!s.word_wrap());
+        assert!(s.sticky_scopes());
     }
 
     #[test]
@@ -787,6 +805,18 @@ whatever = true
         let mut s = from_toml("ui = 3\n");
         s.set_theme(ThemePreference::Light);
         assert_eq!(s.theme(), ThemePreference::Light);
+    }
+
+    #[test]
+    fn sticky_scopes_is_on_by_default_and_can_be_turned_off() {
+        let mut settings = Settings::default();
+        assert!(settings.sticky_scopes());
+        settings.set_sticky_scopes(false);
+        assert!(!settings.sticky_scopes());
+        assert!(
+            !from_toml(&settings.to_toml()).sticky_scopes(),
+            "survives a write"
+        );
     }
 
     #[test]

@@ -8,6 +8,72 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-12
+
+### Added
+
+- **The declaration you are inside stays on screen.** Scroll past a `def`,
+  `class`, `fn`, `struct`, `trait` or `mod` header and it pins itself to the
+  top of the editor, up to four levels of nesting, so a method two hundred
+  lines long is still a method you can name. Click a pinned row to jump back
+  to it.
+
+  The pinned rows are the real lines of the file, highlighted the way they are
+  highlighted in place, with their real line numbers beside them. A header made
+  of reconstructed names has to invent a notation for signatures, decorators
+  and generics and gets it subtly wrong; the source line is already the
+  notation the reader knows, and it is the line they would have scrolled back
+  to look at.
+
+  Driven by the scroll position rather than by the caret: the question it
+  answers is "what am I looking at", and a header keyed to the caret would sit
+  unchanged while the file moved underneath it. What it shows is what *encloses*
+  the top of the viewport, not what merely precedes it — scroll into the blank
+  lines between two functions and nothing is pinned, because you are not inside
+  anything. That distinction needed the outline to record how far each
+  declaration extends, which it now does.
+
+  Costs no more per frame than the viewport already did: the enclosing
+  declarations are walked out of the parse tree when the tree changes, not when
+  the view scrolls, and each pinned row is highlighted as a single line rather
+  than by colouring everything from the declaration down to the screen.
+
+  On by default; **Settings > Editor > Sticky declarations** turns it off, or
+  `sticky_scopes` in the settings file.
+
+### Fixed
+
+- **Python installed by the Python Install Manager is found.** On a machine
+  whose only Python came from the installer python.org now recommends for
+  Windows, The Editor found nothing at all: `python` ran perfectly well in a
+  terminal, and the Run button, the packages panel and the language servers all
+  behaved as though Python were not installed.
+
+  The install manager is an MSIX app, so the `python`, `python3` and `py`
+  commands it publishes are App Execution Aliases in `WindowsApps` -- the same
+  folder the Microsoft Store puts its decoy `python.exe` in, the one that only
+  prints "Python was not found" and offers to open the Store. The Editor refuses
+  everything in that folder, and has to: the two are indistinguishable on disk,
+  both being zero-byte reparse points identical in size, attributes and link
+  target. Telling them apart means running them, and the detection runs on every
+  frame the settings window is open.
+
+  So rather than guess which alias is real, detection now looks for the
+  interpreter the alias would have dispatched to, which is an ordinary file in
+  an ordinary directory: the install manager's global commands in
+  `%LocalAppData%\Python\bin`, then the runtimes beside them, newest first. A
+  `global_dir` or `install_dir` set in `%AppData%\Python\pymanager.json` is
+  honoured, since an administrator can move both.
+
+  The commands directory is preferred over any single runtime because it follows
+  the default the user has chosen and keeps following it when they change it,
+  which is exactly what `python` means in their terminal. `PATH` still wins over
+  all of it, so nothing changes on a machine that was already working.
+
+  The same directories were added to the interpreter picker and the
+  **Create Virtual Environment** dialog, which previously knew about the old
+  per-user installer's `AppData\Local\Programs\Python` but not this one.
+
 ## [1.0.0] - 2026-08-25
 
 ### Added
@@ -771,5 +837,6 @@ Entries are written as each milestone lands, not retroactively at release time.
 - Rendering spike (`cargo spike`) validating virtualised painting of a
   `ropey::Rope` with a working caret, and measuring paint and edit cost.
 
-[Unreleased]: https://github.com/finchyfinch/The-Editor/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/finchyfinch/The-Editor/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/finchyfinch/The-Editor/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/finchyfinch/The-Editor/releases/tag/v1.0.0
