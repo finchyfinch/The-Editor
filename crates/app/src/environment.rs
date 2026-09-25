@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use editor_config::editorconfig::{self, FileStyle};
@@ -36,6 +37,16 @@ pub(crate) struct Environment {
     requirements: Option<PathBuf>,
     /// `.editorconfig`'s answer per file, with when it was looked up.
     editorconfig: HashMap<PathBuf, (FileStyle, Instant)>,
+    /// Versions found by running a program, keyed by the program and the
+    /// directory it was run in.
+    versions: HashMap<(PathBuf, Option<PathBuf>), Version>,
+}
+
+/// A version being asked for, or the answer.
+#[derive(Debug)]
+enum Version {
+    Asking(Receiver<Result<String, String>>),
+    Known(Result<String, String>),
 }
 
 impl Environment {
@@ -43,6 +54,7 @@ impl Environment {
     pub(crate) fn invalidate(&mut self) {
         self.looked_at = None;
         self.editorconfig.clear();
+        self.versions.clear();
     }
 
     /// React to the file watcher: anything happening in the project may have
@@ -101,6 +113,86 @@ impl Environment {
         let style = editorconfig::style_for(file);
         self.editorconfig.insert(file.to_path_buf(), (style, now));
         style
+    }
+
+    /// The version of the Python at `interpreter`: `None` while it is being
+    /// asked, which takes a process and so happens on a thread of its own.
+    pub(crate) fn python_version(&mut self, interpreter: &Path) -> Option<Result<String, String>> {
+        let path = interpreter.to_path_buf();
+        self.version(path.clone(), None, move || interpreter::version_of(&path))
+    }
+
+    /// The Rust toolchain version in `root`, as `rustc` reports it there — run
+    /// in the project so that rustup applies its `rust-toolchain.toml`.
+    pub(crate) fn rust_version(&mut self, root: Option<&Path>) -> Option<Result<String, String>> {
+        let Some(rustc) = interpreter::which("rustc") else {
+            return Some(Err("rustc is not on PATH".to_owned()));
+        };
+        let cwd = root.map(Path::to_path_buf);
+        let dir = cwd.clone();
+        self.version(rustc.clone(), cwd, move || {
+            let mut command = editor_proc::spawn::quiet(&rustc);
+            command.arg("--version");
+            if let Some(dir) = &dir {
+                command.current_dir(dir);
+            }
+            let output = command.output().map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("rustc failed")
+                    .to_owned());
+            }
+            // `rustc 1.97.1 (a1b2c3d4 2026-08-01)`
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .nth(1)
+                .map(str::to_owned)
+                .ok_or_else(|| "rustc said nothing".to_owned())
+        })
+    }
+
+    /// True while a version is being asked for, so the caller knows to keep
+    /// asking for frames until it arrives.
+    pub(crate) fn is_asking(&self) -> bool {
+        self.versions
+            .values()
+            .any(|v| matches!(v, Version::Asking(_)))
+    }
+
+    fn version(
+        &mut self,
+        program: PathBuf,
+        cwd: Option<PathBuf>,
+        ask: impl FnOnce() -> Result<String, String> + Send + 'static,
+    ) -> Option<Result<String, String>> {
+        let key = (program, cwd);
+        match self.versions.get(&key) {
+            Some(Version::Known(answer)) => return Some(answer.clone()),
+            Some(Version::Asking(rx)) => {
+                let answer = match rx.try_recv() {
+                    Ok(answer) => answer,
+                    Err(TryRecvError::Empty) => return None,
+                    Err(TryRecvError::Disconnected) => Err("no answer".to_owned()),
+                };
+                self.versions.insert(key, Version::Known(answer.clone()));
+                return Some(answer);
+            }
+            None => {}
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = std::thread::Builder::new()
+            .name("version".to_owned())
+            .spawn(move || {
+                let _ = tx.send(ask());
+            });
+        let entry = match asked {
+            Ok(_) => Version::Asking(rx),
+            Err(e) => Version::Known(Err(e.to_string())),
+        };
+        self.versions.insert(key, entry);
+        None
     }
 
     fn refresh(&mut self, configured: &str, root: Option<&Path>) {
@@ -172,6 +264,27 @@ mod tests {
         );
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn a_version_is_asked_for_once_and_then_remembered() {
+        let mut env = Environment::default();
+        let mut runs = 0;
+        let (program, cwd) = (PathBuf::from("prog"), None);
+        let mut answer = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while answer.is_none() && Instant::now() < deadline {
+            answer = env.version(program.clone(), cwd.clone(), || Ok("1.2.3".to_owned()));
+            runs += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(answer, Some(Ok("1.2.3".to_owned())));
+        assert!(runs >= 1);
+        assert!(!env.is_asking());
+        assert_eq!(
+            env.version(program, cwd, || panic!("asked a second time")),
+            Some(Ok("1.2.3".to_owned()))
+        );
     }
 
     #[test]

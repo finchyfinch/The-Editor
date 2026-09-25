@@ -4896,9 +4896,19 @@ impl EditorApp {
                 selected: entry.view.selection_len(),
             }
         });
+        // What will run this file, in place of the bare language name.
+        let runtime = match self.active_doc().map(|entry| entry.language) {
+            Some(LanguageId::Python) => Some(self.python_status()),
+            Some(LanguageId::Rust) => Some(self.rust_status()),
+            _ => None,
+        };
         let theme_label = self.settings.theme().label();
-        let tab_width = self.settings.tab_width();
-        let insert_spaces = self.settings.insert_spaces();
+        // As applied to this file, `.editorconfig` included, not just as set.
+        let EditorOptions {
+            tab_width,
+            insert_spaces,
+            ..
+        } = self.editor_options();
         let running = self.runner.is_running() || self.runner.has_queued_work();
         let diagnostic_counts = self.lsp.diagnostics().total_counts();
         let checkers = self.checker_summary();
@@ -4934,7 +4944,20 @@ impl EditorApp {
                                 ui.weak(format!("({} selected)", s.selected));
                             }
                             ui.separator();
-                            ui.weak(s.language);
+                            match &runtime {
+                                Some(runtime) => {
+                                    if ui
+                                        .button(&runtime.text)
+                                        .on_hover_text(&runtime.hover)
+                                        .clicked()
+                                    {
+                                        invoked = Some(runtime.command);
+                                    }
+                                }
+                                None => {
+                                    ui.weak(s.language);
+                                }
+                            }
                             ui.separator();
                             ui.weak(s.encoding);
                             ui.separator();
@@ -5030,6 +5053,75 @@ impl EditorApp {
             });
 
         invoked
+    }
+
+    /// Which Python will run this file, for the status bar.
+    ///
+    /// PLAN.md §3.8a calls this the indicator that prevents more confusion than
+    /// any other: the Run button, the debugger, the test runner and the
+    /// Packages panel all use this interpreter, and without it on screen
+    /// nothing says when that quietly became a global Python instead of the
+    /// project's environment.
+    fn python_status(&mut self) -> RuntimeStatus {
+        let Some(interpreter) = self.interpreter() else {
+            return RuntimeStatus {
+                text: format!(
+                    "{} No Python",
+                    editor_lsp::diagnostics::Severity::Warning.glyph()
+                ),
+                hover: "No Python interpreter was found, so Python code cannot be run. \
+                        Click to choose one."
+                    .to_owned(),
+                command: CommandId::SelectInterpreter,
+            };
+        };
+        let origin = interpreter.label();
+        let path = interpreter.path.display().to_string();
+        let (text, hover) = match self.environment.python_version(&interpreter.path) {
+            Some(Ok(version)) => (
+                format!("Python {version} ({origin})"),
+                format!("{path}\nClick to choose another interpreter"),
+            ),
+            Some(Err(why)) => (
+                format!(
+                    "{} Python ({origin})",
+                    editor_lsp::diagnostics::Severity::Warning.glyph()
+                ),
+                format!("{path} does not run: {why}\nClick to choose another interpreter"),
+            ),
+            None => (
+                format!("Python ({origin})"),
+                format!("{path}\nClick to choose another interpreter"),
+            ),
+        };
+        RuntimeStatus {
+            text,
+            hover,
+            command: CommandId::SelectInterpreter,
+        }
+    }
+
+    /// Which Rust toolchain this project builds with, for the status bar.
+    fn rust_status(&mut self) -> RuntimeStatus {
+        let (text, hover) = match self.environment.rust_version(self.tree.root()) {
+            Some(Ok(version)) => (
+                format!("Rust {version}"),
+                "The rustc that cargo uses in this project".to_owned(),
+            ),
+            Some(Err(why)) => (
+                format!(
+                    "{} Rust",
+                    editor_lsp::diagnostics::Severity::Warning.glyph()
+                ),
+                format!("No working Rust toolchain: {why}"),
+            ),
+            None => ("Rust".to_owned(), "Asking rustc for its version".to_owned()),
+        };
+        RuntimeStatus {
+            text,
+            hover: format!("{hover}\nClick to check the toolchains"),
+            command: CommandId::CheckToolchains,
+        }
     }
 
     fn editor_pane(&mut self, ui: &mut egui::Ui) -> Option<tab_bar::Action> {
@@ -5548,7 +5640,7 @@ impl eframe::App for EditorApp {
         // whoever looks first gets the key.
         self.completion_keys(&ctx);
         self.sync_language_servers();
-        if self.lsp.is_starting() {
+        if self.lsp.is_starting() || self.environment.is_asking() {
             // A server being looked for or shaking hands answers on another
             // thread, and nothing else wakes an idle window to notice.
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -6035,6 +6127,14 @@ impl eframe::App for EditorApp {
 }
 
 // ---- free functions ------------------------------------------------------
+
+/// The status bar's word on what runs the active file, and what clicking it
+/// does.
+struct RuntimeStatus {
+    text: String,
+    hover: String,
+    command: CommandId,
+}
 
 /// What the status bar displays about the active document.
 struct StatusSummary {

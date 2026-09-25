@@ -8,7 +8,23 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Added
+
+- **The status bar says what will run the file.** For a Python file, the
+  language name is replaced by the interpreter and where it came from —
+  `Python 3.14.6 (.venv)` — and clicking it chooses another; if no Python can
+  be found, or the chosen one does not run, it says so. The Run button, the
+  debugger, the test runner and the Packages panel all use that interpreter,
+  and until now nothing on screen said when it had quietly become a global
+  Python instead of the project's environment. A Rust file shows the version
+  of `rustc` that the project's toolchain file selects, and opens Check
+  Toolchains. Versions are asked for once, in the background.
+
 ### Changed
+
+- **The indentation in the status bar is the file's own.** It showed the
+  global setting even where the project's `.editorconfig` said otherwise and
+  the editor was following that instead.
 
 - **Rename works on a file with unsaved changes.** It used to refuse, because
   a language server could be looking at the file on disk rather than at the
