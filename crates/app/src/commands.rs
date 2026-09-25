@@ -8,7 +8,7 @@
 //! cannot drift apart into doing different things, and that a new command
 //! cannot be added to a menu but forgotten in the palette. See PLAN.md §5.
 
-use eframe::egui::{Key, KeyboardShortcut, Modifiers};
+use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 
 /// Every action The Editor can perform.
 ///
@@ -735,8 +735,72 @@ pub(crate) fn triggered(ctx: &eframe::egui::Context) -> Option<CommandId> {
             // it later in the frame.
             return None;
         }
-        ctx.input_mut(|i| i.consume_shortcut(&sc)).then_some(id)
+        ctx.input_mut(|i| consume(i, sc)).then_some(id)
     })
+}
+
+/// Take `shortcut`'s key press out of this frame's input, if it happened.
+///
+/// egui's own `consume_shortcut` ignores any extra Shift or Alt, so a
+/// combination nothing is bound to ran whatever its letter was bound to:
+/// Ctrl+Shift+W closed the tab. And on a keyboard with an AltGr key, which
+/// arrives as Ctrl+Alt, typing a letter such as Polish `ą` (AltGr+A) ran
+/// Select All. So the modifiers must match exactly — except on keys where
+/// Shift is part of typing the character on some layout. `/` is Shift+7 on a
+/// German keyboard and digits need Shift on a French one, so Ctrl+/ really
+/// arrives as Ctrl+Shift+/ there; demanding an exact match would make Toggle
+/// Comment unreachable. Those keep egui's leniency, and the ordering in
+/// `claimed_bindings` still decides between them.
+fn consume(input: &mut egui::InputState, shortcut: KeyboardShortcut) -> bool {
+    if shift_can_be_part_of(shortcut.logical_key) {
+        return input.consume_shortcut(&shortcut);
+    }
+    let mut found = false;
+    input.events.retain(|event| {
+        let hit = matches!(
+            event,
+            egui::Event::Key { key, modifiers, pressed: true, .. }
+                if *key == shortcut.logical_key && modifiers.matches_exact(shortcut.modifiers)
+        );
+        found |= hit;
+        !hit
+    });
+    found
+}
+
+/// Whether some keyboard layout needs Shift, or AltGr, to type this key.
+fn shift_can_be_part_of(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Colon
+            | Key::Comma
+            | Key::Backslash
+            | Key::Slash
+            | Key::Pipe
+            | Key::Questionmark
+            | Key::Exclamationmark
+            | Key::OpenBracket
+            | Key::CloseBracket
+            | Key::OpenCurlyBracket
+            | Key::CloseCurlyBracket
+            | Key::Backtick
+            | Key::Minus
+            | Key::Period
+            | Key::Plus
+            | Key::Equals
+            | Key::Semicolon
+            | Key::Quote
+            | Key::Num0
+            | Key::Num1
+            | Key::Num2
+            | Key::Num3
+            | Key::Num4
+            | Key::Num5
+            | Key::Num6
+            | Key::Num7
+            | Key::Num8
+            | Key::Num9
+    )
 }
 
 /// Whether this shortcut means something inside a text field.
@@ -781,6 +845,90 @@ fn specificity(sc: KeyboardShortcut) -> u32 {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Run `triggered` against one key press, as the frame loop would.
+    fn press(key: Key, modifiers: Modifiers) -> Option<CommandId> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        let fired = triggered(&ctx);
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        fired
+    }
+
+    /// Ctrl+Shift+W is bound to nothing, and used to close the tab because
+    /// egui ignored the Shift.
+    #[test]
+    fn an_extra_modifier_on_a_letter_is_a_different_shortcut() {
+        let (close, _) = claimed_bindings()
+            .into_iter()
+            .find(|(_, id)| *id == CommandId::CloseTab)
+            .expect("Close Tab has a shortcut");
+        assert_eq!(
+            press(close.logical_key, close.modifiers),
+            Some(CommandId::CloseTab)
+        );
+
+        let with_shift = close.modifiers.plus(Modifiers::SHIFT);
+        let claimed = claimed_bindings()
+            .into_iter()
+            .any(|(sc, _)| sc.logical_key == close.logical_key && sc.modifiers == with_shift);
+        if !claimed {
+            assert_eq!(press(close.logical_key, with_shift), None);
+        }
+    }
+
+    /// AltGr arrives as Ctrl+Alt. With a letter it types a character — Polish
+    /// `ą` is AltGr+A — and must not run that letter's Ctrl shortcut.
+    #[test]
+    fn altgr_with_a_letter_runs_nothing() {
+        // As egui reports it on Windows and Linux: `command` rides with Ctrl.
+        let altgr = Modifiers::COMMAND.plus(Modifiers::ALT);
+        let bindings = claimed_bindings();
+        let (letter, _) = bindings
+            .iter()
+            .find(|(sc, _)| {
+                sc.modifiers == Modifiers::COMMAND
+                    && !shift_can_be_part_of(sc.logical_key)
+                    && !bindings.iter().any(|(other, _)| {
+                        other.logical_key == sc.logical_key && other.modifiers == altgr
+                    })
+            })
+            .expect("some Ctrl+letter shortcut has no Ctrl+Alt twin");
+        assert_eq!(
+            press(letter.logical_key, altgr),
+            None,
+            "{:?}",
+            letter.logical_key
+        );
+    }
+
+    /// On a German keyboard `/` is Shift+7, so Toggle Comment arrives with a
+    /// Shift it did not ask for and must still work.
+    #[test]
+    fn shift_on_a_punctuation_key_is_forgiven() {
+        let (comment, _) = claimed_bindings()
+            .into_iter()
+            .find(|(_, id)| *id == CommandId::ToggleComment)
+            .expect("Toggle Comment has a shortcut");
+        assert!(shift_can_be_part_of(comment.logical_key));
+        assert_eq!(
+            press(
+                comment.logical_key,
+                comment.modifiers.plus(Modifiers::SHIFT)
+            ),
+            Some(CommandId::ToggleComment)
+        );
+    }
 
     /// The bug this ordering exists for: Redo ran Undo.
     ///

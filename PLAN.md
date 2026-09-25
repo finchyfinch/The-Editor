@@ -1054,6 +1054,10 @@ profiling. Each is a product in itself.
   is enough).
 - No command-line file argument: `the-editor foo.py` opens an empty window, so
   "Open with…" and double-clicking a file in Explorer do not work.
+- Save All is Ctrl+Alt+S, which is also AltGr+S — how `ś` is typed on a Polish
+  keyboard. Exact modifier matching cannot tell them apart, because the binding
+  itself is Ctrl+Alt. VS Code avoids it with a chord (Ctrl+K S); worth doing the
+  same, or not binding Save All by default.
 - A wgpu renderer panic ("Failed to create staging buffer for index data") took
   the whole editor down once, on a machine started with a stripped `PATH` —
   probably a software-renderer fallback. Not reproducible with a normal

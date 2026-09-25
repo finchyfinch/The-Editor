@@ -26,6 +26,15 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **A shortcut with an extra modifier no longer runs a different command.**
+  Ctrl+Shift+W, bound to nothing, closed the tab, because the extra Shift was
+  ignored; and on keyboards with an AltGr key, typing a letter such as Polish
+  `ą` (AltGr+A, which arrives as Ctrl+Alt+A) ran that letter's Ctrl shortcut.
+  Letters, function keys and navigation keys now need exactly the modifiers
+  they are bound with. Punctuation and digits still forgive a Shift, because
+  on some layouts it is part of typing them — `/` is Shift+7 on a German
+  keyboard — and Toggle Comment has to keep working there.
+
 - **Long lines can be scrolled to their end.** The editor was a fixed hundred
   and twenty columns wide however long a line was, so the rest of a longer
   line could not be scrolled into view, and typing at its end put the caret
