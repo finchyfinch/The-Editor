@@ -225,6 +225,9 @@ impl Server {
                 // Declared so servers ask rather than assuming their own
                 // defaults; see `configuration_for`.
                 "workspace": { "workspaceFolders": true, "configuration": true },
+                // UTF-32 first: it is how the editor counts, so a server that
+                // accepts it needs no conversion. See `position`.
+                "general": { "positionEncodings": crate::position::Encoding::offered() },
             },
         });
         self.request(id, "initialize", params)?;
@@ -336,6 +339,16 @@ impl Server {
         self.spec.id
     }
 
+    /// How this server counts columns, as agreed in the handshake.
+    #[must_use]
+    pub fn position_encoding(&self) -> crate::position::Encoding {
+        crate::position::Encoding::from_name(
+            self.capabilities
+                .get("positionEncoding")
+                .and_then(Value::as_str),
+        )
+    }
+
     /// True once the handshake has completed.
     #[must_use]
     pub fn is_ready(&self) -> bool {
@@ -440,28 +453,50 @@ impl Server {
     }
 
     /// Ask the server to shut down, then make sure it does.
-    pub fn stop(&mut self) {
-        // Politely first: a server told to shut down flushes its state, which
-        // matters for ones that cache an index on disk.
-        let _ = self.notify("exit", json!(null));
+    ///
+    /// Returns at once. The protocol's `shutdown` request and `exit`
+    /// notification go out in that order, and the wait for the process — and
+    /// the kill if it does not go — happen on a thread of their own, because
+    /// they used to happen here, on the UI thread, at up to half a second a
+    /// server every time a folder was opened or the application closed.
+    ///
+    /// The thread is handed back so that a caller about to exit can wait for
+    /// it: a process that ends first takes the thread with it, and the server
+    /// with nobody left to kill it.
+    #[must_use = "join the handle before exiting, or a stubborn server outlives the editor"]
+    pub fn stop(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        if self.outgoing.is_some() {
+            let id = self.take_id();
+            let _ = self.request(id, "shutdown", Value::Null);
+            let _ = self.notify("exit", Value::Null);
+        }
         self.outgoing = None;
         self.retry_at = None;
 
         if let Some(mut child) = self.child.take() {
-            // Give it a moment, then insist.
-            let deadline = Instant::now() + Duration::from_millis(500);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(20));
+            let id = self.spec.id;
+            let reaped = std::thread::Builder::new()
+                .name(format!("lsp-stop-{id}"))
+                .spawn(move || {
+                    // Politely first: a server told to shut down flushes its
+                    // state, which matters for ones that cache an index on disk.
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while Instant::now() < deadline {
+                        if let Ok(Some(_)) = child.try_wait() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
                     }
-                    _ => break,
-                }
+                    tracing::info!(server = id, "did not exit when asked; killing it");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                });
+            match reaped {
+                Ok(handle) => return Some(handle),
+                Err(e) => tracing::warn!(server = id, "could not start a thread to stop it: {e}"),
             }
-            let _ = child.kill();
-            let _ = child.wait();
         }
+        None
     }
 }
 
@@ -469,7 +504,9 @@ impl Drop for Server {
     fn drop(&mut self) {
         // A dropped server would otherwise be left running, holding a
         // workspace index and a few hundred megabytes.
-        self.stop();
+        if let Some(reaper) = self.stop() {
+            let _ = reaper.join();
+        }
     }
 }
 

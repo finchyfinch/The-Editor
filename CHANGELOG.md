@@ -8,7 +8,44 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Changed
+
+- **Rename works on a file with unsaved changes.** It used to refuse, because
+  a language server could be looking at the file on disk rather than at the
+  buffer. It no longer can (see below), so the refusal has gone.
+
 ### Fixed
+
+- **Open files kept their language server after a virtual environment was
+  created, or a folder opened.** Either one restarts the servers, and the
+  restart forgot every open file — while the editor remembered having sent
+  them and never sent them again. Tabs already open lost their diagnostics,
+  completion, hover and Go to Definition until they were closed and reopened.
+  Only the language-server session keeps that record now, so starting afresh
+  there starts afresh everywhere.
+
+- **Squiggles, jumps and renames land on the right character on lines with an
+  emoji.** Language servers count columns in UTF-16 units unless told
+  otherwise, and the editor counts characters, so every emoji before a
+  position moved it one to the right — and a rename replaced the wrong
+  characters. Positions are now converted both ways, and servers are offered
+  the editor's own count first, which rust-analyzer accepts.
+
+- **A language server that restarts is told what is in the buffer, not what
+  is on disk.** After a crash — and Ruff restarts once on every startup — a
+  server was re-sent the saved file under the buffer's version number, and
+  until the next keystroke answered every question about text that was not on
+  the screen. Files are also no longer sent to a server before its handshake
+  has finished, which the protocol forbids and some servers ignore.
+
+- **Stopping a language server no longer freezes the window.** Opening a
+  folder or quitting waited on each server in turn, up to half a second
+  apiece, on the thread that draws the window. They are asked to shut down
+  properly — the protocol's `shutdown` before `exit` — and waited for in the
+  background; quitting waits for all of them at once, for at most a second.
+
+- **Files over 5 MB are no longer sent to language servers**, as they were
+  always meant not to be.
 
 - **Saving a Windows-1252 file no longer rewrites what it cannot store.** A
   file that was not valid UTF-8 opens as Windows-1252, and anything typed into

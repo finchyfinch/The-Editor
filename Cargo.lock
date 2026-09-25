@@ -890,6 +890,7 @@ dependencies = [
  "editor-core",
  "editor-proc",
  "lsp-types",
+ "ropey",
  "serde",
  "serde_json",
  "tracing",

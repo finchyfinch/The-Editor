@@ -21,6 +21,7 @@
 #![deny(clippy::unwrap_used)]
 
 pub mod diagnostics;
+pub mod position;
 pub mod registry;
 pub mod server;
 pub mod session;

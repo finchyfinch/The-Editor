@@ -378,9 +378,6 @@ pub(crate) struct EditorApp {
     lsp: editor_lsp::session::Lsp,
     /// Which bottom-dock tab is showing.
     dock: DockTab,
-    /// Document versions the servers were last told about, so an unchanged
-    /// document is not re-sent every frame.
-    synced: std::collections::HashMap<PathBuf, u64>,
 }
 
 /// What the pointer is resting on, and what is known about it.
@@ -555,7 +552,6 @@ impl EditorApp {
             completion_version: None,
             lsp: editor_lsp::session::Lsp::default(),
             dock: DockTab::default(),
-            synced: std::collections::HashMap::new(),
             settings,
         };
 
@@ -1629,12 +1625,9 @@ impl EditorApp {
             self.info("Save the file before renaming");
             return;
         };
-        if entry.doc.is_dirty() {
-            // The server reads the file from disk. Renaming against a stale
-            // copy puts every edit on the wrong line, silently.
-            self.info("Save the file first: rename works from what is on disk");
-            return;
-        }
+        // Unsaved changes are fine: the servers are sent the buffer, not the
+        // file, and the rename prompt is modal, so nothing is typed between
+        // the last sync and the question.
         let (line, column) = entry.doc.line_col(entry.view.selection.head);
         let (line, column) = (line as u32 - 1, column as u32 - 1);
 
@@ -2809,41 +2802,20 @@ impl EditorApp {
         self.lsp
             .set_root(self.tree.root().map(Path::to_path_buf), extra_path);
 
-        // Tell the servers about anything new or changed.
+        // Tell the servers about anything new or changed. The session keeps
+        // the only record of what they have been told, so a restart or a new
+        // project root there is noticed here without anyone saying so.
         for entry in &self.docs {
-            let Some(path) = entry.doc.path() else {
-                continue;
-            };
-            let version = entry.doc.version();
-            match self.synced.get(path) {
-                None => {
-                    self.lsp.open(path, &entry.doc.text().to_string());
-                    self.synced.insert(path.to_path_buf(), version);
-                }
-                Some(known) if *known != version => {
-                    self.lsp.change(path, &entry.doc.text().to_string());
-                    self.synced.insert(path.to_path_buf(), version);
-                }
-                Some(_) => {}
+            if let Some(path) = entry.doc.path() {
+                self.lsp
+                    .sync(path, entry.doc.version(), || entry.doc.text().to_string());
             }
         }
 
         // ...and about anything closed.
-        let open: std::collections::HashSet<PathBuf> = self
-            .docs
-            .iter()
-            .filter_map(|d| d.doc.path().map(Path::to_path_buf))
-            .collect();
-        let closed: Vec<PathBuf> = self
-            .synced
-            .keys()
-            .filter(|p| !open.contains(*p))
-            .cloned()
-            .collect();
-        for path in closed {
-            self.lsp.close(&path);
-            self.synced.remove(&path);
-        }
+        let open: std::collections::HashSet<&Path> =
+            self.docs.iter().filter_map(|d| d.doc.path()).collect();
+        self.lsp.retain(|path| open.contains(path));
 
         for notice in self.lsp.poll() {
             match notice {
@@ -3033,9 +3005,9 @@ impl EditorApp {
 
     /// Diagnostics for a document, converted to character offsets.
     ///
-    /// The protocol works in zero-based line and UTF-16 column; the editor works
-    /// in character offsets. Converting here rather than at the point of use
-    /// means one place to get it wrong.
+    /// The store holds zero-based lines and *character* columns — the language
+    /// session has already converted from whatever the server counts in (see
+    /// `editor_lsp::position`) — so this only turns them into offsets.
     fn underlines_for(
         entry: &OpenDoc,
         store: &editor_lsp::diagnostics::Store,
@@ -6251,23 +6223,37 @@ fn shorten_middle(text: &str, max: usize) -> String {
 
 /// Apply a rename to a file that is not open, on disk.
 ///
-/// The edits arrive sorted last-first, so each replacement is stated in
-/// coordinates that the ones already applied have not disturbed.
+/// Through a [`Document`], so the file is read and written exactly as an open
+/// one would be: its encoding, byte-order mark and line endings kept, and the
+/// write atomic. The edits all go in one transaction, in the coordinates of the
+/// file as it was — which is what a `WorkspaceEdit` states them in — rather
+/// than one after another, where each depended on the ones before it having
+/// been applied in the right order.
 fn apply_rename_to_disk(file: &editor_lsp::session::FileEdit) -> Result<(), String> {
-    let text = std::fs::read_to_string(&file.path).map_err(|e| e.to_string())?;
-    let mut rope = ropey::Rope::from_str(&text);
-
+    let mut doc = Document::open(&file.path).map_err(|e| format!("{e:#}"))?;
+    let mut edits = Vec::with_capacity(file.edits.len());
     for edit in &file.edits {
-        let start = offset_of(&rope, edit.start_line as usize, edit.start_column as usize);
-        let end = offset_of(&rope, edit.end_line as usize, edit.end_column as usize);
-        if end < start || end > rope.len_chars() {
-            return Err("the server described an edit outside the file".to_owned());
+        let start = offset_of(
+            doc.text(),
+            edit.start_line as usize,
+            edit.start_column as usize,
+        );
+        let end = offset_of(doc.text(), edit.end_line as usize, edit.end_column as usize);
+        if end < start {
+            return Err("the server described an edit that ends before it starts".to_owned());
         }
-        rope.remove(start..end);
-        rope.insert(start, &edit.text);
+        edits.push(editor_core::edit::Edit::replace(
+            start..end,
+            edit.text.clone(),
+        ));
     }
-
-    std::fs::write(&file.path, rope.to_string()).map_err(|e| e.to_string())
+    let unchanged = editor_core::selection::Selection::at(0);
+    doc.apply(
+        &editor_core::edit::Transaction::new(edits),
+        unchanged,
+        unchanged,
+    );
+    doc.save().map_err(|e| format!("{e:#}"))
 }
 
 /// A zero-based line and column as a character offset, clamped to that line.

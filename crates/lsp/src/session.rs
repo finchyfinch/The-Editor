@@ -14,9 +14,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use editor_core::document::Document;
+use ropey::Rope;
 use serde_json::json;
 
 use crate::diagnostics::{Diagnostic, Store};
+use crate::position::{self, Encoding};
 use crate::registry::{self, ServerSpec};
 use crate::server::{self, Event, Server};
 
@@ -192,13 +195,39 @@ pub enum Notice {
 }
 
 /// One open document, as the servers see it.
+///
+/// Holds the text itself, not just a version number. The servers must be told
+/// what is in the *buffer*: a server started late, or restarted after a crash,
+/// used to be sent the file as it was on disk — with the buffer's version
+/// number on it — so until the next keystroke it answered questions about a
+/// text nobody was looking at, and a rename computed against that text
+/// landed in the wrong places. The text is also what converts columns between
+/// the editor's count and the protocol's; see [`crate::position`].
 #[derive(Debug, Clone)]
 struct OpenDocument {
-    language_id: &'static str,
+    /// `None` for a file no server handles, which is still recorded so that it
+    /// is not offered again on every frame.
+    language_id: Option<&'static str>,
+    /// The protocol's version, bumped with every change sent.
     version: i32,
-    /// Which servers have been told about this file, so it is closed with the
-    /// same ones and never opened twice.
+    /// The editor's version of the text below, so an unchanged document is
+    /// not sent again.
+    source_version: u64,
+    text: Rope,
+    /// Servers that should know this document.
+    serving: Vec<&'static str>,
+    /// The subset that have been sent it. A server joins this list when it
+    /// is sent `didOpen`, which waits for its handshake to finish, and leaves
+    /// it when it dies, so a restarted server is sent the document afresh.
     told: Vec<&'static str>,
+}
+
+impl OpenDocument {
+    /// The text of `line`, or `None` past the end.
+    fn line(&self, line: u32) -> Option<String> {
+        let line = line as usize;
+        (line < self.text.len_lines()).then(|| self.text.line(line).to_string())
+    }
 }
 
 /// Every running server, and what they know.
@@ -221,12 +250,15 @@ pub struct Lsp {
     /// Server ids the user has switched off. Checked before starting one, so a
     /// disabled server is never spawned rather than started and ignored.
     disabled: Vec<String>,
+    /// Threads waiting for stopped servers to exit, joined when this is
+    /// dropped so that none outlives the editor.
+    stopping: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Lsp {
-    /// Point at a project. Stops everything running for the previous one.
     /// Switch servers off by id. Anything already running for a newly
-    /// disabled server is stopped.
+    /// disabled server is stopped, and a server switched back on is started
+    /// for the files that want it.
     pub fn set_disabled(&mut self, disabled: Vec<String>) {
         if self.disabled == disabled {
             return;
@@ -240,17 +272,30 @@ impl Lsp {
             .collect();
         for id in stopping {
             if let Some(mut server) = self.servers.remove(id) {
-                server.stop();
+                self.stopping.extend(server.stop());
             }
             // Its findings go with it: a server that is not running is not
             // there to correct them.
             self.diagnostics.clear_server(id);
-            self.documents
-                .values_mut()
-                .for_each(|d| d.told.retain(|t| *t != id));
+            for document in self.documents.values_mut() {
+                document.serving.retain(|s| *s != id);
+                document.told.retain(|t| *t != id);
+            }
+        }
+        // Anything re-enabled: every document asks again for what it wants.
+        let paths: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        for path in paths {
+            self.attach(&path);
         }
     }
 
+    /// Point at a project. Stops everything running for the previous one.
+    ///
+    /// Every document is forgotten along with the servers, so the next
+    /// [`Self::sync`] offers each open file to the new project's servers.
+    /// Forgetting them here and remembering them anywhere else is how open
+    /// tabs used to lose their language server for good after a virtual
+    /// environment was created.
     pub fn set_root(&mut self, root: Option<PathBuf>, extra_path: Vec<PathBuf>) {
         if self.root == root && self.extra_path == extra_path {
             return;
@@ -263,8 +308,9 @@ impl Lsp {
     /// Stop every server and forget everything.
     pub fn shutdown(&mut self) {
         for (_, mut server) in self.servers.drain() {
-            server.stop();
+            self.stopping.extend(server.stop());
         }
+        self.stopping.retain(|reaper| !reaper.is_finished());
         self.documents.clear();
         self.diagnostics.clear();
         self.missing.clear();
@@ -309,76 +355,109 @@ impl Lsp {
         &self.missing
     }
 
-    /// Tell the servers a file is open.
+    /// Bring the servers' copy of a document up to date with the editor's.
     ///
-    /// Does nothing for a language with no server, which is the common case and
-    /// must be free.
-    pub fn open(&mut self, path: &Path, text: &str) {
-        if self.documents.contains_key(path) {
-            return;
+    /// `version` is the document's own version; `text` is asked for only when
+    /// the servers are behind, so calling this every frame for every tab costs
+    /// a hash lookup. This is the only record of what the servers have been
+    /// told — the application keeps none of its own, which is what lets
+    /// [`Self::set_root`] start afresh without anyone else having to notice.
+    pub fn sync(&mut self, path: &Path, version: u64, text: impl FnOnce() -> String) {
+        match self.documents.get(path) {
+            Some(document) if document.source_version == version => {}
+            Some(_) => self.change(path, version, &text()),
+            None => self.open(path, version, &text()),
         }
-        let Some(language_id) = path
+    }
+
+    /// Close every document for which `keep` says no.
+    pub fn retain(&mut self, keep: impl Fn(&Path) -> bool) {
+        let closing: Vec<PathBuf> = self
+            .documents
+            .keys()
+            .filter(|path| !keep(path))
+            .cloned()
+            .collect();
+        for path in closing {
+            self.close(&path);
+        }
+    }
+
+    /// Record a document and offer it to the servers for its language.
+    ///
+    /// Cheap for a language with no server, which is the common case: the
+    /// document is recorded so it is not offered again, and nothing starts.
+    /// A file too large to edit is recorded the same way — PLAN.md §8 keeps
+    /// language servers away from it.
+    fn open(&mut self, path: &Path, version: u64, text: &str) {
+        let too_large = text.len() as u64 > editor_core::document::LARGE_FILE_BYTES;
+        let language_id = path
             .extension()
             .and_then(|e| e.to_str())
             .and_then(registry::language_id_for_extension)
-        else {
+            .filter(|_| !too_large);
+        self.documents.insert(
+            path.to_path_buf(),
+            OpenDocument {
+                language_id,
+                version: 1,
+                source_version: version,
+                text: Rope::from_str(text),
+                serving: Vec::new(),
+                told: Vec::new(),
+            },
+        );
+        self.attach(path);
+    }
+
+    /// Start whatever servers a document wants and has not got, and send it
+    /// to any that are ready. One that is still starting is sent it by
+    /// [`Self::on_ready`].
+    fn attach(&mut self, path: &Path) {
+        let Some(language_id) = self.documents.get(path).and_then(|d| d.language_id) else {
             return;
         };
-        let wanted = registry::for_language(language_id);
-        if wanted.is_empty() {
+        let started: Vec<&'static str> = registry::for_language(language_id)
+            .into_iter()
+            .filter_map(|spec| self.ensure_started(spec))
+            .collect();
+        let Some(document) = self.documents.get_mut(path) else {
             return;
-        }
-
-        let mut told = Vec::new();
-        for spec in wanted {
-            if self.ensure_started(spec).is_some() {
-                told.push(spec.id);
+        };
+        for id in started {
+            if !document.serving.contains(&id) {
+                document.serving.push(id);
             }
         }
-        if told.is_empty() {
-            return;
+        let uri = server::path_to_uri(path);
+        for id in document.serving.clone() {
+            if document.told.contains(&id) {
+                continue;
+            }
+            if let Some(server) = self.servers.get(id)
+                && server.is_ready()
+            {
+                send_open(server, &uri, document);
+                document.told.push(id);
+            }
         }
+    }
 
-        let document = OpenDocument {
-            language_id,
-            version: 1,
-            told,
+    /// Tell the servers a document changed.
+    fn change(&mut self, path: &Path, version: u64, text: &str) {
+        let Some(document) = self.documents.get_mut(path) else {
+            return;
         };
+        document.text = Rope::from_str(text);
+        document.source_version = version;
+        document.version += 1;
         let uri = server::path_to_uri(path);
         for id in &document.told {
             if let Some(server) = self.servers.get(id) {
                 let _ = server.notify(
-                    "textDocument/didOpen",
-                    json!({
-                        "textDocument": {
-                            "uri": uri,
-                            "languageId": language_id,
-                            "version": document.version,
-                            "text": text,
-                        }
-                    }),
-                );
-            }
-        }
-        self.documents.insert(path.to_path_buf(), document);
-    }
-
-    /// Tell the servers a file changed.
-    pub fn change(&mut self, path: &Path, text: &str) {
-        let Some(document) = self.documents.get_mut(path) else {
-            return;
-        };
-        document.version += 1;
-        let uri = server::path_to_uri(path);
-        let version = document.version;
-        let told = document.told.clone();
-
-        for id in told {
-            if let Some(server) = self.servers.get(id) {
-                let _ = server.notify(
                     "textDocument/didChange",
                     json!({
-                        "textDocument": { "uri": uri, "version": version },
+                        "textDocument": { "uri": uri, "version": document.version },
                         // Full-text sync: one range covering everything.
                         "contentChanges": [{ "text": text }],
                     }),
@@ -403,6 +482,38 @@ impl Lsp {
         }
     }
 
+    /// The servers that know `path` and can answer `capability`, each with the
+    /// position in its own column count. Empty when nobody can be asked.
+    ///
+    /// `line` and `column` are the editor's: zero-based, counted in characters.
+    fn askable(
+        &self,
+        path: &Path,
+        capability: &str,
+        line: u32,
+        column: u32,
+    ) -> Vec<(&'static str, serde_json::Value)> {
+        let Some(document) = self.documents.get(path) else {
+            return Vec::new();
+        };
+        let text = document.line(line).unwrap_or_default();
+        document
+            .told
+            .iter()
+            .filter_map(|id| {
+                let server = self.servers.get(id)?;
+                // Ruff serves Python and cannot answer most of these. Asking it
+                // anyway gets a "method not found" and, worse, stops the loop
+                // before the server that *can* answer is reached.
+                if !server.is_ready() || !server.supports(capability) {
+                    return None;
+                }
+                let character = position::to_protocol(&text, column, server.position_encoding());
+                Some((*id, json!({ "line": line, "character": character })))
+            })
+            .collect()
+    }
+
     /// Ask a server where something is defined, or where else it is used.
     ///
     /// Returns false if nothing could be asked — no server for this language,
@@ -414,33 +525,18 @@ impl Lsp {
     /// results from a linter and a type checker produces a list with the same
     /// place in it twice.
     pub fn ask(&mut self, query: Query, path: &Path, line: u32, column: u32) -> bool {
-        let Some(document) = self.documents.get(path) else {
-            return false;
-        };
-        let told = document.told.clone();
         let uri = server::path_to_uri(path);
-
-        for id in told {
-            let Some(server) = self.servers.get_mut(id) else {
-                continue;
-            };
-            // Ruff serves Python and cannot answer either of these. Asking it
-            // anyway gets a "method not found" and, worse, stops the loop
-            // before the server that *can* answer is reached.
-            if !server.is_ready() || !server.supports(query.capability()) {
-                continue;
-            }
-            let mut params = json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line, "character": column },
-            });
+        for (id, position) in self.askable(path, query.capability(), line, column) {
+            let mut params = json!({ "textDocument": { "uri": uri }, "position": position });
             if query == Query::References {
                 // Without this the definition itself is left out of the list,
                 // and "find uses" that skips the declaration is confusing when
                 // there is only one use.
                 params["context"] = json!({ "includeDeclaration": true });
             }
-            if let Ok(request) = server.send_request(query.method(), params) {
+            if let Some(server) = self.servers.get_mut(id)
+                && let Ok(request) = server.send_request(query.method(), params)
+            {
                 self.pending
                     .insert((id, request), Pending::Locations(query));
                 return true;
@@ -461,25 +557,12 @@ impl Lsp {
     /// one.
     pub fn complete(&mut self, path: &Path, line: u32, column: u32) -> bool {
         self.pending.retain(|_, kind| *kind != Pending::Completions);
-
-        let Some(document) = self.documents.get(path) else {
-            return false;
-        };
-        let told = document.told.clone();
         let uri = server::path_to_uri(path);
-
-        for id in told {
-            let Some(server) = self.servers.get_mut(id) else {
-                continue;
-            };
-            if !server.is_ready() || !server.supports("completionProvider") {
-                continue;
-            }
-            let params = json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line, "character": column },
-            });
-            if let Ok(request) = server.send_request("textDocument/completion", params) {
+        for (id, position) in self.askable(path, "completionProvider", line, column) {
+            let params = json!({ "textDocument": { "uri": uri }, "position": position });
+            if let Some(server) = self.servers.get_mut(id)
+                && let Ok(request) = server.send_request("textDocument/completion", params)
+            {
                 self.pending.insert((id, request), Pending::Completions);
                 return true;
             }
@@ -505,29 +588,19 @@ impl Lsp {
     /// meant Ruff answered `null` in ten milliseconds and basedpyright, which
     /// knows the type, was never asked at all. The caller keeps the first
     /// non-empty answer.
+    ///
+    /// The answer carries back the position asked about, in the editor's
+    /// terms, so the caller can tell whether it still applies.
     pub fn hover(&mut self, path: &Path, line: u32, column: u32) -> bool {
         self.pending
             .retain(|_, kind| !matches!(kind, Pending::Hover { .. }));
-
-        let Some(document) = self.documents.get(path) else {
-            return false;
-        };
-        let told = document.told.clone();
         let uri = server::path_to_uri(path);
         let mut asked = false;
-
-        for id in told {
-            let Some(server) = self.servers.get_mut(id) else {
-                continue;
-            };
-            if !server.is_ready() || !server.supports("hoverProvider") {
-                continue;
-            }
-            let params = json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line, "character": column },
-            });
-            if let Ok(request) = server.send_request("textDocument/hover", params) {
+        for (id, position) in self.askable(path, "hoverProvider", line, column) {
+            let params = json!({ "textDocument": { "uri": uri }, "position": position });
+            if let Some(server) = self.servers.get_mut(id)
+                && let Ok(request) = server.send_request("textDocument/hover", params)
+            {
                 self.pending
                     .insert((id, request), Pending::Hover { line, column });
                 asked = true;
@@ -543,25 +616,16 @@ impl Lsp {
     /// rename the wrong things, and a wrong rename is silent until something
     /// breaks much later.
     pub fn rename(&mut self, path: &Path, line: u32, column: u32, new_name: &str) -> bool {
-        let Some(document) = self.documents.get(path) else {
-            return false;
-        };
-        let told = document.told.clone();
         let uri = server::path_to_uri(path);
-
-        for id in told {
-            let Some(server) = self.servers.get_mut(id) else {
-                continue;
-            };
-            if !server.is_ready() || !server.supports("renameProvider") {
-                continue;
-            }
+        for (id, position) in self.askable(path, "renameProvider", line, column) {
             let params = json!({
                 "textDocument": { "uri": uri },
-                "position": { "line": line, "character": column },
+                "position": position,
                 "newName": new_name,
             });
-            if let Ok(request) = server.send_request("textDocument/rename", params) {
+            if let Some(server) = self.servers.get_mut(id)
+                && let Ok(request) = server.send_request("textDocument/rename", params)
+            {
                 self.pending.insert((id, request), Pending::Rename);
                 return true;
             }
@@ -640,15 +704,29 @@ impl Lsp {
             };
             let spec = server.spec();
             let events = server.poll();
+            // Read after polling: the handshake that fixes it may be among the
+            // events just drained.
+            let encoding = server.position_encoding();
             let became_ready = events.iter().any(|e| matches!(e, Event::Ready { .. }));
 
             for event in events {
                 match event {
                     Event::Diagnostics { path, diagnostics } => {
-                        let converted: Vec<Diagnostic> = diagnostics
+                        let mut converted: Vec<Diagnostic> = diagnostics
                             .iter()
                             .map(|d| Diagnostic::from_lsp(d, spec.name))
                             .collect();
+                        // A file nobody has open is left in protocol columns:
+                        // reading it from disk for every publish would cost
+                        // more than a column on an emoji line is worth, and
+                        // opening it gets fresh diagnostics anyway.
+                        if let Some(document) = self.documents.get(&path) {
+                            for d in &mut converted {
+                                d.column = from_protocol(document, d.line, d.column, encoding);
+                                d.end_column =
+                                    from_protocol(document, d.end_line, d.end_column, encoding);
+                            }
+                        }
                         self.diagnostics.set(&path, id, converted);
                         notices.push(Notice::DiagnosticsChanged(path));
                     }
@@ -656,6 +734,12 @@ impl Lsp {
                         // Stale diagnostics from a server that is no longer
                         // running to correct them are worse than none.
                         self.diagnostics.clear_server(id);
+                        // A restarted server knows nothing, so every document
+                        // has to be sent to it again once it is ready.
+                        for document in self.documents.values_mut() {
+                            document.told.retain(|t| *t != id);
+                        }
+                        self.pending.retain(|(server, _), _| *server != id);
                         notices.push(Notice::ServerDied {
                             id,
                             name: spec.name,
@@ -677,16 +761,41 @@ impl Lsp {
                         result,
                     } => match self.pending.remove(&(id, request)) {
                         Some(Pending::Locations(query)) => {
-                            notices.push(Notice::Answered {
-                                query,
-                                locations: parse_locations(&result),
-                            });
+                            let mut locations = parse_locations(&result);
+                            let mut texts = Texts::new(&self.documents);
+                            for location in &mut locations {
+                                location.column = texts.column(
+                                    &location.path,
+                                    location.line,
+                                    location.column,
+                                    encoding,
+                                );
+                            }
+                            notices.push(Notice::Answered { query, locations });
                         }
                         Some(Pending::Completions) => {
                             notices.push(Notice::Completions(parse_completions(&result)));
                         }
                         Some(Pending::Rename) => {
-                            notices.push(Notice::Rename(parse_workspace_edit(&result)));
+                            let mut files = parse_workspace_edit(&result);
+                            let mut texts = Texts::new(&self.documents);
+                            for file in &mut files {
+                                for edit in &mut file.edits {
+                                    edit.start_column = texts.column(
+                                        &file.path,
+                                        edit.start_line,
+                                        edit.start_column,
+                                        encoding,
+                                    );
+                                    edit.end_column = texts.column(
+                                        &file.path,
+                                        edit.end_line,
+                                        edit.end_column,
+                                        encoding,
+                                    );
+                                }
+                            }
+                            notices.push(Notice::Rename(files));
                         }
                         Some(Pending::Hover { line, column }) => {
                             notices.push(Notice::Hovered {
@@ -711,32 +820,20 @@ impl Lsp {
         notices
     }
 
-    /// Complete the handshake and re-send every open document.
-    ///
-    /// The re-send matters after a restart: a freshly started server knows
-    /// nothing, and without this it would answer questions about files it has
-    /// never seen, or say nothing at all.
+    /// Complete the handshake, then send every document waiting for this
+    /// server — from the buffer, as it is now.
     fn on_ready(&mut self, id: &'static str) {
         let Some(server) = self.servers.get(id) else {
             return;
         };
         let _ = server.notify("initialized", json!({}));
 
-        for (path, document) in &self.documents {
-            if !document.told.contains(&id) {
+        for (path, document) in &mut self.documents {
+            if !document.serving.contains(&id) || document.told.contains(&id) {
                 continue;
             }
-            let _ = server.notify(
-                "textDocument/didOpen",
-                json!({
-                    "textDocument": {
-                        "uri": server::path_to_uri(path),
-                        "languageId": document.language_id,
-                        "version": document.version,
-                        "text": std::fs::read_to_string(path).unwrap_or_default(),
-                    }
-                }),
-            );
+            send_open(server, &server::path_to_uri(path), document);
+            document.told.push(id);
         }
     }
 }
@@ -744,6 +841,73 @@ impl Lsp {
 impl Drop for Lsp {
     fn drop(&mut self) {
         self.shutdown();
+        // All at once rather than one after another, so a quit waits for the
+        // slowest server rather than for the sum of them.
+        for reaper in self.stopping.drain(..) {
+            let _ = reaper.join();
+        }
+    }
+}
+
+/// Send `didOpen` for a document, with the text the editor holds.
+fn send_open(server: &Server, uri: &str, document: &OpenDocument) {
+    let _ = server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": document.language_id.unwrap_or("plaintext"),
+                "version": document.version,
+                "text": document.text.to_string(),
+            }
+        }),
+    );
+}
+
+/// A protocol column on `line` of an open document, as a character column.
+fn from_protocol(document: &OpenDocument, line: u32, column: u32, encoding: Encoding) -> u32 {
+    match document.line(line) {
+        Some(text) => position::from_protocol(&text, column, encoding),
+        None => column,
+    }
+}
+
+/// The text of files a server's answer refers to, for converting its columns.
+///
+/// Open documents are read from the buffer, which is what the server was
+/// told. Anything else is read from disk once per answer, the same way it is
+/// read when the answer is acted on — through [`Document::open`], so a
+/// byte-order mark or CRLF line endings do not shift the count.
+struct Texts<'a> {
+    open: &'a HashMap<PathBuf, OpenDocument>,
+    closed: HashMap<PathBuf, Option<Rope>>,
+}
+
+impl<'a> Texts<'a> {
+    fn new(open: &'a HashMap<PathBuf, OpenDocument>) -> Self {
+        Self {
+            open,
+            closed: HashMap::new(),
+        }
+    }
+
+    fn column(&mut self, path: &Path, line: u32, column: u32, encoding: Encoding) -> u32 {
+        if encoding == Encoding::Utf32 {
+            return column;
+        }
+        if let Some(document) = self.open.get(path) {
+            return from_protocol(document, line, column, encoding);
+        }
+        let rope = self
+            .closed
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Document::open(path).ok().map(|d| d.text().clone()));
+        match rope {
+            Some(rope) if (line as usize) < rope.len_lines() => {
+                position::from_protocol(&rope.line(line as usize).to_string(), column, encoding)
+            }
+            _ => column,
+        }
     }
 }
 
@@ -1247,33 +1411,87 @@ mod tests {
         assert_eq!(Query::References.method(), "textDocument/references");
     }
 
+    /// A document as a test wants it, served by nobody.
+    fn document(language_id: Option<&'static str>, version: i32) -> OpenDocument {
+        OpenDocument {
+            language_id,
+            version,
+            source_version: 1,
+            text: Rope::from_str(""),
+            serving: Vec::new(),
+            told: Vec::new(),
+        }
+    }
+
     #[test]
     fn a_language_with_no_server_is_free() {
-        // Opening a text file must not start anything or allocate a document.
+        // Opening a text file must not start anything. It is recorded, so that
+        // it is not offered again on the next frame, and that is all.
         let mut lsp = Lsp::default();
         lsp.set_root(Some(PathBuf::from(".")), Vec::new());
-        lsp.open(Path::new("/project/notes.txt"), "hello");
+        lsp.sync(Path::new("/project/notes.txt"), 1, || "hello".to_owned());
 
-        assert!(lsp.documents.is_empty());
         assert!(lsp.servers.is_empty());
         assert!(lsp.running().is_empty());
+        assert!(
+            lsp.documents[Path::new("/project/notes.txt")]
+                .serving
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unchanged_document_is_not_even_asked_for_its_text() {
+        // The application calls this every frame for every tab.
+        let mut lsp = Lsp::default();
+        let path = Path::new("/project/notes.txt");
+        lsp.sync(path, 7, || "hello".to_owned());
+        lsp.sync(path, 7, || panic!("the text was built for nothing"));
     }
 
     #[test]
     fn a_file_with_no_extension_is_ignored() {
         let mut lsp = Lsp::default();
         lsp.set_root(Some(PathBuf::from(".")), Vec::new());
-        lsp.open(Path::new("/project/Makefile"), "all:");
-        assert!(lsp.documents.is_empty());
+        lsp.sync(Path::new("/project/Makefile"), 1, || "all:".to_owned());
+        assert!(lsp.servers.is_empty());
     }
 
     #[test]
     fn opening_without_a_project_root_starts_nothing() {
         // There is nowhere for a server to index.
         let mut lsp = Lsp::default();
-        lsp.open(Path::new("/loose/main.py"), "x = 1");
+        lsp.sync(Path::new("/loose/main.py"), 1, || "x = 1".to_owned());
         assert!(lsp.servers.is_empty());
+    }
+
+    /// The bug: `set_root` forgot every document, while the application kept
+    /// its own list of what it had sent and so never sent anything again. Open
+    /// tabs lost their language server for good after a virtual environment
+    /// was created, or a folder opened with files already open.
+    #[test]
+    fn documents_are_offered_again_after_the_project_changes() {
+        let mut lsp = Lsp::default();
+        let path = Path::new("/a/main.py");
+        lsp.set_root(Some(PathBuf::from("/a")), Vec::new());
+        lsp.sync(path, 3, || "x = 1".to_owned());
+        assert!(lsp.documents.contains_key(path));
+
+        // A venv appeared: the tool search path changed.
+        lsp.set_root(
+            Some(PathBuf::from("/a")),
+            vec![PathBuf::from("/a/.venv/bin")],
+        );
         assert!(lsp.documents.is_empty());
+
+        // The very next frame, with the document unchanged.
+        let mut asked = false;
+        lsp.sync(path, 3, || {
+            asked = true;
+            "x = 1".to_owned()
+        });
+        assert!(asked, "an unchanged document must still be re-sent");
+        assert!(lsp.documents.contains_key(path));
     }
 
     #[test]
@@ -1284,9 +1502,9 @@ mod tests {
 
         // Nothing is installed under this fake spec, so `python` resolution
         // will record whatever is genuinely absent.
-        lsp.open(Path::new("/project/a.py"), "x = 1");
+        lsp.sync(Path::new("/project/a.py"), 1, || "x = 1".to_owned());
         let after_first = lsp.missing.len();
-        lsp.open(Path::new("/project/b.py"), "y = 2");
+        lsp.sync(Path::new("/project/b.py"), 1, || "y = 2".to_owned());
         assert_eq!(
             lsp.missing.len(),
             after_first,
@@ -1297,7 +1515,7 @@ mod tests {
     #[test]
     fn changing_a_file_that_was_never_opened_is_harmless() {
         let mut lsp = Lsp::default();
-        lsp.change(Path::new("/project/never-opened.py"), "x = 1");
+        lsp.change(Path::new("/project/never-opened.py"), 1, "x = 1");
         lsp.save(Path::new("/project/never-opened.py"), "x = 1");
         lsp.close(Path::new("/project/never-opened.py"));
     }
@@ -1333,14 +1551,8 @@ mod tests {
     fn changing_the_project_root_shuts_everything_down() {
         let mut lsp = Lsp::default();
         lsp.set_root(Some(PathBuf::from("/a")), Vec::new());
-        lsp.documents.insert(
-            PathBuf::from("/a/main.py"),
-            OpenDocument {
-                language_id: "python",
-                version: 1,
-                told: vec!["ruff"],
-            },
-        );
+        lsp.documents
+            .insert(PathBuf::from("/a/main.py"), document(Some("python"), 1));
 
         lsp.set_root(Some(PathBuf::from("/b")), Vec::new());
         assert!(
@@ -1355,14 +1567,8 @@ mod tests {
         // rust-analyzer to start another would cost a full re-index.
         let mut lsp = Lsp::default();
         lsp.set_root(Some(PathBuf::from("/a")), Vec::new());
-        lsp.documents.insert(
-            PathBuf::from("/a/main.py"),
-            OpenDocument {
-                language_id: "python",
-                version: 1,
-                told: vec!["ruff"],
-            },
-        );
+        lsp.documents
+            .insert(PathBuf::from("/a/main.py"), document(Some("python"), 1));
 
         lsp.set_root(Some(PathBuf::from("/a")), Vec::new());
         assert_eq!(lsp.documents.len(), 1, "nothing should have been torn down");
@@ -1374,56 +1580,36 @@ mod tests {
         // change entirely.
         let mut lsp = Lsp::default();
         let path = PathBuf::from("/project/main.py");
-        lsp.documents.insert(
-            path.clone(),
-            OpenDocument {
-                language_id: "python",
-                version: 1,
-                told: Vec::new(),
-            },
-        );
+        lsp.documents
+            .insert(path.clone(), document(Some("python"), 1));
 
-        lsp.change(&path, "a");
-        lsp.change(&path, "ab");
-        lsp.change(&path, "abc");
+        lsp.change(&path, 2, "a");
+        lsp.change(&path, 3, "ab");
+        lsp.change(&path, 4, "abc");
 
         assert_eq!(lsp.documents[&path].version, 4);
     }
 
     #[test]
-    fn opening_the_same_file_twice_is_a_no_op() {
+    fn a_known_document_is_changed_rather_than_opened_again() {
         // A second didOpen for the same URI is a protocol violation and some
         // servers respond by dropping the document entirely.
         let mut lsp = Lsp::default();
         let path = PathBuf::from("/project/main.py");
-        lsp.documents.insert(
-            path.clone(),
-            OpenDocument {
-                language_id: "python",
-                version: 5,
-                told: Vec::new(),
-            },
-        );
+        lsp.documents
+            .insert(path.clone(), document(Some("python"), 5));
 
-        lsp.open(&path, "different text");
-        assert_eq!(
-            lsp.documents[&path].version, 5,
-            "the existing document must be left alone"
-        );
+        lsp.sync(&path, 2, || "different text".to_owned());
+        assert_eq!(lsp.documents[&path].version, 6, "sent as a change");
+        assert_eq!(lsp.documents[&path].text.to_string(), "different text");
     }
 
     #[test]
     fn shutdown_clears_everything() {
         let mut lsp = Lsp::default();
         lsp.set_root(Some(PathBuf::from("/a")), Vec::new());
-        lsp.documents.insert(
-            PathBuf::from("/a/main.py"),
-            OpenDocument {
-                language_id: "python",
-                version: 1,
-                told: Vec::new(),
-            },
-        );
+        lsp.documents
+            .insert(PathBuf::from("/a/main.py"), document(Some("python"), 1));
         lsp.missing.push(registry::RUFF);
 
         lsp.shutdown();
@@ -1571,7 +1757,122 @@ while True:
         assert_eq!(diagnostics[0].message, "a deliberate problem");
         assert_eq!(diagnostics[0].range.start.line, 2);
 
-        server.stop();
+        if let Some(reaper) = server.stop() {
+            reaper.join().expect("the reaper finishes");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Answers `didOpen` with one diagnostic whose message is the first line of
+    /// the text it was sent, at UTF-16 column 12 — so a test can see both *what*
+    /// the client sent and whether it converted the column coming back. A
+    /// `didOpen` that arrives before `initialized` says so in the message.
+    const ECHO_SERVER: &str = r#"
+import json, sys
+
+def read():
+    length = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b'content-length:'):
+            length = int(line.split(b':')[1])
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(payload):
+    body = json.dumps(payload).encode('utf-8')
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+initialized = False
+while True:
+    message = read()
+    if message is None:
+        break
+    method = message.get('method')
+    if method == 'initialize':
+        send({'jsonrpc': '2.0', 'id': message['id'],
+              'result': {'capabilities': {'textDocumentSync': 1}}})
+    elif method == 'initialized':
+        initialized = True
+    elif method == 'textDocument/didOpen':
+        doc = message['params']['textDocument']
+        first = doc['text'].split('\n')[0]
+        if not initialized:
+            first = 'PROTOCOL VIOLATION: didOpen before initialized'
+        send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics',
+              'params': {'uri': doc['uri'], 'diagnostics': [{
+                  'range': {'start': {'line': 0, 'character': 12},
+                            'end': {'line': 0, 'character': 17}},
+                  'severity': 1, 'message': first}]}})
+    elif method == 'exit':
+        break
+"#;
+
+    /// The server is sent the buffer, not the file on disk, only once its
+    /// handshake is done, and its UTF-16 columns come back as characters.
+    #[test]
+    fn a_server_is_sent_the_buffer_after_its_handshake_and_its_columns_are_converted() {
+        let Some(python) = editor_proc_python() else {
+            eprintln!("skipping: no Python available to run the mock server");
+            return;
+        };
+        let root = std::env::temp_dir().join("the-editor-lsp-echo");
+        std::fs::create_dir_all(&root).expect("create dir");
+        let file = root.join("thing.py");
+        std::fs::write(&file, b"on disk, and out of date\n").expect("write");
+
+        let spec = ServerSpec {
+            id: "echo",
+            name: "Echo",
+            commands: &[],
+            args: Box::leak(vec!["-c", ECHO_SERVER].into_boxed_slice()),
+            provides: "",
+            install: "",
+            version_arg: None,
+        };
+        // No project root, so no real server that happens to be installed
+        // here -- Ruff, say -- starts for the file and answers first.
+        let mut lsp = Lsp::default();
+        lsp.servers.insert(
+            "echo",
+            Server::start(spec, python, &root).expect("the mock server starts"),
+        );
+
+        // An emoji before `total`: character 11, UTF-16 column 12.
+        let buffer = "print(\"\u{1F600}\", total)\n";
+        lsp.sync(&file, 1, || buffer.to_owned());
+        lsp.documents
+            .get_mut(file.as_path())
+            .expect("recorded")
+            .serving
+            .push("echo");
+        // Offered now, while the server is certainly still starting: this must
+        // wait for the handshake rather than go out ahead of it.
+        lsp.attach(&file);
+        assert!(lsp.documents[file.as_path()].told.is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline && lsp.diagnostics.for_file(&file).is_empty() {
+            lsp.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let found = lsp.diagnostics.for_file(&file);
+        let diagnostic = found.first().expect("no diagnostic arrived");
+        assert_eq!(
+            diagnostic.message, "print(\"\u{1F600}\", total)",
+            "the server must be told what is in the buffer"
+        );
+        assert_eq!(diagnostic.column, 11, "UTF-16 column 12 is character 11");
+        assert_eq!(diagnostic.end_column, 16);
+
+        drop(lsp);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1624,7 +1925,7 @@ while True:
 
         let mut lsp = Lsp::default();
         lsp.set_root(Some(root.clone()), Vec::new());
-        lsp.open(&main, source);
+        lsp.sync(&main, 1, || source.to_owned());
         assert!(
             !lsp.servers.is_empty(),
             "rust-analyzer is installed but was not started"
