@@ -7,7 +7,7 @@
 //! The editor view is a fully custom widget — no toolkit ships a usable code
 //! editor — and its correctness rests on virtualised rendering: lay out and
 //! paint only the visible line range, so a 200k-line file costs the same per
-//! frame as a 50-line one. See PLAN.md §2.4 and the spike in `crates/spike`.
+//! frame as a 50-line one. See PLAN.md §2.4 and `docs/SPIKE-NOTES.md`.
 
 pub mod console;
 pub mod editor_view;
