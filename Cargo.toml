@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.97"
 authors = ["Gareth Finch"]
@@ -34,6 +34,7 @@ editor-proc = { path = "crates/proc" }
 editor-search = { path = "crates/search" }
 editor-config = { path = "crates/config" }
 editor-vcs = { path = "crates/vcs" }
+editor-testing = { path = "crates/testing" }
 editor-widgets = { path = "crates/widgets" }
 
 # Shared external crates are hoisted here as they are adopted, so every crate

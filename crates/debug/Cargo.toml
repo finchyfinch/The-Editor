@@ -11,11 +11,11 @@ description = "Debug Adapter Protocol client for The Editor"
 [dependencies]
 anyhow.workspace = true
 # For `spawn::quiet`, so the adapter gets no console window.
-editor-proc = { version = "1.0.1", path = "../proc" }
+editor-proc.workspace = true
 # DAP frames its messages exactly as LSP does -- `Content-Length`, a blank
 # line, then the JSON. Reusing that reader is better than a second copy of the
 # same off-by-one bugs.
-editor-lsp = { version = "1.0.1", path = "../lsp" }
+editor-lsp.workspace = true
 serde.workspace = true
 serde_json = "1.0.151"
 tracing.workspace = true

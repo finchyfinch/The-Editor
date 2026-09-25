@@ -9,7 +9,7 @@ publish = false
 description = "Language registry, tree-sitter highlighting, folds and bracket matching"
 
 [dependencies]
-editor-config = { version = "1.0.1", path = "../config" }
+editor-config.workspace = true
 editor-core.workspace = true
 ropey.workspace = true
 tracing.workspace = true

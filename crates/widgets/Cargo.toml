@@ -11,15 +11,15 @@ description = "egui widgets: editor view, file tree, tab bar, palette, console"
 [dependencies]
 editor-core.workspace = true
 editor-config.workspace = true
-editor-syntax = { version = "1.0.1", path = "../syntax" }
+editor-syntax.workspace = true
 eframe.workspace = true
-editor-search = { version = "1.0.1", path = "../search" }
-editor-proc = { version = "1.0.1", path = "../proc" }
+editor-search.workspace = true
+editor-proc.workspace = true
 trash = "5.2.6"
-editor-lsp = { version = "1.0.1", path = "../lsp" }
+editor-lsp.workspace = true
 # For `LineStatus` alone. The gutter draws what the diff decided; it does not
 # run git, and nothing here spawns a process.
-editor-vcs = { version = "1.0.1", path = "../vcs" }
+editor-vcs.workspace = true
 # Re-exported by eframe; named here so the editor can describe itself to the
 # accessibility tree, which a custom-painted widget has to do for itself.
 accesskit = "0.24.1"
