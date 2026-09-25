@@ -36,6 +36,11 @@ Entries are written as each milestone lands, not retroactively at release time.
   target written; a file with several names is written in place after a
   flushed copy has been put aside; and the original's permissions are kept.
 
+- **A mostly-LF file with a few CRLF lines no longer hides a character on
+  them.** The stray `\r` stayed in the buffer, where the caret stepped over it
+  and search could match it. Mixed endings are now resolved to whichever is
+  more common, in both directions, as they always were meant to be.
+
 ## [1.0.1] - 2026-09-12
 
 ### Added

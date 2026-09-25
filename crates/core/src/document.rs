@@ -264,7 +264,10 @@ impl Document {
         let (contents, encoding) = decode(&bytes);
         let line_ending = LineEnding::detect(&contents);
         // Normalise to LF in the buffer; line_ending remembers what to restore.
-        let normalised = if line_ending == LineEnding::Crlf {
+        // Whichever ending won, not only when CRLF did: a mostly-LF file with a
+        // few CRLF lines otherwise kept their `\r` in the buffer, where it
+        // counted as a character to search, select and step the caret over.
+        let normalised = if contents.contains("\r\n") {
             contents.replace("\r\n", "\n")
         } else {
             contents
@@ -887,6 +890,29 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Mixed endings are resolved to the majority, as `LineEnding::detect`
+    /// promises, in both directions — the buffer never holds a `\r\n`.
+    #[test]
+    fn a_mostly_lf_file_with_stray_crlf_lines_is_all_lf_in_the_buffer() {
+        let dir = std::env::temp_dir().join("the-editor-mixed-endings");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("mixed.txt");
+        std::fs::write(&path, b"one\ntwo\nthree\r\nfour\n").expect("write");
+
+        let mut doc = Document::open(&path).expect("open");
+        assert_eq!(doc.line_ending(), LineEnding::Lf);
+        assert!(!doc.text().to_string().contains('\r'));
+        assert_eq!(doc.line_len(2), 5, "no hidden character on the CRLF line");
+
+        doc.save().expect("save");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"one\ntwo\nthree\nfour\n",
+            "saved with the majority ending throughout"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The point of tracking the modification time: our own save must not look
