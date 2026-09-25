@@ -100,6 +100,89 @@ pub struct Hovered {
 const CHANGE_BAR_WIDTH: f32 = 3.0;
 /// The change column: the bar, plus the gap that keeps it off the breakpoints.
 const CHANGE_COLUMN: f32 = CHANGE_BAR_WIDTH + 2.0;
+
+/// Space to the left of the line numbers, and either side of a fold chevron.
+const GUTTER_GAP: f32 = 4.0;
+
+/// Where each column of the gutter is, as offsets from its left edge.
+///
+/// Worked out once per frame and read by the painting and the hit-testing
+/// alike. They used to work it out separately and disagreed: a whole
+/// row-height was reserved for the fold chevrons, but the chevron was drawn in
+/// the twelve pixels of padding to the right of the numbers, so the space
+/// reserved for it turned up as a blank band to the *left* of them — and the
+/// fold's click zone overlapped the last digit of every line number.
+///
+/// Left to right: blame (when shown), the change bar, one glyph column shared
+/// by breakpoints and the diagnostic marker, the numbers, the fold chevrons.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Gutter {
+    blame: f32,
+    glyphs: f32,
+    /// The digits and the gap before them; zero with line numbers off.
+    numbers: f32,
+    folds: f32,
+}
+
+impl Gutter {
+    fn new(
+        blame: f32,
+        row_height: f32,
+        digit_width: f32,
+        line_count: usize,
+        show_numbers: bool,
+    ) -> Self {
+        let digits = line_count.max(1).to_string().len() as f32;
+        Self {
+            blame,
+            glyphs: row_height,
+            numbers: if show_numbers {
+                GUTTER_GAP + digits * digit_width
+            } else {
+                0.0
+            },
+            // One character, with a gap either side so the chevron touches
+            // neither the digits nor the code.
+            folds: digit_width + 2.0 * GUTTER_GAP,
+        }
+    }
+
+    fn glyphs_left(&self) -> f32 {
+        self.blame + CHANGE_COLUMN
+    }
+
+    fn glyphs_centre(&self) -> f32 {
+        self.glyphs_left() + self.glyphs / 2.0
+    }
+
+    /// The digits are right-aligned to this.
+    fn numbers_right(&self) -> f32 {
+        self.glyphs_left() + self.glyphs + self.numbers
+    }
+
+    fn folds_centre(&self) -> f32 {
+        self.numbers_right() + self.folds / 2.0
+    }
+
+    /// Where the text begins.
+    fn width(&self) -> f32 {
+        self.numbers_right() + self.folds
+    }
+
+    fn zone(&self, x: f32) -> Zone {
+        if x < self.glyphs_left() {
+            Zone::Annotation
+        } else if x < self.glyphs_left() + self.glyphs {
+            Zone::Breakpoints
+        } else if x < self.numbers_right() {
+            Zone::Numbers
+        } else if x < self.width() {
+            Zone::Folds
+        } else {
+            Zone::Text
+        }
+    }
+}
 /// How many characters of blame annotation to show.
 ///
 /// Enough for a date and a first name, which is what makes a line's history
@@ -256,6 +339,8 @@ pub struct EditorView {
     /// because everything else in the gutter is positioned relative to it and
     /// threading it through four more parameters buys nothing.
     blame_width: f32,
+    /// The gutter's columns as laid out this frame.
+    gutter: Gutter,
     /// The bracket pair around the caret, recomputed as the caret moves.
     bracket_pair: Option<editor_syntax::brackets::BracketPair>,
     /// Set by the context menu, taken by the application next frame.
@@ -683,36 +768,27 @@ impl EditorView {
         // something is folded.
         let row_count = self.fold_map.visible_rows();
 
-        // A column of its own for breakpoints, at the very left. Drawing them
-        // over the line numbers -- which is what happened first -- makes them
-        // invisible against the digits, so a breakpoint appeared not to have
-        // been set at all.
-        let breakpoint_width = row_height;
-        // A column for the fold chevrons, between the line numbers and the
-        // text. Always reserved, even in a file with nothing to fold: a column
-        // that appears and disappears would shift the whole document sideways
-        // as you type.
-        let fold_width = row_height;
-        // A narrow column at the very left for the change bars. Its own column,
-        // rather than a stripe drawn over the breakpoint dots: a bar behind a
-        // dot is a bar you cannot see, and a bar you can click is a breakpoint
-        // you set by accident.
         // The blame column, at the very left, and only when there is blame to
-        // put in it.
+        // put in it. Then the change bars, in a narrow column of their own
+        // rather than a stripe over the breakpoint dots: a bar behind a dot is
+        // a bar you cannot see. Then one glyph column for breakpoints and the
+        // diagnostic marker -- its own column, because a breakpoint drawn over
+        // the digits was invisible against them. Then the numbers, then the
+        // fold chevrons, whose column is reserved even in a file with nothing
+        // to fold so the text does not shift sideways as you type.
         self.blame_width = if self.blame.is_empty() {
             0.0
         } else {
             space_width * BLAME_COLUMNS as f32 + 10.0
         };
-        let gutter_width = self.blame_width
-            + CHANGE_COLUMN
-            + breakpoint_width
-            + fold_width
-            + if opts.show_line_numbers {
-                space_width * (line_count.to_string().len() as f32 + 2.0) + 12.0
-            } else {
-                6.0
-            };
+        self.gutter = Gutter::new(
+            self.blame_width,
+            row_height,
+            space_width,
+            line_count,
+            opts.show_line_numbers,
+        );
+        let gutter_width = self.gutter.width();
 
         let mut changed = false;
 
@@ -790,7 +866,7 @@ impl EditorView {
                     egui::CursorIcon::Text
                 } else {
                     response.hover_pos().map_or(egui::CursorIcon::Text, |pos| {
-                        self.cursor_icon(doc, pos, rect, text_left, row_height)
+                        self.cursor_icon(doc, pos, rect, row_height)
                     })
                 };
                 let response = response.on_hover_cursor(icon);
@@ -981,19 +1057,8 @@ impl EditorView {
     ///
     /// The order of these tests is the order the gutter is laid out in, so a
     /// column that has been given no width simply never matches.
-    fn zone_at(&self, x: f32, rect: egui::Rect, text_left: f32, row_height: f32) -> Zone {
-        let gutter_left = rect.left() + self.blame_width + CHANGE_COLUMN;
-        if x < gutter_left {
-            Zone::Annotation
-        } else if x < gutter_left + row_height {
-            Zone::Breakpoints
-        } else if x >= text_left {
-            Zone::Text
-        } else if x >= text_left - row_height {
-            Zone::Folds
-        } else {
-            Zone::Numbers
-        }
+    fn zone_at(&self, x: f32, rect: egui::Rect) -> Zone {
+        self.gutter.zone(x - rect.left())
     }
 
     /// The document line drawn at height `y`.
@@ -1014,7 +1079,6 @@ impl EditorView {
         doc: &Document,
         pos: egui::Pos2,
         rect: egui::Rect,
-        text_left: f32,
         row_height: f32,
     ) -> egui::CursorIcon {
         // Before the zones, which describe the text underneath: a pinned row
@@ -1023,7 +1087,7 @@ impl EditorView {
             return egui::CursorIcon::PointingHand;
         }
         let line = self.line_at_pos(pos.y, rect, row_height);
-        match self.zone_at(pos.x, rect, text_left, row_height) {
+        match self.zone_at(pos.x, rect) {
             Zone::Text => egui::CursorIcon::Text,
             Zone::Breakpoints if line < doc.line_count() => egui::CursorIcon::PointingHand,
             Zone::Folds if self.folds.iter().any(|f| f.first == line) => {
@@ -1067,7 +1131,7 @@ impl EditorView {
         // selection, so only a click is intercepted here.
         if response.clicked() {
             let line = self.line_at_pos(pos.y, rect, row_height);
-            match self.zone_at(pos.x, rect, text_left, row_height) {
+            match self.zone_at(pos.x, rect) {
                 // Blame and the change bar are something to read.
                 Zone::Annotation => return false,
                 // Setting a breakpoint by clicking the gutter is how every
@@ -2439,19 +2503,20 @@ impl EditorView {
             );
         }
 
-        // Breakpoints, in their own column beside the change bars.
+        // Breakpoints, in the glyph column beside the change bars.
         for (line, verified) in &self.breakpoints {
-            if *line < first || *line >= last {
-                continue;
-            }
             if self.fold_map.is_hidden(*line) {
                 continue;
             }
-            let y = rect.top() + self.fold_map.row_at(*line) as f32 * row_height + row_height / 2.0;
-            let centre = egui::pos2(
-                rect.left() + self.blame_width + CHANGE_COLUMN + row_height / 2.0,
-                y,
-            );
+            // By row, not by line: below a fold the two differ, and comparing
+            // a line number with the visible rows skipped breakpoints that were
+            // on screen.
+            let row = self.fold_map.row_at(*line);
+            if row < first || row >= last {
+                continue;
+            }
+            let y = rect.top() + row as f32 * row_height + row_height / 2.0;
+            let centre = egui::pos2(rect.left() + self.gutter.glyphs_centre(), y);
             let radius = row_height * 0.26;
             let colour = egui::Color32::from_rgb(0xd0, 0x45, 0x45);
             if *verified {
@@ -2590,7 +2655,10 @@ impl EditorView {
             if self.folds.iter().any(|f| f.first == line) {
                 let closed = self.collapsed.contains(&line);
                 painter.text(
-                    egui::pos2(text_left - row_height * 0.5, y + row_height / 2.0),
+                    egui::pos2(
+                        rect.left() + self.gutter.folds_centre(),
+                        y + row_height / 2.0,
+                    ),
                     egui::Align2::CENTER_CENTER,
                     if closed {
                         crate::glyphs::FOLD_CLOSED
@@ -2606,11 +2674,14 @@ impl EditorView {
                 );
             }
 
-            if opts.show_line_numbers {
-                let is_caret_line = line == caret_line;
-                // A gutter glyph for the worst diagnostic on this line, so
-                // severity is not conveyed by the squiggle's colour alone.
-                if let Some(worst) = self
+            // A glyph for the worst diagnostic on this line, so severity is not
+            // conveyed by the squiggle's colour alone. It shares a column with
+            // breakpoints and gives way to one: the squiggle still marks the
+            // problem, and a breakpoint hidden behind a warning sign is one
+            // nobody can see they set.
+            let has_breakpoint = self.breakpoints.iter().any(|(l, _)| *l == line);
+            if !has_breakpoint
+                && let Some(worst) = self
                     .diagnostics
                     .iter()
                     .filter(|d| {
@@ -2618,20 +2689,23 @@ impl EditorView {
                         d.range.start <= line_end && d.range.end >= line_start
                     })
                     .min_by_key(|d| d.severity)
-                {
-                    painter.text(
-                        egui::pos2(
-                            rect.left() + self.blame_width + CHANGE_COLUMN + row_height + 2.0,
-                            y,
-                        ),
-                        egui::Align2::LEFT_TOP,
-                        worst.severity.glyph(),
-                        font.clone(),
-                        severity_colour(&visuals, worst.severity),
-                    );
-                }
+            {
                 painter.text(
-                    egui::pos2(text_left - 12.0, y),
+                    egui::pos2(
+                        rect.left() + self.gutter.glyphs_centre(),
+                        y + row_height / 2.0,
+                    ),
+                    egui::Align2::CENTER_CENTER,
+                    worst.severity.glyph(),
+                    font.clone(),
+                    severity_colour(&visuals, worst.severity),
+                );
+            }
+
+            if opts.show_line_numbers {
+                let is_caret_line = line == caret_line;
+                painter.text(
+                    egui::pos2(rect.left() + self.gutter.numbers_right(), y),
                     egui::Align2::RIGHT_TOP,
                     line + 1,
                     font.clone(),
@@ -2823,7 +2897,10 @@ impl EditorView {
             // so the reader can tell it apart from the code below it.
             if opts.show_line_numbers {
                 painter.text(
-                    egui::pos2(text_left - 12.0, y),
+                    egui::pos2(
+                        text_left - self.gutter.width() + self.gutter.numbers_right(),
+                        y,
+                    ),
                     egui::Align2::RIGHT_TOP,
                     line + 1,
                     font.clone(),
@@ -5063,10 +5140,68 @@ def b():
         let mut view = EditorView::default();
         let highlighter = Highlighter::new(LanguageId::Python, doc.text()).expect("grammar");
         view.sync_tree_data(doc, Some(&highlighter));
-        // Breakpoints, numbers and folds: two row-height columns either side of
-        // room for four digits.
-        let text_left = rect.left() + row_height * 2.0 + 40.0;
+        view.gutter = Gutter::new(0.0, row_height, 8.0, doc.line_count(), true);
+        let text_left = rect.left() + view.gutter.width();
         (view, rect, text_left, row_height)
+    }
+
+    /// The to-do list's complaint: a wide blank band to the left of the line
+    /// numbers. Between the breakpoint column and the digits there is now only
+    /// the gap that separates them.
+    #[test]
+    fn the_numbers_sit_right_after_the_glyph_column() {
+        let (row_height, digit) = (18.0, 8.0);
+        let gutter = Gutter::new(0.0, row_height, digit, 500, true);
+        let digits_left = gutter.numbers_right() - 3.0 * digit;
+        let glyphs_right = gutter.glyphs_left() + gutter.glyphs;
+        assert_eq!(digits_left - glyphs_right, GUTTER_GAP);
+        assert!(
+            gutter.width()
+                <= CHANGE_COLUMN + row_height + GUTTER_GAP + 3.0 * digit + digit + 2.0 * GUTTER_GAP,
+            "no column is reserved that nothing is drawn in: {gutter:?}"
+        );
+    }
+
+    /// The fold zone used to reach back over the last digit of the line
+    /// number, so a click meant for the number folded the function instead.
+    #[test]
+    fn every_column_is_its_own_zone_and_the_zones_do_not_overlap() {
+        let gutter = Gutter::new(20.0, 18.0, 8.0, 99, true);
+        assert_eq!(gutter.zone(10.0), Zone::Annotation, "blame");
+        assert_eq!(gutter.zone(gutter.glyphs_centre()), Zone::Breakpoints);
+        assert_eq!(
+            gutter.zone(gutter.numbers_right() - 1.0),
+            Zone::Numbers,
+            "the last digit"
+        );
+        assert_eq!(gutter.zone(gutter.folds_centre()), Zone::Folds);
+        assert_eq!(gutter.zone(gutter.width()), Zone::Text);
+
+        let mut previous = Zone::Annotation;
+        let order = |z: Zone| match z {
+            Zone::Annotation => 0,
+            Zone::Breakpoints => 1,
+            Zone::Numbers => 2,
+            Zone::Folds => 3,
+            Zone::Text => 4,
+        };
+        let mut x = 0.0;
+        while x < gutter.width() + 10.0 {
+            let zone = gutter.zone(x);
+            assert!(
+                order(zone) >= order(previous),
+                "zones out of order at x={x}"
+            );
+            previous = zone;
+            x += 0.5;
+        }
+    }
+
+    #[test]
+    fn with_line_numbers_off_the_numbers_take_no_room() {
+        let on = Gutter::new(0.0, 18.0, 8.0, 1000, true);
+        let off = Gutter::new(0.0, 18.0, 8.0, 1000, false);
+        assert_eq!(on.width() - off.width(), GUTTER_GAP + 4.0 * 8.0);
     }
 
     fn at(x: f32, line: usize, row_height: f32) -> egui::Pos2 {
@@ -5083,22 +5218,15 @@ def b():
         let (view, rect, text_left, row_height) = gutter_view(&doc);
 
         assert_eq!(
-            view.cursor_icon(
-                &doc,
-                at(text_left + 30.0, 0, row_height),
-                rect,
-                text_left,
-                row_height
-            ),
+            view.cursor_icon(&doc, at(text_left + 30.0, 0, row_height), rect, row_height),
             egui::CursorIcon::Text,
             "the code pane is text"
         );
         assert_eq!(
             view.cursor_icon(
                 &doc,
-                at(text_left - row_height - 10.0, 0, row_height),
+                at(view.gutter.numbers_right() - 1.0, 0, row_height),
                 rect,
-                text_left,
                 row_height
             ),
             egui::CursorIcon::Default,
@@ -5114,33 +5242,21 @@ def b():
     pass
 ",
         );
-        let (view, rect, text_left, row_height) = gutter_view(&doc);
+        let (view, rect, _, row_height) = gutter_view(&doc);
         assert!(
             view.folds.iter().any(|f| f.first == 0),
             "line 0 opens a fold: {:?}",
             view.folds
         );
 
-        let breakpoints = rect.left() + row_height / 2.0;
+        let breakpoints = rect.left() + view.gutter.glyphs_centre();
         assert_eq!(
-            view.cursor_icon(
-                &doc,
-                at(breakpoints, 0, row_height),
-                rect,
-                text_left,
-                row_height
-            ),
+            view.cursor_icon(&doc, at(breakpoints, 0, row_height), rect, row_height),
             egui::CursorIcon::PointingHand
         );
-        let chevron = text_left - row_height / 2.0;
+        let chevron = rect.left() + view.gutter.folds_centre();
         assert_eq!(
-            view.cursor_icon(
-                &doc,
-                at(chevron, 0, row_height),
-                rect,
-                text_left,
-                row_height
-            ),
+            view.cursor_icon(&doc, at(chevron, 0, row_height), rect, row_height),
             egui::CursorIcon::PointingHand
         );
     }
@@ -5154,16 +5270,10 @@ def b():
     pass
 ",
         );
-        let (view, rect, text_left, row_height) = gutter_view(&doc);
-        let chevron = text_left - row_height / 2.0;
+        let (view, rect, _, row_height) = gutter_view(&doc);
+        let chevron = rect.left() + view.gutter.folds_centre();
         assert_eq!(
-            view.cursor_icon(
-                &doc,
-                at(chevron, 1, row_height),
-                rect,
-                text_left,
-                row_height
-            ),
+            view.cursor_icon(&doc, at(chevron, 1, row_height), rect, row_height),
             egui::CursorIcon::Default,
             "line 1 is the body, and folds nothing"
         );
@@ -5181,16 +5291,10 @@ def b():
     pass
 ",
         );
-        let (mut view, rect, text_left, row_height) = gutter_view(&doc);
-        let breakpoints = rect.left() + row_height / 2.0;
+        let (mut view, rect, _, row_height) = gutter_view(&doc);
+        let breakpoints = rect.left() + view.gutter.glyphs_centre();
         assert_eq!(
-            view.cursor_icon(
-                &doc,
-                at(breakpoints, 40, row_height),
-                rect,
-                text_left,
-                row_height
-            ),
+            view.cursor_icon(&doc, at(breakpoints, 40, row_height), rect, row_height),
             egui::CursorIcon::PointingHand
         );
 
@@ -5310,15 +5414,15 @@ def f():
         let (view, rect, text_left, row_height) = gutter_view(&doc);
         for x in [
             rect.left() + 1.0,
-            rect.left() + row_height / 2.0,
-            text_left - row_height - 5.0,
-            text_left - row_height / 2.0,
+            rect.left() + view.gutter.glyphs_centre(),
+            rect.left() + view.gutter.numbers_right() - 1.0,
+            rect.left() + view.gutter.folds_centre(),
             text_left + 5.0,
         ] {
             let pos = at(x, 0, row_height);
-            let zone = view.zone_at(x, rect, text_left, row_height);
-            let hand = view.cursor_icon(&doc, pos, rect, text_left, row_height)
-                == egui::CursorIcon::PointingHand;
+            let zone = view.zone_at(x, rect);
+            let hand =
+                view.cursor_icon(&doc, pos, rect, row_height) == egui::CursorIcon::PointingHand;
             assert_eq!(
                 hand,
                 matches!(zone, Zone::Breakpoints | Zone::Folds),

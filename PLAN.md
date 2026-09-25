@@ -1054,8 +1054,6 @@ profiling. Each is a product in itself.
   is enough).
 - No command-line file argument: `the-editor foo.py` opens an empty window, so
   "Open with…" and double-clicking a file in Explorer do not work.
-- Ruff's language server exits once on startup and is restarted by the recovery
-  path. Harmless, but it should not be happening.
 - A wgpu renderer panic ("Failed to create staging buffer for index data") took
   the whole editor down once, on a machine started with a stripped `PATH` —
   probably a software-renderer fallback. Not reproducible with a normal

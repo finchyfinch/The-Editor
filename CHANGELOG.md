@@ -14,7 +14,21 @@ Entries are written as each milestone lands, not retroactively at release time.
   a language server could be looking at the file on disk rather than at the
   buffer. It no longer can (see below), so the refusal has gone.
 
+- **The gutter is narrower, and the line numbers sit where the gap was.** A
+  column was reserved for the fold arrows but the arrows were drawn in the
+  padding beside the numbers, so the reserved space showed up as a blank band
+  to the left of them, and clicking the last digit of a line number could fold
+  the function instead. The gutter is now laid out once and read by both the
+  drawing and the clicking: breakpoints and the problem marker share one
+  column (a breakpoint wins, and the squiggle still marks the problem), the
+  numbers are exactly as wide as their digits, and the fold arrows have a
+  column one character wide.
+
 ### Fixed
+
+- **Breakpoints below a folded block are drawn.** They were compared against
+  screen rows as though they were line numbers, so once anything above was
+  folded a breakpoint could be set and not shown.
 
 - **Open files no longer lose their language server when a virtual environment
   is created or a folder opened.** Either one restarts the servers, and the
@@ -36,7 +50,8 @@ Entries are written as each milestone lands, not retroactively at release time.
   server was re-sent the saved file under the buffer's version number, and
   until the next keystroke answered every question about text that was not on
   the screen. Files are also no longer sent to a server before its handshake
-  has finished, which the protocol forbids and some servers ignore.
+  has finished, which the protocol forbids — and which is what made Ruff
+  crash and restart every time the editor started.
 
 - **Stopping a language server no longer freezes the window.** Opening a
   folder or quitting waited on each server in turn, up to half a second
