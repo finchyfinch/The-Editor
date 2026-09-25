@@ -341,6 +341,11 @@ pub struct EditorView {
     blame_width: f32,
     /// The gutter's columns as laid out this frame.
     gutter: Gutter,
+    /// The widest line laid out so far, in pixels, and the font size that
+    /// measurement was made at. The scroll area is made this wide, so a long
+    /// line can be scrolled to its end.
+    widest_text: f32,
+    widest_font_size: f32,
     /// The bracket pair around the caret, recomputed as the caret moves.
     bracket_pair: Option<editor_syntax::brackets::BracketPair>,
     /// Set by the context menu, taken by the application next frame.
@@ -821,7 +826,20 @@ impl EditorView {
                 // The rows past the end of the text are only ever hit-tested,
                 // never painted: the paint loop's last row is capped by the
                 // document, not by this rectangle.
-                let widest = 120.0 * space_width;
+                // As wide as the widest line seen so far, and never narrower
+                // than a hundred and twenty columns. Fixed at those hundred and
+                // twenty, the end of any longer line could not be scrolled to,
+                // and typing there put the caret off the edge of the window.
+                //
+                // "Seen so far" because measuring every line of the file on
+                // every edit would cost what virtualised rendering exists to
+                // save. Every painted row is measured anyway, so the width
+                // grows as long lines come into view, a frame after they do.
+                if self.widest_font_size != opts.font_size {
+                    self.widest_text = 0.0;
+                    self.widest_font_size = opts.font_size;
+                }
+                let widest = (120.0 * space_width).max(self.widest_text + 4.0 * space_width);
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(
                         (gutter_width + widest).max(ui.available_width()),
@@ -2531,6 +2549,7 @@ impl EditorView {
 
         let mut caret_rect = None;
         let mut extra_carets: Vec<egui::Rect> = Vec::new();
+        let widest_before = self.widest_text;
 
         for row in first..last {
             let line = self.fold_map.line_at(row);
@@ -2717,6 +2736,7 @@ impl EditorView {
                 );
             }
 
+            self.widest_text = self.widest_text.max(galley.size().x);
             if !text.is_empty() {
                 painter.galley(
                     egui::pos2(text_left, y),
@@ -2782,7 +2802,8 @@ impl EditorView {
             painter.rect_filled(caret, 0.0, visuals.strong_text_color());
         }
 
-        if std::mem::take(&mut self.scroll_to_caret) {
+        let scrolling = std::mem::take(&mut self.scroll_to_caret);
+        if scrolling {
             // Derived from the line number rather than taken from `caret_rect`,
             // which only exists when the caret was painted -- that is, only
             // when it is *already* on screen. Keying the scroll off it meant
@@ -2790,7 +2811,22 @@ impl EditorView {
             // ask for it, so jumping to a search match or a definition outside
             // the visible range moved the caret and left the view behind.
             let y = rect.top() + self.fold_map.row_at(caret_line) as f32 * row_height;
-            let x = caret_rect.map_or(text_left, |r| r.left());
+            // A caret that was not painted is on a line off screen, and its
+            // column matters as much as its line: laid out here, one line, so a
+            // jump to the end of a long line does not scroll to its start.
+            let x = match caret_rect {
+                Some(r) => r.left(),
+                None => {
+                    let galley = painter.layout_no_wrap(
+                        doc.line_text(caret_line),
+                        font.clone(),
+                        visuals.text_color(),
+                    );
+                    self.widest_text = self.widest_text.max(galley.size().x);
+                    let column = self.selection.head - doc.line_start(caret_line);
+                    text_left + galley.pos_from_cursor(ccursor(column)).left()
+                }
+            };
             // A couple of rows of context either side, so the target does not
             // land flush against the top or bottom edge -- and above it, room
             // for the sticky header as well, or scrolling up to a caret parks
@@ -2801,6 +2837,17 @@ impl EditorView {
                 egui::pos2(x + 1.5, y + row_height * 3.0),
             );
             ui.scroll_to_rect(target, None);
+        }
+
+        // A wider line than any before it: the scroll area was sized before it
+        // was measured, so ask for the frame that sizes it properly -- and if
+        // this frame was scrolling to the caret, scroll again then, when the
+        // area is wide enough to reach it.
+        if self.widest_text > widest_before {
+            if scrolling {
+                self.scroll_to_caret = true;
+            }
+            ui.ctx().request_repaint();
         }
 
         // Last, so it covers the text, the selection and any caret that ran
@@ -5143,6 +5190,52 @@ def b():
         view.gutter = Gutter::new(0.0, row_height, 8.0, doc.line_count(), true);
         let text_left = rect.left() + view.gutter.width();
         (view, rect, text_left, row_height)
+    }
+
+    /// Draw `view` for a few frames in a window 800 points wide, as the
+    /// application would.
+    fn run_frames(view: &mut EditorView, doc: &mut Document, frames: usize) {
+        let ctx = egui::Context::default();
+        let theme = SyntaxTheme::for_ui(editor_config::theme::ResolvedTheme::Dark);
+        for frame in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                // Half a second a frame, so a scroll's easing finishes.
+                time: Some(frame as f64 * 0.5),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    view.ui(ui, doc, None, &theme, EditorOptions::default());
+                });
+            });
+            // No renderer to hand the font atlas to.
+            output.textures_delta.clear();
+        }
+    }
+
+    /// The scroll area was a fixed hundred and twenty columns wide, so the end
+    /// of a longer line could not be scrolled to and typing there put the
+    /// caret off the edge of the window.
+    #[test]
+    fn the_end_of_a_long_line_can_be_scrolled_to() {
+        let long = "x".repeat(500);
+        let mut doc = doc_with(&format!("short\n{long}\nshort\n"));
+        let mut view = EditorView::default();
+        view.set_caret(doc.line_start(1) + 500);
+
+        run_frames(&mut view, &mut doc, 6);
+        let caret = view
+            .caret_screen_rect()
+            .expect("the caret's line is on screen");
+        assert!(
+            (0.0..=800.0).contains(&caret.left()),
+            "the caret at the end of the long line is off screen, at x = {}",
+            caret.left()
+        );
     }
 
     /// The to-do list's complaint: a wide blank band to the left of the line

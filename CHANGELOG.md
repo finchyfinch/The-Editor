@@ -26,6 +26,13 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **Long lines can be scrolled to their end.** The editor was a fixed hundred
+  and twenty columns wide however long a line was, so the rest of a longer
+  line could not be scrolled into view, and typing at its end put the caret
+  off the edge of the window. It is now as wide as the widest line that has
+  been on screen. Jumping to a place on a long line that is off screen also
+  scrolls sideways to it, rather than to the start of the line.
+
 - **Breakpoints stay on their statements through undo, replace and rename.**
   They were moved by comparing the line count before and after an edit and
   assuming the edit was at the caret — so an undo, a replace-all or a rename
