@@ -49,8 +49,19 @@ fn main() {
     println!("cargo:rustc-env=BUILD_DATE={date}");
     println!("cargo:rustc-env=BUILD_RUSTC={rustc}");
 
-    // Rerun when HEAD moves, but do not fail if .git is absent.
+    // Rerun when the commit changes, but do not fail if .git is absent.
+    //
+    // `.git/HEAD` alone is not enough: on a branch it says only which branch,
+    // and a commit moves the branch's ref, not HEAD. Watching HEAD alone left
+    // the About box naming whatever commit was current when the branch was
+    // checked out, however many commits later the build was.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
+    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD")
+        && let Some(branch) = head.trim().strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=../../.git/{branch}");
+    }
 }
 
 /// Compile the icon and version details into the executable's resources.

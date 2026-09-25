@@ -165,6 +165,10 @@ Entries are written as each milestone lands, not retroactively at release time.
   target written; a file with several names is written in place after a
   flushed copy has been put aside; and the original's permissions are kept.
 
+- **About names the commit the program was built from.** The build noticed a
+  new commit only when the branch changed, so a build made after committing
+  on the same branch reported an older commit.
+
 - **A mostly-LF file with a few CRLF lines no longer hides a character on
   them.** The stray `\r` stayed in the buffer, where the caret stepped over it
   and search could match it. Mixed endings are now resolved to whichever is
