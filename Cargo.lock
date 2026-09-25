@@ -867,6 +867,7 @@ dependencies = [
  "anyhow",
  "encoding_rs",
  "ropey",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

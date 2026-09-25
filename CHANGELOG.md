@@ -8,6 +8,34 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Saving a Windows-1252 file no longer rewrites what it cannot store.** A
+  file that was not valid UTF-8 opens as Windows-1252, and anything typed into
+  it outside that character set — an arrow, a curly quote from another
+  program, an emoji — was written to disk as an HTML entity: `→` became
+  `&#8594;`, with no warning, and the next time the file was opened the entity
+  was what it said. Saving now stops and asks, offering to save the file as
+  UTF-8 instead; declining leaves the file on disk exactly as it was. Save All
+  and the quit prompt name the character and its line rather than asking.
+
+- **Saving no longer breaks links, or destroys a file that happened to have
+  the wrong name.** A save wrote `<file>.tmp` and renamed it over the
+  original, which went wrong four ways:
+  - a file of your own called `notes.py.tmp` was overwritten by saving
+    `notes.py`, then renamed away;
+  - a hard-linked file was split in two, the other names keeping the old
+    contents;
+  - a symlink was replaced by an ordinary file, so the file it pointed to
+    stopped receiving the edits;
+  - on Linux and macOS, a script lost its executable bit.
+
+  The temporary file now has a name nobody would choose and is created only if
+  that name is free; its contents are flushed to disk before the rename, so a
+  power cut cannot leave an empty file behind; a symlink is followed and its
+  target written; a file with several names is written in place after a
+  flushed copy has been put aside; and the original's permissions are kept.
+
 ## [1.0.1] - 2026-09-12
 
 ### Added

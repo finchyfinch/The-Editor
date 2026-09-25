@@ -20,6 +20,7 @@ pub mod document;
 pub mod edit;
 pub mod filename;
 pub mod history;
+pub mod save;
 pub mod selection;
 pub mod whitespace;
 pub mod word;

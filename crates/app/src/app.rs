@@ -16,7 +16,7 @@ use editor_config::paths::AppPaths;
 use editor_config::session::{OpenFile, Session, WindowGeometry};
 use editor_config::settings::Settings;
 use editor_config::theme::{ResolvedTheme, ThemePreference};
-use editor_core::document::{DiskState, Document};
+use editor_core::document::{DiskState, Document, Encoding, Unrepresentable};
 use editor_syntax::LanguageId;
 use editor_syntax::highlight::Highlighter;
 use editor_syntax::theme::SyntaxTheme;
@@ -326,6 +326,10 @@ pub(crate) struct EditorApp {
     /// everything else in the git panel it cannot be undone by git either: the
     /// text was never committed, never stashed, and is not in the reflog.
     pending_discard: Option<Vec<String>>,
+    /// A save refused because the file's encoding cannot hold its text: the
+    /// tab (by recovery id, which survives tabs moving), what was refused, and
+    /// the Save As destination if there was one.
+    pending_encoding: Option<(u64, Unrepresentable, Option<PathBuf>)>,
     /// Whether the Problems panel shows every file or only the open one.
     problems_all_files: bool,
     /// The diagnostic the caret is sitting on, so the Problems panel can pick
@@ -530,6 +534,7 @@ impl EditorApp {
             pending_recent: None,
             pending_delete: None,
             pending_discard: None,
+            pending_encoding: None,
             problems_all_files: false,
             problem_at_caret: None,
             problem_revealed: None,
@@ -925,7 +930,7 @@ impl EditorApp {
         self.tidy_before_saving(index);
         let needs_path = ask_for_path || self.docs[index].doc.path().is_none();
 
-        let result = if needs_path {
+        if needs_path {
             let start = self
                 .tree
                 .root()
@@ -936,9 +941,21 @@ impl EditorApp {
                 .set_file_name(self.docs[index].doc.display_name())
                 .save_file();
             let Some(path) = chosen else { return };
-            self.docs[index].doc.save_as(&path)
+            self.save_to(index, Some(path));
         } else {
-            self.docs[index].doc.save()
+            self.save_to(index, None);
+        }
+    }
+
+    /// Write one document, to `path` if given or to its own path otherwise,
+    /// and bring everything that describes the disk up to date.
+    ///
+    /// A document whose encoding cannot hold its text is not written; the
+    /// question of what to do instead goes to [`Self::encoding_prompt`].
+    fn save_to(&mut self, index: usize, path: Option<PathBuf>) {
+        let result = match &path {
+            Some(path) => self.docs[index].doc.save_as(path),
+            None => self.docs[index].doc.save(),
         };
 
         match result {
@@ -959,7 +976,77 @@ impl EditorApp {
                 }
                 self.info(format!("Saved {name}"));
             }
-            Err(e) => self.error(format!("Save failed: {e:#}")),
+            Err(e) => match e.downcast_ref::<Unrepresentable>() {
+                Some(refused) => {
+                    self.pending_encoding = Some((self.docs[index].recovery_id, *refused, path));
+                }
+                None => self.error(format!("Save failed: {e:#}")),
+            },
+        }
+    }
+
+    /// Ask what to do with a file whose encoding cannot store what was typed.
+    ///
+    /// UTF-8 is the only offer, because it is the only encoding that is
+    /// certain to work and that every tool reading the file will understand.
+    /// The alternative — writing the character as something else — is what
+    /// used to happen silently, and is why this prompt exists.
+    fn encoding_prompt(&mut self, ctx: &egui::Context) {
+        let Some((id, refused, target)) = self.pending_encoding.clone() else {
+            return;
+        };
+        let Some(index) = self.docs.iter().position(|d| d.recovery_id == id) else {
+            self.pending_encoding = None;
+            return;
+        };
+        let name = self.docs[index].doc.display_name();
+        let mut decision: Option<bool> = None;
+
+        egui::Modal::new(egui::Id::new("confirm_encoding")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("Save as UTF-8?");
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&name);
+                ui.label(format!(
+                    "is saved as {}, which cannot store {:?} (line {}, column {}).",
+                    refused.encoding.label(),
+                    refused.character,
+                    refused.line,
+                    refused.column
+                ));
+            });
+            ui.add_space(4.0);
+            ui.label(
+                "Saving it as UTF-8 keeps every character. Programs that expect \
+                 the old encoding may show accented letters differently.",
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    decision = Some(false);
+                }
+                if ui.button("Save as UTF-8").clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+
+        match decision {
+            None => {}
+            Some(false) => {
+                self.pending_encoding = None;
+                self.info(format!("{name} was not saved"));
+            }
+            Some(true) => {
+                self.pending_encoding = None;
+                self.docs[index].doc.set_encoding(Encoding::Utf8);
+                self.save_to(index, target);
+            }
         }
     }
 
@@ -5536,6 +5623,7 @@ impl eframe::App for EditorApp {
             || self.settings_form.is_open()
             || self.pending_delete.is_some()
             || self.pending_discard.is_some()
+            || self.pending_encoding.is_some()
             || self.pending_force_delete.is_some()
             || self.palette.is_open()
             || self.new_file.is_open()
@@ -5914,6 +6002,7 @@ impl eframe::App for EditorApp {
         self.unsaved_prompt(&ctx);
         self.delete_prompt(&ctx);
         self.discard_prompt(&ctx);
+        self.encoding_prompt(&ctx);
         self.force_delete_prompt(&ctx);
         self.search.poll();
         if self.packages.poll() {

@@ -314,8 +314,13 @@ impl Document {
 
     /// Write to `path` and adopt it as this document's path.
     ///
+    /// Written through [`crate::save::write`], which keeps symlinks, hard links
+    /// and permissions and never touches a file it did not create.
+    ///
     /// # Errors
-    /// If the write fails.
+    /// If the write fails, or with [`Unrepresentable`] when the text holds a
+    /// character the document's encoding cannot store. Nothing is written in
+    /// that case; the caller decides whether to change the encoding.
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
         let text = self.text.to_string();
         let restored = if self.line_ending == LineEnding::Crlf {
@@ -323,20 +328,18 @@ impl Document {
         } else {
             text
         };
-        let bytes = encode(&restored, self.encoding);
+        let bytes = encode(&restored, self.encoding).map_err(|character| {
+            let offset = self.text.chars().position(|c| c == character).unwrap_or(0);
+            let (line, column) = self.line_col(offset);
+            Unrepresentable {
+                encoding: self.encoding,
+                character,
+                line,
+                column,
+            }
+        })?;
 
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-
-        // The temporary file must be on the same filesystem as the target, or
-        // the rename is not atomic. Same directory guarantees that.
-        let tmp = path.with_extension(format!(
-            "{}.tmp",
-            path.extension().and_then(|e| e.to_str()).unwrap_or("")
-        ));
-        std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        crate::save::write(path, &bytes)?;
 
         self.path = Some(path.to_path_buf());
         self.saved_version = self.version;
@@ -539,6 +542,17 @@ impl Document {
         self.line_ending
     }
 
+    /// Change the encoding the file will be written with.
+    ///
+    /// Marks the document changed, as switching line endings does: the bytes a
+    /// save would write no longer match the ones on disk.
+    pub fn set_encoding(&mut self, encoding: Encoding) {
+        if self.encoding != encoding {
+            self.encoding = encoding;
+            self.version = next_version();
+        }
+    }
+
     /// Change the line ending the file will be written with.
     pub fn set_line_ending(&mut self, ending: LineEnding) {
         if self.line_ending != ending {
@@ -654,8 +668,13 @@ fn decode(bytes: &[u8]) -> (String, Encoding) {
     }
 }
 
-fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
-    match encoding {
+/// The bytes for `text` in `encoding`, or the first character it cannot hold.
+///
+/// Only Windows-1252 can refuse. `encoding_rs` itself never does: it writes an
+/// unmappable character as an HTML reference, so an arrow typed into a Latin-1
+/// file was saved as `&#8594;` and an emoji as `&#128512;`, with nothing said.
+fn encode(text: &str, encoding: Encoding) -> Result<Vec<u8>, char> {
+    Ok(match encoding {
         Encoding::Utf8 => text.as_bytes().to_vec(),
         Encoding::Utf8Bom => {
             let mut out = vec![0xEF, 0xBB, 0xBF];
@@ -677,11 +696,51 @@ fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
             out
         }
         Encoding::Latin1 => {
-            let (bytes, _, _) = encoding_rs::WINDOWS_1252.encode(text);
+            let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(text);
+            if unmappable {
+                let mut buffer = [0u8; 4];
+                let culprit = text
+                    .chars()
+                    .find(|c| {
+                        encoding_rs::WINDOWS_1252
+                            .encode(c.encode_utf8(&mut buffer))
+                            .2
+                    })
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
+                return Err(culprit);
+            }
             bytes.into_owned()
         }
+    })
+}
+
+/// A save refused because the file's encoding cannot store part of the text.
+///
+/// Carried inside the `anyhow::Error` from [`Document::save`], so a caller can
+/// `downcast_ref` it and offer to change the encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unrepresentable {
+    pub encoding: Encoding,
+    pub character: char,
+    /// One-based, where the character first appears.
+    pub line: usize,
+    pub column: usize,
+}
+
+impl std::fmt::Display for Unrepresentable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} cannot store {:?} (line {}, column {})",
+            self.encoding.label(),
+            self.character,
+            self.line,
+            self.column
+        )
     }
 }
+
+impl std::error::Error for Unrepresentable {}
 
 #[cfg(test)]
 mod tests {
@@ -774,7 +833,7 @@ mod tests {
             Encoding::Latin1,
         ] {
             let original = "hello \u{e9} world";
-            let (decoded, detected) = decode(&encode(original, enc));
+            let (decoded, detected) = decode(&encode(original, enc).expect("representable"));
             assert_eq!(decoded, original, "{enc:?} content");
             assert_eq!(detected, enc, "{enc:?} detection");
         }
@@ -913,6 +972,54 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bug this guards: `encoding_rs` writes what Windows-1252 cannot hold
+    /// as an HTML reference, so an arrow was saved as `&#8594;` without a word.
+    #[test]
+    fn a_character_the_encoding_cannot_hold_refuses_the_save_and_writes_nothing() {
+        let dir = std::env::temp_dir().join("the-editor-unrepresentable");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("latin.txt");
+        std::fs::write(&path, b"caf\xE9\n").expect("write");
+
+        let mut doc = Document::open(&path).expect("open");
+        assert_eq!(doc.encoding(), Encoding::Latin1);
+        let end = doc.len_chars();
+        doc.apply(
+            &Transaction::insert(end, "a \u{2192} b"),
+            Selection::at(end),
+            Selection::at(end),
+        );
+
+        let error = doc.save().expect_err("must not save");
+        let refused = error
+            .downcast_ref::<Unrepresentable>()
+            .expect("a typed refusal the caller can act on");
+        assert_eq!(refused.character, '\u{2192}');
+        assert_eq!((refused.line, refused.column), (2, 3));
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"caf\xE9\n",
+            "untouched"
+        );
+        assert!(doc.is_dirty(), "still unsaved");
+
+        doc.set_encoding(Encoding::Utf8);
+        doc.save().expect("UTF-8 holds anything");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "caf\u{e9}\na \u{2192} b"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn text_the_encoding_can_hold_still_saves_as_windows_1252() {
+        assert_eq!(
+            encode("caf\u{e9} \u{20ac}", Encoding::Latin1),
+            Ok(b"caf\xE9 \x80".to_vec())
+        );
     }
 
     /// A recovered buffer is unsaved work by definition: it exists precisely
