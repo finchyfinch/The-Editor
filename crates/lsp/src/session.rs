@@ -1967,6 +1967,93 @@ while True:
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Starts a child of its own, writes the child's pid to the file named by
+    /// its argument, and then ignores everything, including being told to exit
+    /// and its input closing -- the server that has to be killed.
+    const STUBBORN_SERVER: &str = r#"
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+open(sys.argv[1], 'w').write(str(child.pid))
+while True:
+    time.sleep(1)
+"#;
+
+    fn is_running(pid: &str) -> bool {
+        if cfg!(windows) {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .output()
+                .expect("tasklist runs");
+            String::from_utf8_lossy(&out.stdout).contains(pid)
+        } else {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+    }
+
+    /// A server that will not stop is killed, and so is everything it started:
+    /// on Windows a server installed by npm is a `.cmd` shim, and killing only
+    /// the process that was started leaves the server itself running.
+    #[test]
+    fn a_server_that_will_not_stop_is_killed_with_everything_it_started() {
+        let Some(python) = editor_proc_python() else {
+            eprintln!("skipping: no Python available to run the mock server");
+            return;
+        };
+        let root = std::env::temp_dir().join("the-editor-lsp-stubborn");
+        std::fs::create_dir_all(&root).expect("create dir");
+        let pid_file = root.join("child.pid");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let spec = ServerSpec {
+            id: "stubborn",
+            name: "Stubborn",
+            commands: &[],
+            args: Box::leak(
+                vec![
+                    "-c",
+                    STUBBORN_SERVER,
+                    Box::leak(pid_file.display().to_string().into_boxed_str()),
+                ]
+                .into_boxed_slice(),
+            ),
+            provides: "",
+            install: "",
+            version_arg: None,
+        };
+        let mut server = Server::start(spec, python, &root).expect("starts");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                && !pid.trim().is_empty()
+            {
+                break pid.trim().to_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(is_running(&pid), "the child is running to begin with");
+
+        server
+            .stop()
+            .expect("a thread to see it stopped")
+            .join()
+            .expect("the reaper finishes");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while is_running(&pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!is_running(&pid), "the server's own child outlived it");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A Python interpreter for the mock server, or `None`.
     fn editor_proc_python() -> Option<PathBuf> {
         for name in if cfg!(windows) {

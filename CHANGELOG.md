@@ -130,6 +130,12 @@ Entries are written as each milestone lands, not retroactively at release time.
   looked up again when the file watcher sees the project change, when a
   different folder or interpreter is chosen, or after a few seconds.
 
+- **A language server that will not stop is stopped with everything it
+  started.** One that ignored the request to shut down was killed, but only
+  the process the editor had started — which, for a server installed with
+  npm on Windows, is the `cmd` shim in front of it, leaving the server itself
+  running. The whole process tree goes now.
+
 - **Files over 5 MB are no longer sent to language servers**, as they were
   always meant not to be.
 

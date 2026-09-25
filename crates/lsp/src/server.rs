@@ -173,12 +173,15 @@ impl Server {
         // `quiet`, not `Command::new`: a release build has no console of its
         // own, so Windows would allocate one for the server and leave it on
         // screen behind the editor for as long as the server runs.
-        let mut child = editor_proc::spawn::quiet(&self.program)
+        let mut command = editor_proc::spawn::quiet(&self.program);
+        command
             .args(self.spec.args)
             .current_dir(&self.root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        put_in_own_group(&mut command);
+        let mut child = command
             .spawn()
             .with_context(|| format!("starting {}", self.program.display()))?;
 
@@ -488,6 +491,10 @@ impl Server {
                         std::thread::sleep(Duration::from_millis(25));
                     }
                     tracing::info!(server = id, "did not exit when asked; killing it");
+                    // The whole tree, not just the process started: on Windows
+                    // a server installed by npm is a `.cmd` shim, and killing
+                    // the shell it runs in leaves the server itself running.
+                    editor_proc::pty::kill_tree(child.id());
                     let _ = child.kill();
                     let _ = child.wait();
                 });
@@ -498,6 +505,19 @@ impl Server {
         }
         None
     }
+}
+
+/// Start a server in a process group of its own on Unix, so that
+/// `kill_tree` can reach everything it starts. Windows walks the parent chain
+/// instead and needs nothing here.
+fn put_in_own_group(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 impl Drop for Server {
