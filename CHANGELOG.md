@@ -16,8 +16,8 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
-- **Open files kept their language server after a virtual environment was
-  created, or a folder opened.** Either one restarts the servers, and the
+- **Open files no longer lose their language server when a virtual environment
+  is created or a folder opened.** Either one restarts the servers, and the
   restart forgot every open file — while the editor remembered having sent
   them and never sent them again. Tabs already open lost their diagnostics,
   completion, hover and Go to Definition until they were closed and reopened.
@@ -49,6 +49,14 @@ Entries are written as each milestone lands, not retroactively at release time.
   Node-based one such as basedpyright takes most of a second to answer. That
   happened on the thread that draws the window. It happens in the background
   now, and the server starts when the answer arrives.
+
+- **The editor stopped searching the disk on every frame.** Which Python to
+  use, where the project's virtual environment is, whether there is a
+  `requirements.txt`, and what `.editorconfig` says were each looked up again
+  sixty times a second while typing — the Python search alone is a few hundred
+  file checks on an ordinary Windows machine. They are remembered now, and
+  looked up again when the file watcher sees the project change, when a
+  different folder or interpreter is chosen, or after a few seconds.
 
 - **Files over 5 MB are no longer sent to language servers**, as they were
   always meant not to be.

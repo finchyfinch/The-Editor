@@ -14,6 +14,7 @@ mod completion;
 mod debugger;
 mod diff_view;
 mod docs_window;
+mod environment;
 mod file_picker;
 mod git_panel;
 mod history_view;

@@ -232,6 +232,10 @@ pub(crate) struct EditorApp {
     /// across frames because creation is three processes, not a function call.
     pending_venv: Option<venv_dialog::Completion>,
 
+    /// What the project's surroundings say — interpreter, venv, requirements,
+    /// `.editorconfig` — remembered between frames rather than asked of the
+    /// filesystem on every one.
+    environment: crate::environment::Environment,
     /// Watches the open folder. `None` when no folder is open, or when the
     /// platform refused to watch it.
     watcher: Option<Watcher>,
@@ -487,6 +491,7 @@ impl EditorApp {
             dock_height: DEFAULT_DOCK_HEIGHT,
             venv_dialog: venv_dialog::Dialog::default(),
             pending_venv: None,
+            environment: crate::environment::Environment::default(),
             // Created up front rather than when a folder opens: a single file
             // opened from the command line needs watching too, and there may
             // never be a folder.
@@ -605,7 +610,7 @@ impl EditorApp {
 
     /// Editor options from settings, with the language left at its default —
     /// callers that have a document fill that in.
-    fn editor_options(&self) -> EditorOptions {
+    fn editor_options(&mut self) -> EditorOptions {
         let mut opts = EditorOptions {
             font_size: self.settings.font_size(),
             tab_width: self.settings.tab_width(),
@@ -628,7 +633,7 @@ impl EditorApp {
                 .and_then(|i| self.docs.get(i))
                 .and_then(|e| e.doc.path())
         {
-            let style = editor_config::editorconfig::style_for(path);
+            let style = self.environment.style_for(path);
             if let Some(spaces) = style.insert_spaces {
                 opts.insert_spaces = spaces;
             }
@@ -1266,6 +1271,8 @@ impl EditorApp {
             return;
         }
 
+        self.environment.invalidate();
+
         // A different folder is a different repository, or none. Asked for here
         // rather than per file: discovery is one subprocess and the answer is
         // what decides whether any of the rest is worth doing.
@@ -1738,8 +1745,9 @@ impl EditorApp {
     }
 
     /// The interpreter the packages panel and the runner should use.
-    fn interpreter(&self) -> Option<editor_proc::interpreter::Interpreter> {
-        editor_proc::interpreter::resolve(&self.settings.python_interpreter(), self.tree.root())
+    fn interpreter(&mut self) -> Option<editor_proc::interpreter::Interpreter> {
+        self.environment
+            .interpreter(&self.settings.python_interpreter(), self.tree.root())
     }
 
     /// Ask pip what is installed, if there is an interpreter to ask.
@@ -2993,14 +3001,9 @@ impl EditorApp {
     /// A project virtual environment's tools come first, so a project with
     /// `ruff` pinned in its venv is linted by that version rather than by
     /// whatever happens to be installed globally.
-    fn tool_search_path(&self) -> Vec<PathBuf> {
-        let Some(root) = self.tree.root() else {
-            return Vec::new();
-        };
-        editor_proc::interpreter::find_venv(root)
-            .and_then(|venv| venv.path.parent().map(Path::to_path_buf))
-            .into_iter()
-            .collect()
+    fn tool_search_path(&mut self) -> Vec<PathBuf> {
+        self.environment
+            .tool_search_path(&self.settings.python_interpreter(), self.tree.root())
     }
 
     /// Diagnostics for a document, converted to character offsets.
@@ -3051,6 +3054,8 @@ impl EditorApp {
         if changes.is_empty() {
             return;
         }
+        self.environment
+            .changed(&changes.touched, changes.structural);
         if changes.structural {
             self.tree.refresh();
         }
@@ -4051,6 +4056,8 @@ impl EditorApp {
 
     /// Adopt a newly created virtual environment, once its commands have run.
     fn finish_venv(&mut self, completion: &venv_dialog::Completion, code: Option<i32>) {
+        // Whatever happened, the project's surroundings may have changed.
+        self.environment.invalidate();
         if code != Some(0) {
             self.error("Virtual environment was not created \u{2014} see the output");
             return;
@@ -5383,8 +5390,8 @@ impl EditorApp {
     /// The setting is only a preference: an empty one means "detect", and a
     /// project virtual environment wins over both. Showing the setting alone
     /// would tell the user nothing about what Run is going to do.
-    fn detected_interpreter(&self) -> Option<String> {
-        editor_proc::interpreter::resolve(&self.settings.python_interpreter(), self.tree.root())
+    fn detected_interpreter(&mut self) -> Option<String> {
+        self.interpreter()
             .map(|i| format!("{} ({})", i.path.display(), i.label()))
     }
 
@@ -5719,7 +5726,9 @@ impl eframe::App for EditorApp {
                 .interpreter()
                 .map(|i| i.path)
                 .filter(|_| self.dock == DockTab::Packages);
-            let requirements = crate::packages_panel::requirements_file(self.tree.root());
+            let requirements = self
+                .environment
+                .requirements(&self.settings.python_interpreter(), self.tree.root());
             // Read before the closure borrows self for the panel.
             let terminal_cwd = self.tree.root().map(Path::to_path_buf);
             let mut problem_clicked = None;
