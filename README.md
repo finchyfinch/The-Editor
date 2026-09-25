@@ -4,7 +4,7 @@ An IDE for Python and Rust development, written in Rust.
 
 Copyright © 2026 Gareth Finch. MIT licensed.
 
-**Status: v1.0.1.** The Editor handles day-to-day Python and Rust work:
+**Status: v1.1.0.** The Editor handles day-to-day Python and Rust work:
 tree-sitter highlighting, completion, and diagnostics from `rust-analyzer`,
 Pyright and Ruff; Go to Definition and Find Uses; project-wide search and Go to
 File; a file explorer; an integrated console for running code; and a Python
