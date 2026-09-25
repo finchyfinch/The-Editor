@@ -11,6 +11,7 @@ pub mod paths;
 pub mod session;
 pub mod settings;
 pub mod theme;
+pub mod trust;
 
 // Still to come.
 //

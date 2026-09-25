@@ -83,6 +83,7 @@ pub(crate) enum CommandId {
     ToggleBlame,
     SelectInterpreter,
     CreateVenv,
+    FolderTrust,
     // View
     ToggleExplorer,
     ThemeDark,
@@ -173,6 +174,7 @@ impl CommandId {
         Self::ToggleBlame,
         Self::SelectInterpreter,
         Self::CreateVenv,
+        Self::FolderTrust,
         Self::ToggleExplorer,
         Self::ThemeDark,
         Self::ThemeLight,
@@ -560,6 +562,7 @@ static REGISTRY: [Command; CommandId::ALL.len()] = [
         "Create Virtual Environment...",
         None,
     ),
+    cmd(CommandId::FolderTrust, "Tools", "Folder Trust...", None),
     cmd(
         CommandId::ToggleExplorer,
         "View",

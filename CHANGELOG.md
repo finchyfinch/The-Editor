@@ -20,6 +20,23 @@ Entries are written as each milestone lands, not retroactively at release time.
   of `rustc` that the project's toolchain file selects, and opens Check
   Toolchains. Versions are asked for once, in the background.
 
+- **Opening a folder no longer runs anything in it until you say so.** A
+  project's virtual environment was searched for language servers before
+  anything installed on the machine, so a repository that shipped its own
+  `.venv/Scripts/ruff.exe` had it started as soon as one of its Python files
+  was opened. rust-analyzer does the same in its own way — it builds a Rust
+  project's build scripts and macros to understand it — and a
+  `rust-toolchain.toml` can name a toolchain by path.
+
+  The first time a folder containing any of those is opened, The Editor asks
+  whether to trust it, and remembers the answer (in `trusted_folders.toml`,
+  beside the settings). Until it is trusted the folder opens, highlights and is
+  checked by the tools installed on the machine, but nothing it contains is
+  run: no tools from its environment, no rust-analyzer, not even its Python to
+  ask the version. **Tools > Folder Trust** changes the answer. Folders with
+  nothing in them that would run are never asked about, and creating a
+  virtual environment from the editor trusts the folder it is created in.
+
 ### Changed
 
 - **The indentation in the status bar is the file's own.** It showed the

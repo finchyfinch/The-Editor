@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 use editor_config::editorconfig::{self, FileStyle};
 use editor_proc::interpreter::{self, Interpreter};
 
+/// Why a version was not asked for.
+pub(crate) const NOT_TRUSTED: &str = "not run, because this folder is not trusted";
+
 /// How long an answer is trusted with nothing to say it changed.
 const FRESH_FOR: Duration = Duration::from_secs(5);
 
@@ -40,6 +43,10 @@ pub(crate) struct Environment {
     /// Versions found by running a program, keyed by the program and the
     /// directory it was run in.
     versions: HashMap<(PathBuf, Option<PathBuf>), Version>,
+    /// Whether the project may run its own tools. Until it may, its virtual
+    /// environment is not searched for them and nothing in it is run, not
+    /// even to ask its version; see `editor_config::trust`.
+    trusted: bool,
 }
 
 /// A version being asked for, or the answer.
@@ -50,6 +57,11 @@ enum Version {
 }
 
 impl Environment {
+    /// Say whether the project may run its own tools.
+    pub(crate) fn set_trusted(&mut self, trusted: bool) {
+        self.trusted = trusted;
+    }
+
     /// Forget everything, so the next question looks again.
     pub(crate) fn invalidate(&mut self) {
         self.looked_at = None;
@@ -89,6 +101,9 @@ impl Environment {
         root: Option<&Path>,
     ) -> Vec<PathBuf> {
         self.refresh(configured, root);
+        if !self.trusted {
+            return Vec::new();
+        }
         self.venv_bin.iter().cloned().collect()
     }
 
@@ -117,14 +132,26 @@ impl Environment {
 
     /// The version of the Python at `interpreter`: `None` while it is being
     /// asked, which takes a process and so happens on a thread of its own.
-    pub(crate) fn python_version(&mut self, interpreter: &Path) -> Option<Result<String, String>> {
-        let path = interpreter.to_path_buf();
+    ///
+    /// A project environment's Python is not run in a folder that is not
+    /// trusted; that is reported as an error saying so.
+    pub(crate) fn python_version(
+        &mut self,
+        interpreter: &Interpreter,
+    ) -> Option<Result<String, String>> {
+        if !self.trusted && matches!(interpreter.origin, interpreter::Origin::Venv(_)) {
+            return Some(Err(NOT_TRUSTED.to_owned()));
+        }
+        let path = interpreter.path.clone();
         self.version(path.clone(), None, move || interpreter::version_of(&path))
     }
 
     /// The Rust toolchain version in `root`, as `rustc` reports it there — run
     /// in the project so that rustup applies its `rust-toolchain.toml`.
     pub(crate) fn rust_version(&mut self, root: Option<&Path>) -> Option<Result<String, String>> {
+        if !self.trusted {
+            return Some(Err(NOT_TRUSTED.to_owned()));
+        }
         let Some(rustc) = interpreter::which("rustc") else {
             return Some(Err("rustc is not on PATH".to_owned()));
         };
@@ -226,7 +253,7 @@ mod tests {
     #[test]
     fn an_answer_is_kept_until_something_says_it_changed() {
         let root = project("kept");
-        let mut env = Environment::default();
+        let mut env = trusting();
         assert_eq!(env.requirements("", Some(&root)), None);
 
         std::fs::write(root.join("requirements.txt"), "requests\n").expect("write");
@@ -249,7 +276,7 @@ mod tests {
         let a = project("key-a");
         let b = project("key-b");
         std::fs::write(b.join("requirements.txt"), "x\n").expect("write");
-        let mut env = Environment::default();
+        let mut env = trusting();
         assert_eq!(env.requirements("", Some(&a)), None);
         assert!(
             env.requirements("", Some(&b)).is_some(),
@@ -264,6 +291,41 @@ mod tests {
         );
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    fn trusting() -> Environment {
+        let mut env = Environment::default();
+        env.set_trusted(true);
+        env
+    }
+
+    /// The bug: a repository shipping `.venv/Scripts/ruff.exe` had it started
+    /// as a language server the moment one of its Python files was opened.
+    #[test]
+    fn an_untrusted_projects_environment_supplies_no_tools_and_is_not_run() {
+        let root = project("untrusted");
+        let bin = interpreter::venv_python(&root.join(".venv"));
+        std::fs::create_dir_all(bin.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&bin, "").expect("write");
+
+        let mut env = Environment::default();
+        assert!(env.tool_search_path("", Some(&root)).is_empty());
+        let venv = env
+            .interpreter("", Some(&root))
+            .expect("the venv is still found");
+        assert_eq!(
+            env.python_version(&venv),
+            Some(Err(NOT_TRUSTED.to_owned())),
+            "asked without running it"
+        );
+        assert!(!env.is_asking());
+
+        env.set_trusted(true);
+        assert_eq!(
+            env.tool_search_path("", Some(&root)),
+            vec![bin.parent().expect("parent").to_path_buf()]
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

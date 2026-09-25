@@ -230,6 +230,13 @@ pub(crate) struct EditorApp {
     /// across frames because creation is three processes, not a function call.
     pending_venv: Option<venv_dialog::Completion>,
 
+    /// Which folders may run their own tools, and the folder waiting to be
+    /// asked about.
+    trust: editor_config::trust::Trust,
+    trust_prompt: Option<PathBuf>,
+    /// Whether the open folder contains anything that would run, and so has
+    /// to be trusted before it does. Most folders do not, and are never asked.
+    trust_required: bool,
     /// What the project's surroundings say — interpreter, venv, requirements,
     /// `.editorconfig` — remembered between frames rather than asked of the
     /// filesystem on every one.
@@ -435,6 +442,7 @@ impl EditorApp {
         let first_run = !paths.settings_file().exists();
         let (settings, settings_error) = Settings::load(&paths.settings_file());
         let session = Session::load(&paths.session_file());
+        let trust = editor_config::trust::Trust::load(&paths.trust_file());
 
         // Before this session claims a directory of its own, so its own empty
         // one is not among the candidates.
@@ -489,6 +497,9 @@ impl EditorApp {
             dock_height: DEFAULT_DOCK_HEIGHT,
             venv_dialog: venv_dialog::Dialog::default(),
             pending_venv: None,
+            trust,
+            trust_prompt: None,
+            trust_required: false,
             environment: crate::environment::Environment::default(),
             // Created up front rather than when a folder opens: a single file
             // opened from the command line needs watching too, and there may
@@ -1269,6 +1280,12 @@ impl EditorApp {
         }
 
         self.environment.invalidate();
+        self.trust_required = editor_config::trust::needs_asking(&folder);
+        if self.trust_required && self.trust.decision(&folder).is_none() {
+            self.trust_prompt = Some(folder.clone());
+        }
+        self.environment
+            .set_trusted(self.folder_trusted_for(&folder));
 
         // A different folder is a different repository, or none. Asked for here
         // rather than per file: discovery is one subprocess and the answer is
@@ -2803,7 +2820,13 @@ impl EditorApp {
     /// the same reason the highlighter is driven from the change outbox.
     fn sync_language_servers(&mut self) {
         let extra_path = self.tool_search_path();
-        self.lsp.set_disabled(self.settings.disabled_servers());
+        let mut disabled = self.settings.disabled_servers();
+        if !self.folder_trusted() {
+            // It builds the project's build scripts and macros to understand
+            // it, which is running the project's code.
+            disabled.push(editor_lsp::registry::RUST_ANALYZER.id.to_owned());
+        }
+        self.lsp.set_disabled(disabled);
         self.lsp
             .set_root(self.tree.root().map(Path::to_path_buf), extra_path);
 
@@ -3681,6 +3704,97 @@ impl EditorApp {
     /// but a mis-click on a folder still means fishing a hundred files back out
     /// of it, and the file tree is a place where a click lands one row from
     /// where you meant. Escape cancels, which is the safe answer.
+    /// Whether the open folder may run its own tools. A folder with nothing
+    /// in it that would run needs no trust and is never asked about.
+    fn folder_trusted(&self) -> bool {
+        self.tree
+            .root()
+            .is_none_or(|root| self.folder_trusted_for(root))
+    }
+
+    fn folder_trusted_for(&self, root: &Path) -> bool {
+        !self.trust_required || self.trust.decision(root) == Some(true)
+    }
+
+    /// Record an answer about a folder, keep it, and act on it.
+    fn set_trust(&mut self, folder: &Path, trusted: bool) {
+        self.trust.decide(folder, trusted);
+        if let Err(e) = self.trust.save(&self.paths.trust_file()) {
+            self.error(format!("Could not save the folder's trust: {e}"));
+        }
+        if self.tree.root() == Some(folder) {
+            self.environment
+                .set_trusted(self.folder_trusted_for(folder));
+        }
+    }
+
+    /// Ask whether a folder may run its own tools.
+    ///
+    /// Asked once per folder, and only about one that contains something that
+    /// would run. Until it is answered the folder is treated as untrusted,
+    /// which costs nothing but the tools themselves: the file still opens,
+    /// highlights, and is checked by the servers found on `PATH`.
+    fn trust_prompt_ui(&mut self, ctx: &egui::Context) {
+        let Some(folder) = self.trust_prompt.clone() else {
+            return;
+        };
+        let name = folder.file_name().map_or_else(
+            || folder.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let current = self.trust.decision(&folder);
+        let mut decision: Option<bool> = None;
+
+        egui::Modal::new(egui::Id::new("folder_trust")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading("Trust this folder?");
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&name);
+                ui.label(
+                    "contains things The Editor would run to help you work on it: \
+                     the tools in its virtual environment, and for a Rust project, \
+                     rust-analyzer, which builds its build scripts and macros, and \
+                     the toolchain it names.",
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(
+                "Trust it if you wrote it or know where it came from. If not, it \
+                 still opens and highlights, and is checked by the tools installed \
+                 on this machine, but nothing it contains is run.",
+            );
+            ui.add_space(4.0);
+            ui.weak(folder.display().to_string());
+            if let Some(trusted) = current {
+                ui.weak(if trusted {
+                    "Currently trusted."
+                } else {
+                    "Currently not trusted."
+                });
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Don't Trust").clicked() {
+                    decision = Some(false);
+                }
+                if ui.button("Trust").clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // Dismissed, not answered: not trusted, and asked again next time.
+            self.trust_prompt = None;
+            return;
+        }
+        if let Some(trusted) = decision {
+            self.trust_prompt = None;
+            self.set_trust(&folder, trusted);
+        }
+    }
+
     fn delete_prompt(&mut self, ctx: &egui::Context) {
         let Some(path) = self.pending_delete.clone() else {
             return;
@@ -4056,6 +4170,12 @@ impl EditorApp {
             return;
         }
 
+        // An environment made here, by the person at the keyboard, is theirs.
+        if let Some(root) = self.tree.root().map(Path::to_path_buf)
+            && !self.folder_trusted()
+        {
+            self.set_trust(&root, true);
+        }
         if completion.set_as_project_interpreter {
             self.settings
                 .set_python_interpreter(&completion.interpreter.display().to_string());
@@ -4562,6 +4682,10 @@ impl EditorApp {
                 // An unsaved buffer has nothing committed to compare with, and
                 // saying so beats an empty window that looks like a failure.
                 None => self.error("Save this file before comparing it with the repository"),
+            },
+            CommandId::FolderTrust => match self.tree.root() {
+                Some(root) => self.trust_prompt = Some(root.to_path_buf()),
+                None => self.info("Open a folder first"),
             },
             CommandId::CreateVenv => match self.tree.root() {
                 Some(root) => self.venv_dialog.open(root.to_path_buf()),
@@ -5077,7 +5201,14 @@ impl EditorApp {
         };
         let origin = interpreter.label();
         let path = interpreter.path.display().to_string();
-        let (text, hover) = match self.environment.python_version(&interpreter.path) {
+        let (text, hover) = match self.environment.python_version(&interpreter) {
+            Some(Err(why)) if why == crate::environment::NOT_TRUSTED => (
+                format!("Python ({origin}, not trusted)"),
+                format!(
+                    "{path}\nThis folder is not trusted, so nothing in its environment \
+                     is run. Tools > Folder Trust changes that."
+                ),
+            ),
             Some(Ok(version)) => (
                 format!("Python {version} ({origin})"),
                 format!("{path}\nClick to choose another interpreter"),
@@ -5104,6 +5235,12 @@ impl EditorApp {
     /// Which Rust toolchain this project builds with, for the status bar.
     fn rust_status(&mut self) -> RuntimeStatus {
         let (text, hover) = match self.environment.rust_version(self.tree.root()) {
+            Some(Err(why)) if why == crate::environment::NOT_TRUSTED => (
+                "Rust (not trusted)".to_owned(),
+                "This folder is not trusted, so rust-analyzer and the toolchain it \
+                 names are not run. Tools > Folder Trust changes that."
+                    .to_owned(),
+            ),
             Some(Ok(version)) => (
                 format!("Rust {version}"),
                 "The rustc that cargo uses in this project".to_owned(),
@@ -5682,6 +5819,7 @@ impl eframe::App for EditorApp {
             || self.pending_delete.is_some()
             || self.pending_discard.is_some()
             || self.pending_encoding.is_some()
+            || self.trust_prompt.is_some()
             || self.pending_force_delete.is_some()
             || self.palette.is_open()
             || self.new_file.is_open()
@@ -6063,6 +6201,7 @@ impl eframe::App for EditorApp {
         self.delete_prompt(&ctx);
         self.discard_prompt(&ctx);
         self.encoding_prompt(&ctx);
+        self.trust_prompt_ui(&ctx);
         self.force_delete_prompt(&ctx);
         self.search.poll();
         if self.packages.poll() {
@@ -6738,6 +6877,7 @@ const MENUS: &[(&str, &[MenuEntry])] = &[
             MenuEntry::Separator,
             MenuEntry::Item(CommandId::ShowPackages),
             MenuEntry::Separator,
+            MenuEntry::Item(CommandId::FolderTrust),
             MenuEntry::Item(CommandId::OpenSettings),
         ],
     ),

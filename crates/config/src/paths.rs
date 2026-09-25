@@ -68,6 +68,12 @@ impl AppPaths {
         self.config.join("settings.toml")
     }
 
+    /// Which folders may run their own tools; see [`crate::trust`].
+    #[must_use]
+    pub fn trust_file(&self) -> PathBuf {
+        self.config.join("trusted_folders.toml")
+    }
+
     /// User keybinding overrides.
     #[must_use]
     pub fn keymap_file(&self) -> PathBuf {
