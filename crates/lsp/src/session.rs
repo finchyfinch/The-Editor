@@ -253,6 +253,15 @@ pub struct Lsp {
     /// Threads waiting for stopped servers to exit, joined when this is
     /// dropped so that none outlives the editor.
     stopping: Vec<std::thread::JoinHandle<()>>,
+    /// Servers being looked for on a thread of their own, each with the
+    /// channel its answer arrives on.
+    probing: HashMap<
+        &'static str,
+        (
+            ServerSpec,
+            std::sync::mpsc::Receiver<Option<registry::Found>>,
+        ),
+    >,
 }
 
 impl Lsp {
@@ -315,6 +324,8 @@ impl Lsp {
         self.diagnostics.clear();
         self.missing.clear();
         self.pending.clear();
+        // An answer still on its way is about the old project's search path.
+        self.probing.clear();
     }
 
     #[must_use]
@@ -672,29 +683,86 @@ impl Lsp {
             return None; // already looked, still not there
         }
 
-        let root = self.root.clone()?;
-        let Some(found) = registry::find(spec, &self.extra_path) else {
-            tracing::info!(server = spec.id, "not installed");
-            self.missing.push(spec);
-            return None;
-        };
+        if self.probing.contains_key(spec.id) {
+            return None; // still being looked for
+        }
+        self.root.as_ref()?;
 
-        match Server::start(spec, found.program, &root) {
-            Ok(server) => {
-                tracing::info!(server = spec.id, "started");
-                self.servers.insert(spec.id, server);
-                Some(spec.id)
+        // Looking for a server means running it with `--version`, and a
+        // Node-based one takes the best part of a second to answer. That used
+        // to happen here, on the thread that draws the window, the moment the
+        // first file of a language was opened. It happens on a thread of its
+        // own now, and `poll` starts the server when the answer comes back.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let extra_path = self.extra_path.clone();
+        let probe = std::thread::Builder::new()
+            .name(format!("lsp-find-{}", spec.id))
+            .spawn(move || {
+                let _ = tx.send(registry::find(spec, &extra_path));
+            });
+        match probe {
+            Ok(_) => {
+                self.probing.insert(spec.id, (spec, rx));
             }
             Err(e) => {
-                tracing::warn!(server = spec.id, "could not start: {e:#}");
+                tracing::warn!(server = spec.id, "could not look for it: {e}");
                 self.missing.push(spec);
-                None
             }
         }
+        None
+    }
+
+    /// Start every server whose search has finished, and offer it the
+    /// documents that were waiting for it.
+    fn finish_probes(&mut self) {
+        let finished: Vec<(ServerSpec, Option<registry::Found>)> = self
+            .probing
+            .values()
+            .filter_map(|(spec, rx)| match rx.try_recv() {
+                Ok(found) => Some((*spec, found)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((*spec, None)),
+            })
+            .collect();
+        if finished.is_empty() {
+            return;
+        }
+
+        for (spec, found) in finished {
+            self.probing.remove(spec.id);
+            let (Some(found), Some(root)) = (found, self.root.clone()) else {
+                tracing::info!(server = spec.id, "not installed");
+                self.missing.push(spec);
+                continue;
+            };
+            match Server::start(spec, found.program, &root) {
+                Ok(server) => {
+                    tracing::info!(server = spec.id, "started");
+                    self.servers.insert(spec.id, server);
+                }
+                Err(e) => {
+                    tracing::warn!(server = spec.id, "could not start: {e:#}");
+                    self.missing.push(spec);
+                }
+            }
+        }
+
+        let paths: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        for path in paths {
+            self.attach(&path);
+        }
+    }
+
+    /// True while a server is being looked for, so a caller waiting on one
+    /// knows to keep asking for frames.
+    #[must_use]
+    pub fn is_starting(&self) -> bool {
+        !self.probing.is_empty() || self.servers.values().any(|s| !s.is_ready())
     }
 
     /// Drain every server. Call once per frame.
     pub fn poll(&mut self) -> Vec<Notice> {
+        self.finish_probes();
         let mut notices = Vec::new();
         let ids: Vec<&'static str> = self.servers.keys().copied().collect();
 
@@ -1494,6 +1562,29 @@ mod tests {
         assert!(lsp.documents.contains_key(path));
     }
 
+    /// Looking for a server runs it, which can take a second. That must not
+    /// happen on the caller's thread.
+    #[test]
+    fn looking_for_a_server_does_not_block_the_caller() {
+        let mut lsp = Lsp::default();
+        lsp.set_root(Some(std::env::temp_dir()), Vec::new());
+        lsp.sync(Path::new("/project/main.py"), 1, || "x = 1".to_owned());
+        assert!(
+            lsp.servers.is_empty(),
+            "nothing may be started before the search has answered"
+        );
+
+        // Whatever the machine has installed, the search finishes and each
+        // server ends up either running or recorded as missing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !lsp.probing.is_empty() && std::time::Instant::now() < deadline {
+            lsp.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(lsp.probing.is_empty(), "the search never finished");
+        lsp.shutdown();
+    }
+
     #[test]
     fn a_missing_server_is_recorded_once_rather_than_retried() {
         // Retrying discovery on every keystroke would hammer the filesystem.
@@ -1926,10 +2017,6 @@ while True:
         let mut lsp = Lsp::default();
         lsp.set_root(Some(root.clone()), Vec::new());
         lsp.sync(&main, 1, || source.to_owned());
-        assert!(
-            !lsp.servers.is_empty(),
-            "rust-analyzer is installed but was not started"
-        );
 
         // rust-analyzer has to index and run `cargo check`, which is slow on a
         // cold cache.

@@ -5559,6 +5559,11 @@ impl eframe::App for EditorApp {
         // whoever looks first gets the key.
         self.completion_keys(&ctx);
         self.sync_language_servers();
+        if self.lsp.is_starting() {
+            // A server being looked for or shaking hands answers on another
+            // thread, and nothing else wakes an idle window to notice.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
 
         // Never let the window close with unsaved work. This must run before
         // anything else in the frame, and `quit_confirmed` stops the second

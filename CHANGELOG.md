@@ -44,6 +44,12 @@ Entries are written as each milestone lands, not retroactively at release time.
   properly — the protocol's `shutdown` before `exit` — and waited for in the
   background; quitting waits for all of them at once, for at most a second.
 
+- **Opening the first Python or Rust file no longer freezes the window.**
+  Finding a language server means running it once to check it works, and a
+  Node-based one such as basedpyright takes most of a second to answer. That
+  happened on the thread that draws the window. It happens in the background
+  now, and the server starts when the answer arrives.
+
 - **Files over 5 MB are no longer sent to language servers**, as they were
   always meant not to be.
 
