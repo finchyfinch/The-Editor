@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use editor_core::document::LineShift;
 use editor_debug::{Frame, Variable};
 use eframe::egui;
 
@@ -75,23 +76,27 @@ impl Breakpoints {
         }
     }
 
-    /// Move breakpoints below an edit, so they stay on the line they were put
-    /// on rather than on whatever has since slid into its place.
-    pub(crate) fn shift(&mut self, path: &Path, from_line: usize, by: isize) {
+    /// Carry a file's breakpoints through the edits made to it, so each stays
+    /// on the statement it was put on rather than on whatever has since slid
+    /// into its place. Returns whether any moved.
+    ///
+    /// From the document's own record of how each edit moved lines, not from
+    /// how the line count changed and where the caret is: that guess moved
+    /// breakpoints relative to the caret, so an undo, a replace-all or a rename
+    /// somewhere else in the file put them on the wrong lines.
+    pub(crate) fn follow(&mut self, path: &Path, shifts: &[LineShift]) -> bool {
         let Some(set) = self.lines.get_mut(path) else {
-            return;
+            return false;
         };
+        // Stored one-based, as the gutter and the protocol count; the shifts
+        // are zero-based.
         let moved: BTreeSet<usize> = set
             .iter()
-            .map(|line| {
-                if *line > from_line {
-                    line.saturating_add_signed(by).max(1)
-                } else {
-                    *line
-                }
-            })
+            .map(|line| shifts.iter().fold(line - 1, |l, shift| shift.follow(l)) + 1)
             .collect();
+        let changed = moved != *set;
         *set = moved;
+        changed
     }
 }
 
@@ -275,6 +280,15 @@ mod tests {
         assert!(b.files().is_empty());
     }
 
+    fn shift(line: usize, removed: usize, added: usize) -> LineShift {
+        LineShift {
+            line,
+            at_line_start: false,
+            removed,
+            added,
+        }
+    }
+
     #[test]
     fn inserting_lines_carries_the_breakpoints_below_it_down() {
         // Otherwise adding an import at the top silently moves every breakpoint
@@ -283,25 +297,26 @@ mod tests {
         for line in [5, 10] {
             b.toggle(&path(), line);
         }
-        b.shift(&path(), 2, 3);
+        assert!(b.follow(&path(), &[shift(1, 0, 3)]));
         assert_eq!(b.for_file(&path()), [8, 13]);
     }
 
     #[test]
-    fn deleting_lines_carries_them_back_up_and_never_past_the_first_line() {
+    fn a_breakpoint_on_deleted_lines_lands_on_the_edit_and_merges() {
         let mut b = Breakpoints::default();
-        for line in [4, 20] {
+        for line in [4, 6] {
             b.toggle(&path(), line);
         }
-        b.shift(&path(), 1, -30);
-        assert_eq!(b.for_file(&path()), [1], "clamped, and merged into one");
+        // Zero-based line 2 swallows the next five line breaks.
+        b.follow(&path(), &[shift(2, 5, 0)]);
+        assert_eq!(b.for_file(&path()), [3], "both on the joined line, once");
     }
 
     #[test]
     fn a_breakpoint_above_the_edit_does_not_move() {
         let mut b = Breakpoints::default();
         b.toggle(&path(), 3);
-        b.shift(&path(), 10, 5);
+        assert!(!b.follow(&path(), &[shift(9, 0, 5)]));
         assert_eq!(b.for_file(&path()), [3]);
     }
 

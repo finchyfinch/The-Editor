@@ -26,6 +26,14 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ### Fixed
 
+- **Breakpoints stay on their statements through undo, replace and rename.**
+  They were moved by comparing the line count before and after an edit and
+  assuming the edit was at the caret — so an undo, a replace-all or a rename
+  that changed lines anywhere else moved them onto the wrong statements. Each
+  edit now records which line it began on and how many lines it added or
+  removed, and breakpoints follow exactly that. One on a deleted line lands
+  where the deletion was rather than above it.
+
 - **Breakpoints below a folded block are drawn.** They were compared against
   screen rows as though they were line numbers, so once anything above was
   folded a breakpoint could be set and not shown.

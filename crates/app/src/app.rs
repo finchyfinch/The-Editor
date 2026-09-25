@@ -171,8 +171,6 @@ struct OpenDoc {
     /// Document version the built-in syntax check last ran against. `None`
     /// until it has run once.
     syntax_version: Option<u64>,
-    /// Line count as of the last frame, so breakpoints can follow their lines.
-    line_count_seen: Option<usize>,
     /// When the next syntax check is due, so squiggles do not flicker under
     /// the caret while a line is half-typed.
     syntax_due: Option<Instant>,
@@ -701,7 +699,6 @@ impl EditorApp {
             syntax_version: None,
             syntax_due: None,
             disk: DiskState::Unchanged,
-            line_count_seen: None,
         };
 
         // A preview tab replaces the existing one rather than adding to it.
@@ -2915,6 +2912,9 @@ impl EditorApp {
 
         for entry in &mut self.docs {
             let changes = entry.doc.take_changes();
+            // Drained for every document, so a buffer with no breakpoints
+            // does not collect them for ever.
+            let shifts = entry.doc.take_line_shifts();
             if let Some(h) = entry.highlighter.as_mut() {
                 if !changes.is_empty() {
                     h.update(&changes, entry.doc.text());
@@ -2940,26 +2940,10 @@ impl EditorApp {
                 continue;
             };
 
-            // Carry breakpoints with the lines they were put on. Approximated
-            // from the change in line count rather than from the edit itself:
-            // exact tracking needs every edit's range, and being one line out
-            // after a multi-cursor paste is a much smaller problem than a
-            // breakpoint that silently stops matching its statement.
-            let lines_now = entry.doc.line_count();
-            if let Some(before) = entry.line_count_seen
-                && before != lines_now
-                && !self.breakpoints.for_file(&path).is_empty()
-            {
-                let caret_line = entry.doc.line_of(entry.view.selection.head);
-                let delta = lines_now as isize - before as isize;
-                self.breakpoints.shift(
-                    &path,
-                    caret_line.saturating_sub(delta.unsigned_abs()),
-                    delta,
-                );
+            // Carry breakpoints with the lines they were put on.
+            if !shifts.is_empty() && self.breakpoints.follow(&path, &shifts) {
                 breakpoints_changed.push(path.clone());
             }
-            entry.line_count_seen = Some(lines_now);
             let version = entry.doc.version();
             if entry.syntax_version == Some(version) {
                 continue;
@@ -3401,7 +3385,6 @@ impl EditorApp {
             syntax_version: None,
             syntax_due: None,
             disk: DiskState::Unchanged,
-            line_count_seen: None,
         };
 
         // The session restore ran earlier in this same frame and has already
@@ -4366,7 +4349,6 @@ impl EditorApp {
                     syntax_version: None,
                     syntax_due: None,
                     disk: DiskState::Unchanged,
-                    line_count_seen: None,
                 });
                 self.active = Some(self.docs.len() - 1);
                 self.focus_active();
@@ -7105,7 +7087,6 @@ mod tests {
             syntax_version: None,
             syntax_due: None,
             disk: DiskState::Unchanged,
-            line_count_seen: None,
         }
     }
 

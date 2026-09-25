@@ -17,6 +17,8 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use ropey::Rope;
 
+#[cfg(test)]
+use crate::edit::Edit;
 use crate::edit::{self, Change, Transaction};
 use crate::history::History;
 use crate::selection::Selection;
@@ -137,6 +139,8 @@ pub struct Document {
     /// project-wide replace. Queueing them here means no new edit path can
     /// forget to notify anyone.
     pending: Vec<Change>,
+    /// How edits since the last [`Self::take_line_shifts`] moved whole lines.
+    line_shifts: Vec<LineShift>,
     /// Bumped by every mutation, including undo and redo. Compared against
     /// [`Self::saved_version`] to decide whether the tab shows an unsaved
     /// marker.
@@ -158,6 +162,38 @@ pub struct Document {
     /// be read — a filesystem that will not report a time should be treated as
     /// "unknown", never as "unchanged".
     disk_mtime: Option<SystemTime>,
+}
+
+/// How one edit moved whole lines, in the lines of the text just before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineShift {
+    /// Zero-based line the edit begins on.
+    pub line: usize,
+    /// Whether it begins at the very start of that line, in which case that
+    /// line's own text moves with whatever is inserted in front of it.
+    pub at_line_start: bool,
+    /// Line breaks the edit removed, and inserted.
+    pub removed: usize,
+    pub added: usize,
+}
+
+impl LineShift {
+    /// Where something on zero-based line `line` ends up.
+    ///
+    /// Above the edit, nothing moves; nor does the line it begins on, unless
+    /// it begins at the start of that line. A line the edit swallowed lands
+    /// where the edit's text ends, rather than vanishing or jumping above the
+    /// edit. Everything below moves by the change in the number of lines.
+    #[must_use]
+    pub fn follow(&self, line: usize) -> usize {
+        if line < self.line || (line == self.line && !self.at_line_start) {
+            line
+        } else if line <= self.line + self.removed {
+            self.line + self.added
+        } else {
+            line + self.added - self.removed
+        }
+    }
 }
 
 /// Source of document versions.
@@ -195,6 +231,7 @@ impl Document {
             large: false,
             history: History::default(),
             pending: Vec::new(),
+            line_shifts: Vec::new(),
             version,
             saved_version: version,
             disk_mtime: None,
@@ -223,6 +260,7 @@ impl Document {
             large: false,
             history: History::default(),
             pending: Vec::new(),
+            line_shifts: Vec::new(),
             version: next_version(),
             // Never written to `path`, so no version of it has been saved.
             saved_version: 0,
@@ -294,6 +332,7 @@ impl Document {
             large,
             history: History::default(),
             pending: Vec::new(),
+            line_shifts: Vec::new(),
             version: opened,
             saved_version: opened,
             disk_mtime: meta.modified().ok(),
@@ -365,6 +404,7 @@ impl Document {
         if tx.is_empty() {
             return Vec::new();
         }
+        self.record_line_shifts(tx);
         let applied = edit::apply(&mut self.text, tx);
         self.history
             .push(tx.clone(), applied.inverse, before, after);
@@ -381,6 +421,49 @@ impl Document {
     /// edits sent to a language server.
     pub fn take_changes(&mut self) -> Vec<Change> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// Take every line movement recorded since this was last called, in the
+    /// order to apply them.
+    ///
+    /// For anything that marks a *line* rather than a character — a
+    /// breakpoint — and has to follow it. Worked out as each edit is applied,
+    /// because only then is the text the edit was stated against still here to
+    /// say which line it began on.
+    pub fn take_line_shifts(&mut self) -> Vec<LineShift> {
+        std::mem::take(&mut self.line_shifts)
+    }
+
+    /// Note how `tx` will move lines, before it is applied.
+    ///
+    /// Last edit first: each edit only moves the lines after it, so applying
+    /// the shifts in that order means none of them is thrown off by another
+    /// from the same transaction.
+    fn record_line_shifts(&mut self, tx: &Transaction) {
+        let mut edits: Vec<&edit::Edit> = tx.edits.iter().collect();
+        edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
+        let len = self.text.len_chars();
+        for e in edits {
+            let start = e.range.start.min(len);
+            let end = e.range.end.clamp(start, len);
+            let removed = self
+                .text
+                .slice(start..end)
+                .chars()
+                .filter(|c| *c == '\n')
+                .count();
+            let added = e.text.matches('\n').count();
+            if removed == 0 && added == 0 {
+                continue; // nothing moved to another line
+            }
+            let line = self.text.char_to_line(start);
+            self.line_shifts.push(LineShift {
+                line,
+                at_line_start: self.text.line_to_char(line) == start,
+                removed,
+                added,
+            });
+        }
     }
 
     /// True if there are changes no consumer has seen yet.
@@ -406,6 +489,7 @@ impl Document {
     /// nothing to undo.
     pub fn undo(&mut self) -> Option<Selection> {
         let step = self.history.undo()?;
+        self.record_line_shifts(&step.transaction);
         let applied = edit::apply(&mut self.text, &step.transaction);
         self.version = next_version();
         self.pending.extend(applied.changes);
@@ -415,6 +499,7 @@ impl Document {
     /// Redo one step. Returns the selection to restore.
     pub fn redo(&mut self) -> Option<Selection> {
         let step = self.history.redo()?;
+        self.record_line_shifts(&step.transaction);
         let applied = edit::apply(&mut self.text, &step.transaction);
         self.version = next_version();
         self.pending.extend(applied.changes);
@@ -1046,6 +1131,156 @@ mod tests {
             encode("caf\u{e9} \u{20ac}", Encoding::Latin1),
             Ok(b"caf\xE9 \x80".to_vec())
         );
+    }
+
+    fn follow_all(doc: &mut Document, line: usize) -> usize {
+        doc.take_line_shifts()
+            .iter()
+            .fold(line, |line, shift| shift.follow(line))
+    }
+
+    #[test]
+    fn typing_on_a_line_moves_nothing() {
+        let mut doc = Document::untitled();
+        doc.apply(
+            &Transaction::insert(0, "a\nb\nc\n"),
+            Selection::at(0),
+            Selection::at(0),
+        );
+        doc.take_line_shifts();
+        doc.apply(
+            &Transaction::insert(2, "xyz"),
+            Selection::at(2),
+            Selection::at(5),
+        );
+        assert!(doc.take_line_shifts().is_empty());
+    }
+
+    #[test]
+    fn lines_follow_an_inserted_line_above_them_and_ignore_one_below() {
+        let mut doc = Document::untitled();
+        doc.apply(
+            &Transaction::insert(0, "a\nb\nc\n"),
+            Selection::at(0),
+            Selection::at(0),
+        );
+        doc.take_line_shifts();
+        // Enter at the end of line 0.
+        doc.apply(
+            &Transaction::insert(1, "\n"),
+            Selection::at(1),
+            Selection::at(2),
+        );
+        let shifts = doc.take_line_shifts();
+        assert_eq!(
+            shifts.iter().fold(0, |l, s| s.follow(l)),
+            0,
+            "the line the edit is on"
+        );
+        assert_eq!(shifts.iter().fold(2, |l, s| s.follow(l)), 3, "a line below");
+    }
+
+    #[test]
+    fn a_line_moves_with_a_line_inserted_at_its_very_start() {
+        let mut doc = Document::untitled();
+        doc.apply(
+            &Transaction::insert(0, "a\nb\n"),
+            Selection::at(0),
+            Selection::at(0),
+        );
+        doc.take_line_shifts();
+        // A new line typed in front of `b`, whose text moves down with it.
+        doc.apply(
+            &Transaction::insert(2, "new\n"),
+            Selection::at(2),
+            Selection::at(6),
+        );
+        assert_eq!(follow_all(&mut doc, 1), 2);
+    }
+
+    #[test]
+    fn joining_two_lines_brings_the_second_up_and_deleting_lines_lands_on_the_edit() {
+        let mut doc = Document::untitled();
+        doc.apply(
+            &Transaction::insert(0, "0\n1\n2\n3\n4\n5\n"),
+            Selection::at(0),
+            Selection::at(0),
+        );
+        doc.take_line_shifts();
+        // Backspace at the start of line 2 joins it onto line 1.
+        doc.apply(
+            &Transaction::delete(3..4),
+            Selection::at(4),
+            Selection::at(3),
+        );
+        let shifts = doc.take_line_shifts();
+        assert_eq!(shifts.iter().fold(2, |l, s| s.follow(l)), 1);
+        assert_eq!(shifts.iter().fold(5, |l, s| s.follow(l)), 4);
+
+        // Delete whole lines 1 and 2 of what is now `0 12 3 4 5`.
+        let from = doc.line_start(1);
+        let to = doc.line_start(3);
+        doc.apply(
+            &Transaction::delete(from..to),
+            Selection::at(from),
+            Selection::at(from),
+        );
+        let shifts = doc.take_line_shifts();
+        assert_eq!(
+            shifts.iter().fold(2, |l, s| s.follow(l)),
+            1,
+            "a deleted line lands on the edit"
+        );
+        assert_eq!(
+            shifts.iter().fold(3, |l, s| s.follow(l)),
+            1,
+            "the line after it moves up"
+        );
+        assert_eq!(shifts.iter().fold(0, |l, s| s.follow(l)), 0);
+    }
+
+    /// Several edits in one transaction — a multi-caret Enter — each stated
+    /// against the text before any of them.
+    #[test]
+    fn a_multi_edit_transaction_shifts_by_every_edit_above() {
+        let mut doc = Document::untitled();
+        doc.apply(
+            &Transaction::insert(0, "a\nb\nc\nd\n"),
+            Selection::at(0),
+            Selection::at(0),
+        );
+        doc.take_line_shifts();
+        // Enter at the end of lines 0 and 2.
+        doc.apply(
+            &Transaction::new(vec![Edit::insert(1, "\n"), Edit::insert(5, "\n")]),
+            Selection::at(1),
+            Selection::at(2),
+        );
+        let shifts = doc.take_line_shifts();
+        let follow = |line| shifts.iter().fold(line, |l, s| s.follow(l));
+        assert_eq!(follow(1), 2, "below the first");
+        assert_eq!(follow(3), 5, "below both");
+        assert_eq!(follow(2), 3, "on the second, not at its start");
+    }
+
+    #[test]
+    fn undo_moves_lines_back() {
+        let mut doc = Document::untitled();
+        doc.apply(
+            &Transaction::insert(0, "a\nb\n"),
+            Selection::at(0),
+            Selection::at(0),
+        );
+        doc.break_undo_run();
+        doc.take_line_shifts();
+        doc.apply(
+            &Transaction::insert(0, "x\ny\n"),
+            Selection::at(0),
+            Selection::at(4),
+        );
+        assert_eq!(follow_all(&mut doc, 1), 3);
+        doc.undo();
+        assert_eq!(follow_all(&mut doc, 3), 1);
     }
 
     /// A recovered buffer is unsaved work by definition: it exists precisely
