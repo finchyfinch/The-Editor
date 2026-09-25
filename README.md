@@ -54,6 +54,9 @@ cargo xlint
 cargo xtest
 ```
 
+[docs/INVARIANTS.md](docs/INVARIANTS.md) lists the rules the code relies on and
+the test that enforces each.
+
 Dependency licence and advisory audit (needs `cargo install cargo-deny`):
 
 ```bash

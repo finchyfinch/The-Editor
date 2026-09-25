@@ -7,8 +7,8 @@
 //! opening a CRLF file and saving it produces a byte-identical CRLF file and
 //! not a diff touching every line. Same for the byte-order mark.
 //!
-//! M2 adds edits, undo and selections on top of this. M1 needs only load,
-//! display and save.
+//! Writing goes through [`crate::save`], which is atomic and keeps links and
+//! permissions; every change to the text goes through [`Document::apply`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
