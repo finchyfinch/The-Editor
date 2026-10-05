@@ -50,6 +50,7 @@ use crate::watcher::Watcher;
 mod chrome;
 mod documents;
 mod language;
+mod problems;
 mod project;
 mod running;
 mod session;
@@ -415,6 +416,11 @@ struct Hover {
     from_file: bool,
     /// Whether a server has been asked and has not answered.
     waiting: bool,
+    /// The diagnostics at this place, shown above whatever the server says:
+    /// "why is this underlined" is the first question a squiggle raises.
+    problems: Vec<editor_lsp::diagnostics::Diagnostic>,
+    /// Asked from the gutter marker, about the whole line rather than a symbol.
+    gutter: bool,
 }
 
 /// The bottom dock's tabs.
@@ -1564,6 +1570,13 @@ impl eframe::App for EditorApp {
                 }
                 ContextAction::FindUses => self.run_command(CommandId::FindUses, &ctx),
                 ContextAction::Paste => self.run_command(CommandId::Paste, &ctx),
+                ContextAction::ShowProblem => {
+                    self.run_command(CommandId::ShowProblems, &ctx);
+                    // Scroll to it even if it was already the highlighted row:
+                    // the list may have been scrolled away from it since.
+                    self.problem_revealed = None;
+                }
+                ContextAction::CopyProblem => self.copy_problem_at_caret(&ctx),
             }
         }
 

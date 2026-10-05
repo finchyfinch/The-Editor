@@ -2,6 +2,10 @@
 //! completion, hover, navigation and rename, with the parse-tree fallbacks
 //! for when no server can answer.
 
+use super::problems::{
+    diagnostic_range, is_underlined, problem_report, problems_at, problems_at_caret,
+    problems_on_line,
+};
 use super::*;
 
 impl EditorApp {
@@ -191,7 +195,7 @@ impl EditorApp {
     ///
     /// Recomputed each frame from the caret rather than set when the user
     /// clicks, so arrowing onto a squiggle reveals it too — and so it clears
-    /// itself the moment the caret moves off.
+    /// itself the moment the caret moves off the line.
     pub(super) fn sync_problem_at_caret(&mut self) {
         self.problem_at_caret = self.diagnostic_under_caret();
     }
@@ -200,21 +204,40 @@ impl EditorApp {
         let entry = self.active.and_then(|i| self.docs.get(i))?;
         let path = entry.doc.path()?;
         let caret = entry.view.selection.head;
+        let all = self.lsp.diagnostics().for_file(path);
 
-        self.lsp
-            .diagnostics()
-            .for_file(path)
-            .into_iter()
-            .find(|d| {
-                let start = entry.doc.offset_at(d.line as usize, d.column as usize);
-                let end = entry
-                    .doc
-                    .offset_at(d.end_line as usize, d.end_column as usize);
-                // Inclusive of the end, so a caret left just past the last
-                // character of a squiggle still counts as on it.
-                caret >= start && caret <= end.max(start)
-            })
+        problems_at_caret(&entry.doc, &all, caret)
+            .first()
             .map(|d| (path.to_path_buf(), d.line, d.column))
+    }
+
+    /// Right-click > Copy Problem: the problems at the caret, in full.
+    ///
+    /// The hover cannot be selected from, and the Problems panel shows only a
+    /// first line; this is the way to get the whole message somewhere else.
+    pub(super) fn copy_problem_at_caret(&mut self, ctx: &egui::Context) {
+        let Some(entry) = self.active.and_then(|i| self.docs.get(i)) else {
+            return;
+        };
+        let Some(path) = entry.doc.path() else {
+            return;
+        };
+        let all = self.lsp.diagnostics().for_file(path);
+        let problems = problems_at_caret(&entry.doc, &all, entry.view.selection.head);
+        if problems.is_empty() {
+            self.info("No problem reported here");
+            return;
+        }
+        let report = problems
+            .iter()
+            .map(|d| problem_report(path, d))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        ctx.copy_text(report);
+        self.info(match problems.len() {
+            1 => "Copied the problem".to_owned(),
+            n => format!("Copied {n} problems"),
+        });
     }
 
     /// F2: ask for a new name for the symbol under the caret.
@@ -622,8 +645,38 @@ impl EditorApp {
         if self
             .hover
             .as_ref()
-            .is_some_and(|h| h.offset == hovered.offset)
+            .is_some_and(|h| h.offset == hovered.offset && h.gutter == hovered.gutter)
         {
+            return;
+        }
+
+        // The problems here. Over the text, only the underlined ones: a popup
+        // about a warning the setting chose not to draw would be about nothing
+        // the reader can see. The gutter marker stands for everything on the
+        // line, so it shows everything.
+        let problems = entry.doc.path().map_or_else(Vec::new, |path| {
+            let all = self.lsp.diagnostics().for_file(path);
+            if hovered.gutter {
+                problems_on_line(&entry.doc, &all, entry.doc.line_of(hovered.offset))
+            } else {
+                let level = self.settings.underline_diagnostics();
+                problems_at(&entry.doc, &all, hovered.offset)
+                    .into_iter()
+                    .filter(|d| is_underlined(d, level))
+                    .collect()
+            }
+        });
+        // The marker asks about the line, which has no type to look up.
+        if hovered.gutter {
+            self.hover = Some(Hover {
+                offset: hovered.offset,
+                at: hovered.at,
+                text: String::new(),
+                from_file: false,
+                waiting: false,
+                problems,
+                gutter: true,
+            });
             return;
         }
 
@@ -655,6 +708,8 @@ impl EditorApp {
                 .unwrap_or_default(),
             from_file: local.is_some(),
             waiting: asked,
+            problems,
+            gutter: false,
         });
     }
 
@@ -665,7 +720,7 @@ impl EditorApp {
         };
         // Nothing to say and nothing coming: no popup at all, rather than an
         // empty one that follows the pointer around.
-        if hover.text.is_empty() && !hover.waiting {
+        if hover.text.is_empty() && !hover.waiting && hover.problems.is_empty() {
             return;
         }
 
@@ -678,6 +733,18 @@ impl EditorApp {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_max_width(560.0);
+                    for (i, problem) in hover.problems.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(6.0);
+                        }
+                        problem_ui(ui, problem);
+                    }
+                    if hover.text.is_empty() && !hover.waiting {
+                        return;
+                    }
+                    if !hover.problems.is_empty() {
+                        ui.separator();
+                    }
                     if hover.text.is_empty() {
                         ui.weak("Looking\u{2026}");
                         return;
@@ -1073,6 +1140,7 @@ impl EditorApp {
                     // pointer moves while the request is in flight, and a
                     // description of somewhere it has left is worse than none.
                     if let Some(hover) = self.hover.as_mut()
+                        && !hover.gutter
                         && let Some(entry) = self.active.and_then(|i| self.docs.get(i))
                     {
                         let (at_line, at_column) = entry.doc.line_col(hover.offset);
@@ -1225,36 +1293,25 @@ impl EditorApp {
     /// The store holds zero-based lines and *character* columns — the language
     /// session has already converted from whatever the server counts in (see
     /// `editor_lsp::position`) — so this only turns them into offsets.
+    ///
+    /// Every diagnostic is passed on, because the gutter marks them all; the
+    /// setting only decides which are also written across the text.
     pub(super) fn underlines_for(
         entry: &OpenDoc,
         store: &editor_lsp::diagnostics::Store,
         level: editor_config::settings::UnderlineDiagnostics,
     ) -> Vec<Underline> {
-        use editor_config::settings::UnderlineDiagnostics as Level;
-        if level == Level::None {
-            return Vec::new();
-        }
         let Some(path) = entry.doc.path() else {
             return Vec::new();
         };
         store
             .for_file(path)
             .into_iter()
-            // The gutter and the Problems panel still show everything; this
-            // only decides how much of it is written across the text.
-            .filter(|d| {
-                level == Level::All || d.severity == editor_lsp::diagnostics::Severity::Error
-            })
-            .map(|d| {
-                let start = entry.doc.offset_at(d.line as usize, d.column as usize);
-                let end = entry
-                    .doc
-                    .offset_at(d.end_line as usize, d.end_column as usize);
-                Underline {
-                    range: start..end.max(start),
-                    severity: d.severity,
-                    message: d.summary(),
-                }
+            .map(|d| Underline {
+                range: diagnostic_range(&entry.doc, &d),
+                severity: d.severity,
+                underlined: is_underlined(&d, level),
+                message: d.summary(),
             })
             .collect()
     }
@@ -1274,4 +1331,24 @@ impl EditorApp {
             format!("Checking syntax, plus: {}", running.join(", "))
         }
     }
+}
+
+/// One diagnostic in the hover popup: what kind, which rule, who said so, and
+/// the whole message.
+///
+/// The rule and the server are what make a complaint checkable — they are what
+/// to search for, and what to switch off if the rule is not wanted here.
+fn problem_ui(ui: &mut egui::Ui, problem: &editor_lsp::diagnostics::Diagnostic) {
+    ui.horizontal(|ui| {
+        ui.colored_label(
+            severity_colour(ui.visuals(), problem.severity),
+            problem.severity.glyph(),
+        );
+        ui.strong(problem.severity.label());
+        if let Some(code) = &problem.code {
+            ui.monospace(code);
+        }
+        ui.weak(&problem.source);
+    });
+    ui.label(&problem.message);
 }

@@ -599,3 +599,107 @@ fn every_theme_preference_has_a_command_and_a_menu_entry() {
         "a new theme preference needs a command, a menu entry and a status-bar cycle step"
     );
 }
+
+// ---- Which problem the user pointed at ----------------------------------
+
+fn problem(
+    severity: editor_lsp::diagnostics::Severity,
+    line: u32,
+    columns: (u32, u32),
+) -> editor_lsp::diagnostics::Diagnostic {
+    editor_lsp::diagnostics::Diagnostic {
+        severity,
+        line,
+        column: columns.0,
+        end_line: line,
+        end_column: columns.1,
+        message: format!("problem on line {line}"),
+        code: Some("reportArgumentType".to_owned()),
+        source: "basedpyright".to_owned(),
+    }
+}
+
+fn three_lines() -> Document {
+    // `join` on the second line is at columns 10..14, offsets 18..22.
+    Document::recovered(None, "x = f()\nprint(' '.join(x))\ny = 2\n")
+}
+
+#[test]
+fn a_problem_is_found_under_the_pointer_including_its_last_edge() {
+    use editor_lsp::diagnostics::Severity;
+    let doc = three_lines();
+    let all = [problem(Severity::Error, 1, (10, 14))];
+
+    assert!(
+        problems::problems_at(&doc, &all, 17).is_empty(),
+        "just before it"
+    );
+    assert_eq!(problems::problems_at(&doc, &all, 18).len(), 1);
+    assert_eq!(
+        problems::problems_at(&doc, &all, 22).len(),
+        1,
+        "just past the end"
+    );
+    assert!(problems::problems_at(&doc, &all, 23).is_empty());
+}
+
+/// A right-click on the gutter marker leaves the caret at the start of the
+/// line, nowhere near the squiggle. The menu must still find the problem.
+#[test]
+fn the_caret_finds_a_problem_on_its_line_when_not_on_the_squiggle() {
+    use editor_lsp::diagnostics::Severity;
+    let doc = three_lines();
+    let all = [
+        problem(Severity::Error, 1, (10, 14)),
+        problem(Severity::Warning, 2, (0, 1)),
+    ];
+
+    let at_line_start = problems::problems_at_caret(&doc, &all, doc.line_start(1));
+    assert_eq!(at_line_start.len(), 1);
+    assert_eq!(at_line_start[0].line, 1, "not the next line's");
+    assert!(problems::problems_at_caret(&doc, &all, 0).is_empty());
+}
+
+/// On the squiggle, only that problem: another one further along the same
+/// line is not what the user is pointing at.
+#[test]
+fn the_caret_on_a_squiggle_prefers_it_over_the_rest_of_the_line() {
+    use editor_lsp::diagnostics::Severity;
+    let doc = three_lines();
+    let all = [
+        problem(Severity::Error, 1, (10, 14)),
+        problem(Severity::Warning, 1, (15, 16)),
+    ];
+    let found = problems::problems_at_caret(&doc, &all, 19);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].column, 10);
+}
+
+#[test]
+fn the_setting_decides_what_is_underlined_but_not_what_is_marked() {
+    use editor_config::settings::UnderlineDiagnostics as Level;
+    use editor_lsp::diagnostics::Severity;
+    let error = problem(Severity::Error, 0, (0, 1));
+    let warning = problem(Severity::Warning, 0, (0, 1));
+
+    assert!(problems::is_underlined(&error, Level::Errors));
+    assert!(!problems::is_underlined(&warning, Level::Errors));
+    assert!(problems::is_underlined(&warning, Level::All));
+    assert!(!problems::is_underlined(&error, Level::None));
+}
+
+/// The clipboard copy has to be the whole thing: basedpyright's first line
+/// says *that* an argument is wrong, and the lines after it say why.
+#[test]
+fn a_copied_problem_is_located_attributed_and_complete() {
+    use editor_lsp::diagnostics::Severity;
+    let mut d = problem(Severity::Error, 4801, (12, 40));
+    d.message = "Argument of type \"int\" cannot be assigned\n  \"int\" is not iterable".to_owned();
+
+    let report = problems::problem_report(Path::new("pfemame.py"), &d);
+    assert_eq!(
+        report,
+        "pfemame.py:4802:13: Error [reportArgumentType] (basedpyright)\n\
+         Argument of type \"int\" cannot be assigned\n  \"int\" is not iterable"
+    );
+}

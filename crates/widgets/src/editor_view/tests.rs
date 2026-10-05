@@ -2218,3 +2218,40 @@ fn each_style_writes_its_own_layout() {
         );
     }
 }
+
+// ---- Diagnostics in the gutter ----------------------------------------
+
+fn underline(range: std::ops::Range<usize>, underlined: bool) -> Underline {
+    Underline {
+        range,
+        severity: editor_lsp::diagnostics::Severity::Warning,
+        message: "w".to_owned(),
+        underlined,
+    }
+}
+
+/// The gutter marker, its hover and the right-click items all key off this,
+/// so a warning the setting does not underline must still count.
+#[test]
+fn a_line_has_a_problem_whether_or_not_it_is_underlined() {
+    let doc = doc_with("a = 1\nb = c\nd = 2\n");
+    let mut view = EditorView::default();
+    // `c` on the second line, offsets 10..11.
+    view.set_diagnostics(vec![underline(10..11, false)]);
+
+    assert!(!view.line_has_problem(&doc, 0));
+    assert!(view.line_has_problem(&doc, 1));
+    assert!(!view.line_has_problem(&doc, 2));
+}
+
+#[test]
+fn a_problem_spanning_lines_marks_each_of_them() {
+    let doc = doc_with("x = (\n    1,\n)\ny = 2\n");
+    let mut view = EditorView::default();
+    view.set_diagnostics(vec![underline(4..13, true)]);
+
+    assert!(view.line_has_problem(&doc, 0));
+    assert!(view.line_has_problem(&doc, 1));
+    assert!(view.line_has_problem(&doc, 2));
+    assert!(!view.line_has_problem(&doc, 3));
+}

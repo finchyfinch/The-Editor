@@ -71,6 +71,8 @@ struct Resting {
     at: egui::Pos2,
     /// When it arrived here.
     since: std::time::Instant,
+    /// Over the gutter's diagnostic marker rather than the text.
+    gutter: bool,
 }
 
 /// What the pointer is over, left to right across the view.
@@ -111,9 +113,14 @@ struct Gesture {
 /// Something the pointer has settled on, for the application to describe.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hovered {
+    /// The character under the pointer, or the start of the line when the
+    /// pointer is on the gutter.
     pub offset: usize,
     /// Where to put the popup.
     pub at: egui::Pos2,
+    /// On a line's diagnostic marker rather than on the text: a question about
+    /// the line's problems, not about a symbol.
+    pub gutter: bool,
 }
 
 /// How wide the change bar is drawn.
@@ -320,8 +327,10 @@ pub struct Underline {
     /// Character offsets into the document.
     pub range: std::ops::Range<usize>,
     pub severity: editor_lsp::diagnostics::Severity,
-    /// Shown on hover.
     pub message: String,
+    /// Whether to draw the squiggle. Every diagnostic gets its gutter glyph;
+    /// which of them are also written across the text is a setting.
+    pub underlined: bool,
 }
 
 impl EditorView {
@@ -868,6 +877,26 @@ impl EditorView {
                         ui.close();
                     }
                     ui.separator();
+                    // On the caret's line rather than under the caret itself,
+                    // so a right-click on the gutter marker finds it too.
+                    let has_problem = self.line_has_problem(doc, doc.line_of(self.selection.head));
+                    if ui
+                        .add_enabled(has_problem, egui::Button::new("Show in Problems"))
+                        .on_disabled_hover_text("No problem reported on this line")
+                        .clicked()
+                    {
+                        self.context_action = Some(ContextAction::ShowProblem);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_problem, egui::Button::new("Copy Problem"))
+                        .on_disabled_hover_text("No problem reported on this line")
+                        .clicked()
+                    {
+                        self.context_action = Some(ContextAction::CopyProblem);
+                        ui.close();
+                    }
+                    ui.separator();
                     let has_selection = !self.selection.is_empty();
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Cut"))
@@ -960,6 +989,10 @@ pub enum ContextAction {
     GoToDefinition,
     FindUses,
     Paste,
+    /// Open the Problems panel on the problem at the caret.
+    ShowProblem,
+    /// Put the problem at the caret, in full, on the clipboard.
+    CopyProblem,
 }
 
 /// How long to keep drawing frames after the view last moved.

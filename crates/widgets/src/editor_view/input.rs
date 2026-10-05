@@ -4,7 +4,8 @@
 use super::*;
 
 impl EditorView {
-    /// Note where the pointer is resting over the text.
+    /// Note where the pointer is resting over the text, or over a line's
+    /// diagnostic marker in the gutter.
     ///
     /// Only records; [`Self::hovered`] decides when it has rested long enough.
     /// Moving to a different character restarts the clock, so dragging across a
@@ -20,8 +21,8 @@ impl EditorView {
         text_left: f32,
         row_height: f32,
     ) {
-        // A pointer that is dragging, or over the gutter, is not asking about
-        // anything. Nor is one over a different widget.
+        // A pointer that is dragging is not asking about anything. Nor is one
+        // over a different widget.
         let Some(pos) = response.hover_pos() else {
             self.resting = None;
             return;
@@ -29,19 +30,34 @@ impl EditorView {
         // Nor is one over the sticky header: the offset under it belongs to a
         // line the reader cannot see, so a popup about it would be about the
         // wrong symbol entirely.
-        if response.dragged() || pos.x < text_left || self.sticky_at(pos).is_some() {
+        if response.dragged() || self.sticky_at(pos).is_some() {
             self.resting = None;
             return;
         }
 
-        let offset = self.offset_at_pos(ui, doc, font, pos, rect, text_left, row_height);
+        // The gutter asks only about a line's diagnostic marker, and its line
+        // number beside it: the marker is a few pixels wide, and the number is
+        // where the eye goes looking for "which line is this".
+        let (offset, gutter) = if pos.x < text_left {
+            let line = self.line_at_pos(pos.y, rect, row_height);
+            let on_marker = matches!(self.zone_at(pos.x, rect), Zone::Breakpoints | Zone::Numbers);
+            if !on_marker || line >= doc.line_count() || !self.line_has_problem(doc, line) {
+                self.resting = None;
+                return;
+            }
+            (doc.line_start(line), true)
+        } else {
+            let offset = self.offset_at_pos(ui, doc, font, pos, rect, text_left, row_height);
+            (offset, false)
+        };
         match self.resting {
-            Some(resting) if resting.offset == offset => {}
+            Some(resting) if resting.offset == offset && resting.gutter == gutter => {}
             _ => {
                 self.resting = Some(Resting {
                     offset,
                     at: pos,
                     since: std::time::Instant::now(),
+                    gutter,
                 });
             }
         }
@@ -66,7 +82,20 @@ impl EditorView {
         (resting.since.elapsed() >= HOVER_DELAY).then_some(Hovered {
             offset: resting.offset,
             at: resting.at,
+            gutter: resting.gutter,
         })
+    }
+
+    /// Whether any diagnostic touches `line`, underlined or not.
+    ///
+    /// The same test the gutter glyph is drawn by, so the hover and the menu
+    /// offer a problem exactly where the marker says there is one.
+    pub(super) fn line_has_problem(&self, doc: &Document, line: usize) -> bool {
+        let line_start = doc.line_start(line);
+        let line_end = line_start + doc.line_len(line);
+        self.diagnostics
+            .iter()
+            .any(|d| d.range.start <= line_end && d.range.end >= line_start)
     }
 
     #[allow(clippy::too_many_arguments)]

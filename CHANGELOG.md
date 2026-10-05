@@ -8,6 +8,24 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Added
+
+- **Hovering a problem says what it is.** The hover box over an underline now
+  leads with the problem itself: its severity, rule, the server that reported
+  it, and the whole message. Until now it showed only the type, and the reason
+  for the red line had to be hunted for in the Problems panel. Hovering the
+  gutter marker or the line number lists every problem on that line.
+
+- **Right-click a problem to find it or copy it.** **Show in Problems** opens
+  the panel scrolled to that entry and highlighted; **Copy Problem** puts its
+  location, rule and full message on the clipboard.
+
+### Fixed
+
+- **Warnings that are not underlined are still marked in the gutter.** With
+  underlining set to errors only, warnings lost their gutter marker as well,
+  although the setting promises they stay there.
+
 ## [1.1.0] - 2026-09-26
 
 ### Added

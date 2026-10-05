@@ -339,7 +339,7 @@ impl EditorView {
             // the selection.
             if !self.diagnostics.is_empty() {
                 let line_end = line_start + text.chars().count();
-                for diagnostic in &self.diagnostics {
+                for diagnostic in self.diagnostics.iter().filter(|d| d.underlined) {
                     if diagnostic.range.end < line_start || diagnostic.range.start > line_end {
                         continue;
                     }

@@ -300,6 +300,17 @@ one of them is noisier than it is helpful on a particular project.
 **Hover** the pointer over a name and hold it still: a moment later a box
 appears with the type, the signature and the documentation.
 
+Hovering an underlined problem shows it at the top of that box, in full: how
+serious it is, the rule (`reportArgumentType`, `F401`), which server reported
+it, and the whole message, including the lines after the first that usually
+explain it. Hover the marker in the gutter, or the line number beside it, to
+see every problem on that line, including warnings that are not underlined.
+
+**Right-click** on a problem for **Show in Problems**, which opens the Problems
+panel scrolled to it and highlighted, and **Copy Problem**, which puts the file,
+line, rule and whole message on the clipboard. Both work from anywhere on the
+line, including a right-click in the gutter.
+
 With no server running it still answers, from the file you are looking at — the
 line the name was declared on, and its docstring or doc comment — and says that
 is what it is doing. It cannot tell you a type, or anything about a name from
