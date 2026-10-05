@@ -40,6 +40,10 @@ font_size = 14.0
 # whatever the monitor reports; raise it to make everything larger.
 ui_scale = 1.0
 show_file_tree = true
+# Single-clicking a file in the explorer opens it in a reusable preview tab,
+# shown in italics, that the next single-clicked file replaces until you edit
+# it or double-click it. Off, every file opened gets a tab of its own.
+preview_tabs = false
 restore_session = true
 
 [editor]
@@ -103,6 +107,9 @@ mod defaults {
     pub(super) const UI_FONT_SIZE: f32 = 14.0;
     pub(super) const UI_SCALE: f32 = 1.0;
     pub(super) const SHOW_FILE_TREE: bool = true;
+    /// Off: a file that vanishes when the next one is clicked looks like a
+    /// file that failed to stay open, to anyone who has not met the idea.
+    pub(super) const PREVIEW_TABS: bool = false;
     pub(super) const RESTORE_SESSION: bool = true;
     pub(super) const FONT_SIZE: f32 = 13.0;
     pub(super) const TAB_WIDTH: usize = 4;
@@ -431,6 +438,18 @@ impl Settings {
 
     pub fn set_show_file_tree(&mut self, show: bool) {
         self.set("ui", "show_file_tree", value(show));
+    }
+
+    /// Whether a single click in the explorer opens a reusable preview tab
+    /// rather than a tab of its own.
+    #[must_use]
+    pub fn preview_tabs(&self) -> bool {
+        self.bool_at("ui", "preview_tabs")
+            .unwrap_or(defaults::PREVIEW_TABS)
+    }
+
+    pub fn set_preview_tabs(&mut self, on: bool) {
+        self.set("ui", "preview_tabs", value(on));
     }
 
     #[must_use]
@@ -805,6 +824,18 @@ whatever = true
         let mut s = from_toml("ui = 3\n");
         s.set_theme(ThemePreference::Light);
         assert_eq!(s.theme(), ThemePreference::Light);
+    }
+
+    #[test]
+    fn preview_tabs_are_off_by_default_and_can_be_turned_on() {
+        let mut settings = Settings::default();
+        assert!(!settings.preview_tabs());
+        settings.set_preview_tabs(true);
+        assert!(settings.preview_tabs());
+        assert!(
+            from_toml(&settings.to_toml()).preview_tabs(),
+            "survives a write"
+        );
     }
 
     #[test]

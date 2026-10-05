@@ -25,6 +25,11 @@ the-editor .
 A folder on the command line is opened as the project; files are opened in
 tabs. `the-editor --help` prints the options.
 
+Every file opened gets a tab of its own. If you would rather browse, turn on
+**Settings > Preview tabs**: a single click in the explorer then opens a file
+in one reusable tab, shown in italics, which the next single-clicked file
+replaces. Editing the file or double-clicking it keeps it open.
+
 **Find a file** with `Ctrl+P` and type any part of its name. The match is
 fuzzy, so `mpy` finds `main.py`.
 

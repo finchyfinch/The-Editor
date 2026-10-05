@@ -22,6 +22,14 @@ Entries are written as each milestone lands, not retroactively at release time.
   the panel scrolled to that entry and highlighted; **Copy Problem** puts its
   location, rule and full message on the clipboard.
 
+### Changed
+
+- **A file opened from the explorer stays open.** A single click opened the
+  file in a preview tab that the next click replaced, so opening several
+  files meant editing each one before clicking the next. Every file now gets
+  its own tab. The preview behaviour is still there, off by default, as
+  **Settings > Preview tabs**.
+
 ### Fixed
 
 - **Warnings that are not underlined are still marked in the gutter.** With

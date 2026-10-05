@@ -88,7 +88,9 @@ impl EditorApp {
         match action {
             Action::None => {}
             Action::Open(path) => self.open_path(&path, false),
-            Action::Preview(path) => self.open_path(&path, true),
+            // A single click. Whether that means "just looking" is a setting:
+            // off, it opens a tab like any other.
+            Action::Preview(path) => self.open_path(&path, self.settings.preview_tabs()),
             Action::Refresh => self.tree.refresh(),
 
             Action::NewFileIn(directory) => self.new_file.open(directory),

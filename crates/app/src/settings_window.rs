@@ -356,6 +356,22 @@ fn appearance(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
 
     changed |= row(
         ui,
+        "Preview tabs",
+        "Single-clicking a file opens it in a reusable tab, in italics, that \
+         the next single-clicked file replaces until you edit it or \
+         double-click it. Off, every file you open gets a tab of its own.",
+        |ui| {
+            let mut preview = settings.preview_tabs();
+            if ui.checkbox(&mut preview, "").changed() {
+                settings.set_preview_tabs(preview);
+                return true;
+            }
+            false
+        },
+    );
+
+    changed |= row(
+        ui,
         "Restore session on start",
         "Reopen the folder, tabs and window position from last time.",
         |ui| {
