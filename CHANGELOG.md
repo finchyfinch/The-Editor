@@ -8,6 +8,8 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-05
+
 ### Added
 
 - **Hovering a problem says what it is.** The hover box over an underline now
@@ -1023,7 +1025,8 @@ Entries are written as each milestone lands, not retroactively at release time.
 - Rendering spike (`cargo spike`) validating virtualised painting of a
   `ropey::Rope` with a working caret, and measuring paint and edit cost.
 
-[Unreleased]: https://github.com/finchyfinch/The-Editor/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/finchyfinch/The-Editor/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/finchyfinch/The-Editor/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/finchyfinch/The-Editor/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/finchyfinch/The-Editor/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/finchyfinch/The-Editor/releases/tag/v1.0.0
