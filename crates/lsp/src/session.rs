@@ -250,6 +250,9 @@ pub struct Lsp {
     /// Server ids the user has switched off. Checked before starting one, so a
     /// disabled server is never spawned rather than started and ignored.
     disabled: Vec<String>,
+    /// The type-checking mode Python servers are asked for, or `None` for
+    /// [`crate::server::DEFAULT_TYPE_CHECKING`].
+    type_checking: Option<&'static str>,
     /// Threads waiting for stopped servers to exit, joined when this is
     /// dropped so that none outlives the editor.
     stopping: Vec<std::thread::JoinHandle<()>>,
@@ -295,6 +298,18 @@ impl Lsp {
         let paths: Vec<PathBuf> = self.documents.keys().cloned().collect();
         for path in paths {
             self.attach(&path);
+        }
+    }
+
+    /// Set how strictly pyright checks types: "off", "basic", "standard" or
+    /// "strict". Running servers are told at once and re-check open files.
+    pub fn set_type_checking(&mut self, mode: &'static str) {
+        if self.type_checking == Some(mode) {
+            return;
+        }
+        self.type_checking = Some(mode);
+        for server in self.servers.values_mut() {
+            server.set_type_checking(mode);
         }
     }
 
@@ -736,7 +751,10 @@ impl Lsp {
                 continue;
             };
             match Server::start(spec, found.program, &root) {
-                Ok(server) => {
+                Ok(mut server) => {
+                    if let Some(mode) = self.type_checking {
+                        server.set_type_checking(mode);
+                    }
                     tracing::info!(server = spec.id, "started");
                     self.servers.insert(spec.id, server);
                 }

@@ -1099,7 +1099,7 @@ impl eframe::App for EditorApp {
         self.sync_highlighters(&ctx);
         self.sync_completion();
         self.sync_problem_at_caret();
-        self.sync_hover();
+        self.sync_hover(&ctx);
         // Before the menu bar, toolbar and editor read this frame's events:
         // whoever looks first gets the key.
         self.completion_keys(&ctx);

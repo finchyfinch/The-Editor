@@ -19,6 +19,7 @@
 use editor_config::settings::DocstringStyle;
 use editor_config::settings::Renderer;
 use editor_config::settings::Settings;
+use editor_config::settings::TypeChecking;
 use editor_config::settings::UnderlineDiagnostics;
 use editor_config::theme::ThemePreference;
 use eframe::egui;
@@ -227,6 +228,35 @@ impl SettingsWindow {
                 settings.set_server_enabled(spec.id, enabled);
                 action = Action::Changed;
             }
+        }
+        ui.add_space(8.0);
+        if row(
+            ui,
+            "Python type checking",
+            "How strictly Pyright checks types. Off, it still provides hover, \
+             completion and Go to Definition, and Ruff still reports undefined \
+             names and unused imports. The stricter modes suit code with type hints \
+             throughout; elsewhere most of what they report is a gap in a \
+             library's stubs rather than a bug. A project's own pyrightconfig.json \
+             or [tool.pyright] takes precedence.",
+            |ui| {
+                let mut mode = settings.type_checking();
+                let before = mode;
+                egui::ComboBox::from_id_salt("type_checking")
+                    .selected_text(mode.label())
+                    .show_ui(ui, |ui| {
+                        for option in TypeChecking::ALL {
+                            ui.selectable_value(&mut mode, option, option.label());
+                        }
+                    });
+                if mode != before {
+                    settings.set_type_checking(mode);
+                    return true;
+                }
+                false
+            },
+        ) {
+            action = Action::Changed;
         }
         ui.add_space(8.0);
 
@@ -449,7 +479,8 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
     changed |= row(
         ui,
         "Follow .editorconfig",
-        "A project's own file overrides the indent and save settings here for          the files it covers.",
+        "A project's own file overrides the indent and save settings here for \
+         the files it covers.",
         |ui| {
             let mut use_it = settings.use_editorconfig();
             if ui.checkbox(&mut use_it, "").changed() {
@@ -466,7 +497,8 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
     changed |= row(
         ui,
         "Trim trailing whitespace",
-        "Invisible, meaningless, and noise in every later diff. Lands in the          undo history, so it can be taken back.",
+        "Invisible, meaningless, and noise in every later diff. Lands in the \
+         undo history, so it can be taken back.",
         |ui| {
             let mut trim = settings.trim_trailing_whitespace();
             if ui.checkbox(&mut trim, "").changed() {
@@ -497,7 +529,9 @@ fn editor(ui: &mut egui::Ui, settings: &mut Settings) -> Action {
     changed |= row(
         ui,
         "Underline in the text",
-        "The gutter marks and the Problems panel always show everything. A type          checker that cannot resolve a project's imports will report most of its          lines, which makes a file unreadable when all of them are underlined.",
+        "The gutter marks and the Problems panel always show everything. A type \
+         checker that cannot resolve a project's imports will report most of its \
+         lines, which makes a file unreadable when all of them are underlined.",
         |ui| {
             let mut level = settings.underline_diagnostics();
             let before = level;

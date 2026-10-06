@@ -111,6 +111,10 @@ fn dark() -> egui::Visuals {
     v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0x44, 0x44, 0x4c);
     v.widgets.inactive.bg_fill = Color32::from_rgb(0x2c, 0x2c, 0x33);
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x26, 0x26, 0x2c);
+    // egui draws an idle control with no outline, so an unticked checkbox was
+    // a box a shade lighter than the window behind it and next to invisible.
+    // See `idle_controls_are_outlined_at_3_to_1`.
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x78, 0x78, 0x82));
     v.widgets.hovered.bg_fill = Color32::from_rgb(0x39, 0x39, 0x42);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x33, 0x33, 0x3b);
     v.widgets.active.bg_fill = Color32::from_rgb(0x44, 0x44, 0x50);
@@ -135,6 +139,7 @@ fn light() -> egui::Visuals {
     v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0xc0, 0xc0, 0xc8);
     v.widgets.inactive.bg_fill = Color32::from_rgb(0xe4, 0xe4, 0xe9);
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xec, 0xec, 0xf0);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x84, 0x84, 0x8e));
     v.widgets.hovered.bg_fill = Color32::from_rgb(0xd8, 0xd8, 0xde);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xe0, 0xe0, 0xe6);
     v.widgets.active.bg_fill = Color32::from_rgb(0xc8, 0xc8, 0xd0);
@@ -230,6 +235,28 @@ mod tests {
                 ratio >= 1.5,
                 "{theme:?}: panel separators at {ratio:.2}:1 disappear into the panel"
             );
+        }
+    }
+
+    /// An idle checkbox is its outline and nothing else, so the outline is
+    /// held to WCAG's 3:1 for user-interface components against everything a
+    /// control is drawn on: the window, the panels, and its own fill.
+    #[test]
+    fn idle_controls_are_outlined_at_3_to_1() {
+        for theme in [ResolvedTheme::Dark, ResolvedTheme::Light] {
+            let v = visuals(theme);
+            let outline = v.widgets.inactive.bg_stroke;
+            assert!(
+                outline.width >= 1.0,
+                "{theme:?}: idle controls have no outline"
+            );
+            for (name, bg) in [("window", v.window_fill), ("panel", v.panel_fill)] {
+                let ratio = contrast_ratio(outline.color, bg);
+                assert!(
+                    ratio >= 3.0,
+                    "{theme:?}: control outline on {name} is {ratio:.2}:1, below 3:1"
+                );
+            }
         }
     }
 

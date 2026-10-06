@@ -68,20 +68,29 @@ pub enum Event {
 
 /// What The Editor asks a Python server to do.
 ///
-/// basedpyright's own default is its "recommended" mode, which turns on rules
-/// pyright leaves off — import-cycle reporting among them — and treats a great
-/// deal as an error. On a real project using libraries whose stubs do not
-/// describe them fully, that produces hundreds of findings that are true of the
-/// stubs and false of the code, and a Problems panel nobody reads is worth less
-/// than none.
+/// `type_checking` is pyright's `typeCheckingMode`: "off", "basic",
+/// "standard" or "strict". It is the user's choice, and "off" is the default,
+/// which is also Pylance's. Pyright is a type checker, and on code that was
+/// not written with types in mind most of what it reports is true of the
+/// stubs and false of the code: a GUI toolkit whose stubs say `Size` where the
+/// library takes a tuple, an attribute set to `None` in `__init__` and filled
+/// in later, names a `setattr` loop creates. Measured on a 28,000-line
+/// wxPython project, "basic" and "standard" each reported around 480 errors,
+/// and none sampled was a bug. Off, the server still answers hover,
+/// completion and Go to Definition, which is what it is here for, and Ruff
+/// still reports undefined names and the like.
 ///
-/// `standard` is pyright's own default and the level its documentation
-/// describes. `openFilesOnly` keeps a server from reporting on files the user
-/// has not opened.
-fn configuration_for(section: &str) -> Value {
+/// basedpyright's own default, "recommended", is stricter still -- import
+/// cycles among much else -- which is why the mode is always sent rather than
+/// left to the server. A project's own `pyrightconfig.json` or
+/// `[tool.pyright]` overrides all of this, as pyright documents.
+///
+/// `openFilesOnly` keeps a server from reporting on files the user has not
+/// opened.
+fn configuration_for(section: &str, type_checking: &str) -> Value {
     // Servers ask for a dotted section and expect just that subtree back.
     let analysis = json!({
-        "typeCheckingMode": "standard",
+        "typeCheckingMode": type_checking,
         "diagnosticMode": "openFilesOnly",
         "diagnosticSeverityOverrides": {
             "reportImportCycles": "none",
@@ -93,6 +102,9 @@ fn configuration_for(section: &str) -> Value {
         _ => Value::Null,
     }
 }
+
+/// The type-checking mode a server is asked for until told otherwise.
+pub const DEFAULT_TYPE_CHECKING: &str = "off";
 
 /// Whether a capabilities object advertises a capability.
 ///
@@ -131,6 +143,9 @@ pub struct Server {
     /// asking it where something is defined gets an error at best. Only the
     /// server itself knows.
     capabilities: Value,
+    /// What `workspace/configuration` answers for pyright's
+    /// `typeCheckingMode`; see `configuration_for`.
+    type_checking: &'static str,
 }
 
 impl std::fmt::Debug for Server {
@@ -164,6 +179,7 @@ impl Server {
             retry_at: None,
             ready: false,
             capabilities: Value::Null,
+            type_checking: DEFAULT_TYPE_CHECKING,
         };
         server.spawn()?;
         Ok(server)
@@ -295,7 +311,9 @@ impl Server {
                     .map(|item| {
                         item.get("section")
                             .and_then(Value::as_str)
-                            .map_or(Value::Null, configuration_for)
+                            .map_or(Value::Null, |section| {
+                                configuration_for(section, self.type_checking)
+                            })
                     })
                     .collect(),
             )
@@ -308,6 +326,28 @@ impl Server {
             "id": id,
             "result": result,
         }));
+    }
+
+    /// Change the type-checking mode, and tell the server so it asks again.
+    ///
+    /// `didChangeConfiguration` with no settings in it is how a pull-model
+    /// server like pyright is told to send `workspace/configuration` again; it
+    /// then re-checks every open file under the new mode. A server that never
+    /// asks for configuration ignores it.
+    pub fn set_type_checking(&mut self, mode: &'static str) {
+        if self.type_checking == mode {
+            return;
+        }
+        self.type_checking = mode;
+        // Before the handshake there is nothing to tell: the server asks for
+        // its configuration once it is initialised, and gets the new mode then.
+        if !self.ready {
+            return;
+        }
+        let _ = self.notify(
+            "workspace/didChangeConfiguration",
+            json!({ "settings": null }),
+        );
     }
 
     /// Send a notification, which expects no reply.
@@ -944,10 +984,11 @@ mod tests {
 
     /// basedpyright's own default is its strictest mode, which on a project
     /// using libraries whose stubs are incomplete reports hundreds of findings
-    /// that are true of the stubs and false of the code.
+    /// that are true of the stubs and false of the code. The mode is always
+    /// sent, so the server's own default never applies.
     #[test]
-    fn python_servers_are_asked_for_the_standard_type_checking_mode() {
-        let analysis = configuration_for("python.analysis");
+    fn python_servers_are_asked_for_the_chosen_type_checking_mode() {
+        let analysis = configuration_for("python.analysis", "standard");
         assert_eq!(analysis["typeCheckingMode"], "standard");
         assert_eq!(analysis["diagnosticMode"], "openFilesOnly");
         assert_eq!(
@@ -957,8 +998,8 @@ mod tests {
 
         // Asked for by the parent section, the same settings arrive nested.
         assert_eq!(
-            configuration_for("basedpyright")["analysis"]["typeCheckingMode"],
-            "standard"
+            configuration_for("basedpyright", DEFAULT_TYPE_CHECKING)["analysis"]["typeCheckingMode"],
+            "off"
         );
     }
 
@@ -966,7 +1007,7 @@ mod tests {
     fn a_section_we_have_nothing_to_say_about_is_answered_with_null() {
         // The protocol requires one entry per requested item; skipping one
         // shifts every later answer onto the wrong section.
-        assert_eq!(configuration_for("editor.wibble"), Value::Null);
+        assert_eq!(configuration_for("editor.wibble", "off"), Value::Null);
     }
 
     #[test]

@@ -92,6 +92,13 @@ interpreter = \"\"
 # type, and anything the body raises. \"google\", \"numpy\", \"sphinx\", or
 # \"off\" to leave the quotes alone.
 docstrings = \"google\"
+# How strictly Pyright checks types: \"off\" (default), \"basic\", \"standard\"
+# or \"strict\". Off, it still provides hover, completion and Go to Definition,
+# and Ruff still reports undefined names, unused imports and the like. The
+# stricter modes suit code written with type hints throughout; on code that
+# is not, most of what they report is a gap in a library's stubs rather than a
+# bug. A project's own pyrightconfig.json or [tool.pyright] takes precedence.
+type_checking = \"off\"
 
 [lsp]
 # Language servers to leave alone, by id: \"ruff\", \"pyright\", \"pylsp\",
@@ -210,6 +217,51 @@ impl DocstringStyle {
             Self::Google => "Google",
             Self::Numpy => "NumPy",
             Self::Sphinx => "Sphinx (reST)",
+        }
+    }
+}
+
+/// How strictly Pyright checks types, as its `typeCheckingMode`.
+///
+/// Off by default, as in Pylance. Pyright's findings are statements about
+/// types, and in code written without type hints they are mostly about the
+/// stubs: a wxPython project of 28,000 lines drew around 480 errors at both
+/// "basic" and "standard", none of them a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypeChecking {
+    #[default]
+    Off,
+    Basic,
+    Standard,
+    Strict,
+}
+
+impl TypeChecking {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Basic, Self::Standard, Self::Strict];
+
+    /// The name pyright and the settings file both use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Basic => "basic",
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == name)
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Basic => "Basic",
+            Self::Standard => "Standard",
+            Self::Strict => "Strict",
         }
     }
 }
@@ -604,6 +656,19 @@ impl Settings {
         self.set("python", "docstrings", value(name));
     }
 
+    /// How strictly Pyright checks types. An unrecognised name reads as the
+    /// default.
+    #[must_use]
+    pub fn type_checking(&self) -> TypeChecking {
+        self.str_at("python", "type_checking")
+            .and_then(TypeChecking::parse)
+            .unwrap_or_default()
+    }
+
+    pub fn set_type_checking(&mut self, mode: TypeChecking) {
+        self.set("python", "type_checking", value(mode.as_str()));
+    }
+
     /// Server ids the user has switched off.
     #[must_use]
     pub fn disabled_servers(&self) -> Vec<String> {
@@ -895,6 +960,18 @@ whatever = true
     fn an_unrecognised_docstring_style_falls_back_rather_than_off() {
         let settings = from_toml("[python]\ndocstrings = \"gooogle\"\n");
         assert_eq!(settings.docstrings(), Some(DocstringStyle::Google));
+    }
+
+    #[test]
+    fn type_checking_defaults_to_off_and_round_trips() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.type_checking(), TypeChecking::Off);
+        for mode in TypeChecking::ALL {
+            settings.set_type_checking(mode);
+            assert_eq!(settings.type_checking(), mode);
+        }
+        settings.set("python", "type_checking", value("pedantic"));
+        assert_eq!(settings.type_checking(), TypeChecking::Off);
     }
 
     #[test]

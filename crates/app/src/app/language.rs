@@ -111,7 +111,7 @@ impl EditorApp {
                                     diagnostic.line + 1,
                                     diagnostic.column + 1
                                 ));
-                                ui.add(
+                                let summary = ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(diagnostic.summary()).background_color(
                                             if at_caret {
@@ -123,7 +123,9 @@ impl EditorApp {
                                     )
                                     .sense(egui::Sense::click())
                                     .truncate(),
-                                )
+                                );
+                                selection_margin(ui);
+                                summary
                             })
                             .inner;
 
@@ -627,9 +629,12 @@ impl EditorApp {
     /// A server is asked when one can answer; the parse tree answers meanwhile
     /// and answers alone when there is no server. The degradation ladder in
     /// PLAN.md §3.6: everything that can work without a server should.
-    pub(super) fn sync_hover(&mut self) {
-        // A popup while a menu or a dialog is open is a popup in the way.
-        if self.palette.is_open() || self.completion.is_open() {
+    pub(super) fn sync_hover(&mut self, ctx: &egui::Context) {
+        // A popup while a menu or a dialog is open is a popup in the way. A
+        // context menu most of all: the hover popup is drawn at tooltip level,
+        // above menus, so a right-click on a squiggle opened the menu
+        // underneath the problem it was asking about.
+        if self.palette.is_open() || self.completion.is_open() || egui::Popup::is_any_open(ctx) {
             self.hover = None;
             return;
         }
@@ -715,6 +720,12 @@ impl EditorApp {
 
     /// Draw whatever is known about what the pointer is on.
     pub(super) fn hover_draw(&mut self, ctx: &egui::Context) {
+        // Checked again here because the menu a right-click opens appears in
+        // the frame it is clicked in, after `sync_hover` has run.
+        if egui::Popup::is_any_open(ctx) {
+            self.hover = None;
+            return;
+        }
         let Some(hover) = self.hover.clone() else {
             return;
         };
@@ -874,7 +885,8 @@ impl EditorApp {
                 }
             }
             self.info(format!(
-                "No {} of `{}` found (no language server, so this is a search of the                  project's text rather than an answer about the code)",
+                "No {} of `{}` found (no language server, so this is a search of the \
+                 project's text rather than an answer about the code)",
                 query.noun(),
                 symbol.name
             ));
@@ -1101,6 +1113,8 @@ impl EditorApp {
             disabled.push(editor_lsp::registry::RUST_ANALYZER.id.to_owned());
         }
         self.lsp.set_disabled(disabled);
+        self.lsp
+            .set_type_checking(self.settings.type_checking().as_str());
         self.lsp
             .set_root(self.tree.root().map(Path::to_path_buf), extra_path);
 
@@ -1331,6 +1345,37 @@ impl EditorApp {
             format!("Checking syntax, plus: {}", running.join(", "))
         }
     }
+}
+
+/// The rest of a Problems row after its text, as somewhere to start a text
+/// selection.
+///
+/// Pressing on a problem goes to it, so a selection begun there would jump the
+/// editor away before anything could be copied. Pressing here instead starts
+/// a selection that can be dragged across the rows above and below, as from
+/// the end of a line in a text editor, and copied with Ctrl+C. It takes part
+/// in egui's label selection as an empty label the width of the space left.
+fn selection_margin(ui: &mut egui::Ui) {
+    let width = ui.available_width();
+    if !width.is_finite() || width <= 0.0 {
+        return;
+    }
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Sense::click_and_drag(),
+    );
+    let colour = ui.visuals().text_color();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(String::new(), egui::FontId::default(), colour);
+    egui::text_selection::LabelSelectionState::label_text_selection(
+        ui,
+        &response,
+        rect.left_top(),
+        galley,
+        colour,
+        egui::Stroke::NONE,
+    );
 }
 
 /// One diagnostic in the hover popup: what kind, which rule, who said so, and

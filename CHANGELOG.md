@@ -8,6 +8,33 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Added
+
+- **Select and copy text in the Problems panel.** Press in the space to the
+  right of a problem and drag to select across rows, then Ctrl+C. Clicking
+  the problem itself still goes to it.
+
+- **Python type checking level.** Settings > Python > Python type checking
+  sets how strictly Pyright checks: Off, Basic, Standard or Strict. A project's
+  own `pyrightconfig.json` or `[tool.pyright]` still takes precedence.
+
+### Changed
+
+- **Pyright no longer type-checks by default.** At "standard" it reported
+  hundreds of errors on working code that has no type hints. Nearly all of
+  them were gaps in a library's stubs, or an attribute set to `None` in
+  `__init__` and filled in later. Pyright still provides hover, completion and
+  Go to Definition, and Ruff still reports undefined names and unused imports.
+  The stricter levels are in Settings for code that uses type hints.
+
+### Fixed
+
+- **Unticked checkboxes are visible in the dark theme.** Idle controls now
+  have an outline at 3:1 contrast in both themes.
+- **A right-click on an underlined problem shows its menu.** The hover box
+  was drawn on top of the context menu. It now closes while a menu is open.
+- Several Settings hints had runs of spaces in the middle of a sentence.
+
 ## [1.2.0] - 2026-10-05
 
 ### Added
