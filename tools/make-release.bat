@@ -112,6 +112,10 @@ powershell -NoProfile -Command ^
     "(Get-FileHash 'dist\%NAME%.zip' -Algorithm SHA256).Hash.ToLower() + '  %NAME%.zip'" ^
     > "dist\%NAME%.zip.sha256"
 
+rem The zip is made, so the staging folder and target\release are now only
+rem ever needed again by the next release build. See tools\tidy-build.ps1.
+powershell -NoProfile -ExecutionPolicy Bypass -File "tools\tidy-build.ps1" -Release
+
 echo.
 echo Done.
 for %%f in ("dist\%NAME%.zip") do echo   dist\%NAME%.zip  (%%~zf bytes)

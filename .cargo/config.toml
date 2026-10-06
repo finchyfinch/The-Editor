@@ -11,8 +11,10 @@ editor = ["run", "--package", "the-editor"]
 # compilation flag -- a profile setting, a feature, a new dependency --
 # produces artefacts under a fresh hash and leaves the old ones there for
 # good. Over this project that reached 13.8 GB, about 5 GB of which was dead.
-# There is no built-in sweep, so run `cargo clean` every so often; a full
-# rebuild costs about 100 seconds and the folder settles back to ~4 GB.
+# There is no built-in sweep, so tools\tidy-build.ps1 does it: the pre-push
+# hook and tools\make-release.bat both run it, and it cleans target\debug once
+# it passes 8 GB. A full rebuild costs about 100 seconds and the folder
+# settles back to ~4 GB.
 
 # Link the C runtime statically on Windows.
 #
