@@ -8,6 +8,8 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-25
+
 ### Added
 
 - **Select and copy text in the Problems panel.** Press in the space to the
@@ -26,6 +28,11 @@ Entries are written as each milestone lands, not retroactively at release time.
   `__init__` and filled in later. Pyright still provides hover, completion and
   Go to Definition, and Ruff still reports undefined names and unused imports.
   The stricter levels are in Settings for code that uses type hints.
+
+- **Opening another folder closes the open tabs.** A tab left over from the
+  previous folder looked just like one from the new folder, so it was easy to
+  edit the wrong file. Any unsaved changes get the usual Save / Don't Save /
+  Cancel prompt, and Cancel keeps the old folder open.
 
 ### Fixed
 
@@ -1060,7 +1067,8 @@ Entries are written as each milestone lands, not retroactively at release time.
 - Rendering spike (`cargo spike`) validating virtualised painting of a
   `ropey::Rope` with a working caret, and measuring paint and edit cost.
 
-[Unreleased]: https://github.com/finchyfinch/The-Editor/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/finchyfinch/The-Editor/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/finchyfinch/The-Editor/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/finchyfinch/The-Editor/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/finchyfinch/The-Editor/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/finchyfinch/The-Editor/compare/v1.0.0...v1.0.1
