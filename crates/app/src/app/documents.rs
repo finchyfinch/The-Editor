@@ -107,20 +107,20 @@ impl EditorApp {
     }
 
     /// Which documents a pending action would discard.
-    pub(super) fn at_risk(&self, pending: Pending) -> Vec<usize> {
+    pub(super) fn at_risk(&self, pending: &Pending) -> Vec<usize> {
         match pending {
             Pending::CloseTab(i) => self
                 .docs
-                .get(i)
+                .get(*i)
                 .filter(|d| d.doc.is_dirty())
-                .map(|_| vec![i])
+                .map(|_| vec![*i])
                 .unwrap_or_default(),
             Pending::CloseOthers(keep) => self
                 .dirty_indices()
                 .into_iter()
-                .filter(|i| *i != keep)
+                .filter(|i| i != keep)
                 .collect(),
-            Pending::CloseAll | Pending::Quit => self.dirty_indices(),
+            Pending::CloseAll | Pending::OpenFolder(_) | Pending::Quit => self.dirty_indices(),
         }
     }
 
@@ -167,6 +167,11 @@ impl EditorApp {
                 self.docs.clear();
                 self.active = None;
             }
+            Pending::OpenFolder(folder) => {
+                self.docs.clear();
+                self.active = None;
+                self.open_folder(folder);
+            }
             Pending::Quit => {
                 self.confirm_quit();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -196,10 +201,10 @@ impl EditorApp {
     /// Deliberately not a plain "are you sure": the third option has to be
     /// *save*, or the only way out of the dialog is to lose the work.
     pub(super) fn unsaved_prompt(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending else {
+        let Some(pending) = self.pending.clone() else {
             return;
         };
-        let at_risk = self.at_risk(pending);
+        let at_risk = self.at_risk(&pending);
 
         // Nothing actually unsaved — proceed without bothering the user.
         if at_risk.is_empty() {

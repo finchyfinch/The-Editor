@@ -4,6 +4,19 @@
 use super::*;
 
 impl EditorApp {
+    /// Switch to a folder the user picked, closing every open tab first.
+    ///
+    /// A tab left open from the old folder looks just like one from the new
+    /// one, and it is too easy to go on editing it believing it is the file
+    /// of the same name over here. So the tabs go, through the usual prompt
+    /// for any unsaved changes; cancelling that keeps the old folder too.
+    pub(super) fn switch_folder(&mut self, folder: PathBuf) {
+        if self.tree.root() == Some(folder.as_path()) {
+            return;
+        }
+        self.pending = Some(Pending::OpenFolder(folder));
+    }
+
     /// Open a project folder and start watching it.
     pub(super) fn open_folder(&mut self, folder: PathBuf) {
         tracing::info!(path = %folder.display(), "opening folder");

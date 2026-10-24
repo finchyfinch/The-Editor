@@ -127,11 +127,13 @@ enum Decision {
 }
 
 /// An action that would discard unsaved work, held until the user answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     CloseTab(usize),
     CloseOthers(usize),
     CloseAll,
+    /// Switch to another folder, closing every tab first.
+    OpenFolder(PathBuf),
     Quit,
 }
 
@@ -712,7 +714,7 @@ impl EditorApp {
             }
             CommandId::OpenFolder => {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.open_folder(dir);
+                    self.switch_folder(dir);
                 }
             }
             CommandId::Save => self.save_active(false),
