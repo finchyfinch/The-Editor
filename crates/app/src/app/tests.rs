@@ -703,3 +703,38 @@ fn a_copied_problem_is_located_attributed_and_complete() {
          Argument of type \"int\" cannot be assigned\n  \"int\" is not iterable"
     );
 }
+
+#[test]
+fn dropped_files_open_in_the_order_they_came() {
+    let drop = sort_drop([
+        (PathBuf::from("b.py"), false),
+        (PathBuf::from("a.rs"), false),
+    ]);
+    assert_eq!(drop.files, [PathBuf::from("b.py"), PathBuf::from("a.rs")]);
+    assert_eq!(drop.folder, None);
+    assert!(!drop.folders_skipped);
+}
+
+#[test]
+fn a_folder_dropped_on_its_own_becomes_the_project() {
+    // Several folders and the first wins, as on the command line.
+    let drop = sort_drop([
+        (PathBuf::from("first"), true),
+        (PathBuf::from("second"), true),
+    ]);
+    assert!(drop.files.is_empty());
+    assert_eq!(drop.folder, Some(PathBuf::from("first")));
+}
+
+#[test]
+fn a_folder_dropped_with_files_is_skipped_not_opened() {
+    // Switching project closes every tab, so opening the folder would throw
+    // away the files that came with it.
+    let drop = sort_drop([
+        (PathBuf::from("project"), true),
+        (PathBuf::from("main.py"), false),
+    ]);
+    assert_eq!(drop.files, [PathBuf::from("main.py")]);
+    assert_eq!(drop.folder, None);
+    assert!(drop.folders_skipped);
+}

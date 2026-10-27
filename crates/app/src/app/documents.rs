@@ -678,6 +678,45 @@ impl EditorApp {
         }
     }
 
+    /// Open whatever was dropped onto the window this frame.
+    ///
+    /// Files open in tabs of their own, as Open File would. A folder dropped
+    /// on its own becomes the project, through the same prompt for unsaved
+    /// changes as Open Folder. Dropped alongside files, a folder is left
+    /// alone: switching project closes every tab, which would take the files
+    /// just opened with it.
+    ///
+    /// While a dialog is up the drop is refused rather than opened behind it,
+    /// where it would go unseen, or replace the question being asked.
+    pub(super) fn open_dropped(&mut self, ctx: &egui::Context, modal_open: bool) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if modal_open {
+            self.info("Close the dialog first, then drop the file again");
+            return;
+        }
+        let drop = sort_drop(dropped.into_iter().map(|p| {
+            let is_dir = p.is_dir();
+            (p, is_dir)
+        }));
+        for path in &drop.files {
+            self.open_path(path, false);
+        }
+        if let Some(folder) = drop.folder {
+            self.switch_folder(folder);
+        } else if drop.folders_skipped {
+            self.info("Folders dropped with files are not opened; drop a folder on its own");
+        }
+    }
+
     /// Re-check every open file when the window regains focus.
     ///
     /// The watcher only covers the open project folder, so a file opened from

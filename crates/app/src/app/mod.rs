@@ -1154,6 +1154,7 @@ impl eframe::App for EditorApp {
             || self.new_file.is_open()
             || self.venv_dialog.is_open()
             || self.pending.is_some();
+        self.open_dropped(&ctx, modal_open);
         let mut invoked = if modal_open {
             None
         } else {
@@ -1545,6 +1546,7 @@ impl eframe::App for EditorApp {
         }
         self.settle_mru(&ctx);
         self.toasts_ui(&ctx);
+        self.drop_hint(&ctx);
 
         // A breakpoint asked for by a gutter click or the context menu. Drained
         // here, after the editor has drawn: the view records the request and
@@ -1855,6 +1857,40 @@ fn plain_path(path: PathBuf) -> PathBuf {
     };
     let is_drive = matches!(rest.as_bytes(), [c, b':', b'\\', ..] if c.is_ascii_alphabetic());
     if is_drive { PathBuf::from(rest) } else { path }
+}
+
+/// What a drop onto the window asks to open.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DroppedPaths {
+    /// Files, each for a tab, in the order they were dropped.
+    files: Vec<PathBuf>,
+    /// The folder to make the project. Only ever set when no files came with it.
+    folder: Option<PathBuf>,
+    /// Folders that came with files and so were not opened, which is worth
+    /// saying rather than leaving the user to wonder.
+    folders_skipped: bool,
+}
+
+/// Sort dropped paths, each paired with whether it is a folder, into what to
+/// open. Kept apart from the filesystem so the rules can be tested.
+fn sort_drop(paths: impl IntoIterator<Item = (PathBuf, bool)>) -> DroppedPaths {
+    let mut drop = DroppedPaths::default();
+    let mut folders = Vec::new();
+    for (path, is_dir) in paths {
+        if is_dir {
+            folders.push(path);
+        } else {
+            drop.files.push(path);
+        }
+    }
+    if drop.files.is_empty() {
+        // One explorer pane, so one project: the first folder wins, as it
+        // does on the command line.
+        drop.folder = folders.into_iter().next();
+    } else {
+        drop.folders_skipped = !folders.is_empty();
+    }
+    drop
 }
 
 /// One step of the zoom, rounded back onto the step.

@@ -8,6 +8,13 @@ Entries are written as each milestone lands, not retroactively at release time.
 
 ## [Unreleased]
 
+### Added
+
+- **Drop files on the window to open them.** Each file opens in a tab of its
+  own. A folder dropped on its own becomes the project, with the same prompt
+  for unsaved changes as Open Folder. While something is being dragged over
+  the window it is shaded, to show that letting go will open it.
+
 ## [1.3.0] - 2026-10-25
 
 ### Added

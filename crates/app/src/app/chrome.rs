@@ -598,6 +598,40 @@ impl EditorApp {
             });
     }
 
+    /// Shade the window while files are dragged over it, so it is plain that
+    /// letting go will open them.
+    pub(super) fn drop_hint(&self, ctx: &egui::Context) {
+        let count = ctx.input(|i| i.raw.hovered_files.len());
+        if count == 0 {
+            return;
+        }
+        let visuals = &ctx.global_style().visuals;
+        let rect = ctx.content_rect().shrink(8.0);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_hint"),
+        ));
+        painter.rect(
+            rect,
+            8.0,
+            visuals.selection.bg_fill.gamma_multiply(0.25),
+            egui::Stroke::new(2.0, visuals.selection.stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        let text = if count == 1 {
+            "Drop to open".to_owned()
+        } else {
+            format!("Drop to open {count} items")
+        };
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(24.0),
+            visuals.strong_text_color(),
+        );
+    }
+
     pub(super) fn about_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_about;
         egui::Window::new("About The Editor")
